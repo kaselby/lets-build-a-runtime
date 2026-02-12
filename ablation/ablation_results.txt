@@ -1,0 +1,312 @@
+Loaded ablation library
+Running 9 configs x 18 variants
+
+====================================================================================================
+  Toy: d_model=64, n_heads=4, seq=32, batch=1
+  head_dim=16, attn scratch=0.0MB
+====================================================================================================
+  --- Baselines ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  PT naive                   197.5us    58.6us    67.7us    61.0us  29.7% 34.3%   1.00x
+  PT SDPA                    158.7us    39.1us    69.2us    51.1us  24.6% 43.6%   0.80x
+
+  --- Python exec ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Numpy per-op               104.7us    35.4us    35.9us    32.9us  33.8% 34.3%   0.53x
+  C per-op                   119.0us    25.7us    16.2us    74.3us  21.6% 13.6%   0.60x
+
+  --- Incremental fusion ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  No passes                   27.5us     5.6us     2.6us    19.3us  20.3%  9.4%   0.14x
+  + fold/DCE                  27.6us     5.6us     2.6us    19.4us  20.4%  9.5%   0.14x
+  + BLAS absorb               22.2us     8.2us     2.6us    11.7us  36.9% 11.6%   0.11x
+  + MATMUL_ADD                23.6us     7.8us     2.7us    12.7us  33.2% 11.5%   0.12x
+  + BIAS_RELU                 22.1us     8.3us     2.6us    11.2us  37.7% 11.7%   0.11x
+
+  --- Attention variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Attn: prim scalar           26.9us    13.3us     2.5us    11.2us  49.5%  9.4%   0.14x
+  Attn: fused scalar          28.0us    13.4us     3.7us    11.1us  47.7% 13.1%   0.14x
+  Attn: fused SIMD            23.0us     8.2us     3.7us    11.1us  35.9% 16.0%   0.12x
+  Attn: fused GCD             30.0us    15.0us     3.7us    11.3us  50.0% 12.4%   0.15x
+  Attn: flash GCD             30.2us    14.8us     3.8us    11.4us  49.0% 12.6%   0.15x
+
+  --- LayerNorm variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  LN: scalar                  27.5us    13.0us     3.7us    11.4us  47.2% 13.5%   0.14x
+  LN: SIMD                    27.2us    13.7us     2.4us    11.1us  50.2%  8.9%   0.14x
+  LN: SIMD+GCD                27.8us    13.5us     3.0us    11.2us  48.8% 10.7%   0.14x
+
+  --- Full optimization ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Flash + LN opt              33.6us    16.3us     2.8us    11.4us  48.6%  8.3%   0.17x
+
+====================================================================================================
+  Small: d_model=256, n_heads=4, seq=128, batch=1
+  head_dim=64, attn scratch=0.3MB
+====================================================================================================
+  --- Baselines ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  PT naive                   755.4us   158.5us    95.3us   493.7us  21.0% 12.6%   1.00x
+  PT SDPA                    626.7us    64.2us    92.4us   475.9us  10.2% 14.7%   0.83x
+
+  --- Python exec ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Numpy per-op               852.9us   344.5us   134.5us   394.7us  40.4% 15.8%   1.13x
+  C per-op                   495.6us    50.7us    46.8us   389.5us  10.2%  9.4%   0.66x
+
+  --- Incremental fusion ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  No passes                  488.2us    49.8us    38.8us   401.8us  10.2%  7.9%   0.65x
+  + fold/DCE                 491.8us    49.2us    34.1us   403.0us  10.0%  6.9%   0.65x
+  + BLAS absorb              427.5us    67.1us    34.1us   326.7us  15.7%  8.0%   0.57x
+  + MATMUL_ADD               433.5us    75.4us    41.0us   324.1us  17.4%  9.5%   0.57x
+  + BIAS_RELU                407.0us    70.5us    34.9us   299.5us  17.3%  8.6%   0.54x
+
+  --- Attention variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Attn: prim scalar          483.1us   147.4us    33.7us   299.4us  30.5%  7.0%   0.64x
+  Attn: fused scalar         511.9us   159.7us    72.9us   280.1us  31.2% 14.2%   0.68x
+  Attn: fused SIMD           440.5us    77.7us    73.6us   294.2us  17.6% 16.7%   0.58x
+  Attn: fused GCD            422.8us    41.0us    74.8us   299.2us   9.7% 17.7%   0.56x
+  Attn: flash GCD            454.8us    67.3us    74.1us   301.2us  14.8% 16.3%   0.60x
+
+  --- LayerNorm variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  LN: scalar                 420.2us    41.2us    74.9us   307.2us   9.8% 17.8%   0.56x
+  LN: SIMD                   372.4us    42.3us    21.0us   314.0us  11.4%  5.7%   0.49x
+  LN: SIMD+GCD               403.5us    41.4us    32.5us   328.3us  10.3%  8.0%   0.53x
+
+  --- Full optimization ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Flash + LN opt             442.4us    68.4us    34.4us   337.5us  15.5%  7.8%   0.59x
+
+====================================================================================================
+  Medium: d_model=512, n_heads=8, seq=256, batch=1
+  head_dim=64, attn scratch=2.1MB
+====================================================================================================
+  --- Baselines ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  PT naive                    2.66ms   669.1us   108.0us    1.91ms  25.2%  4.1%   1.00x
+  PT SDPA                     2.08ms   170.9us   110.0us    1.80ms   8.2%  5.3%   0.78x
+
+  --- Python exec ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Numpy per-op                5.20ms    3.07ms   494.3us    1.64ms  59.0%  9.5%   1.96x
+  C per-op                    1.76ms   265.5us    99.5us    1.34ms  15.1%  5.7%   0.66x
+
+  --- Incremental fusion ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  No passes                   2.13ms   355.3us   125.6us    1.61ms  16.7%  5.9%   0.80x
+  + fold/DCE                  2.12ms   353.4us   131.3us    1.63ms  16.7%  6.2%   0.80x
+  + BLAS absorb               1.90ms   499.7us   138.7us    1.25ms  26.3%  7.3%   0.72x
+  + MATMUL_ADD                1.89ms   495.6us   133.7us    1.29ms  26.2%  7.1%   0.71x
+  + BIAS_RELU                 1.85ms   515.6us   128.3us    1.22ms  27.8%  6.9%   0.70x
+
+  --- Attention variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Attn: prim scalar           2.56ms    1.16ms   119.4us    1.27ms  45.5%  4.7%   0.96x
+  Attn: fused scalar          2.76ms    1.13ms   315.6us    1.29ms  41.1% 11.4%   1.04x
+  Attn: fused SIMD            2.07ms   511.3us   308.7us    1.25ms  24.7% 14.9%   0.78x
+  Attn: fused GCD             1.72ms   180.0us   308.4us    1.23ms  10.4% 17.9%   0.65x
+  Attn: flash GCD             1.87ms   233.3us   312.2us    1.28ms  12.4% 16.7%   0.71x
+
+  --- LayerNorm variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  LN: scalar                  1.73ms   165.0us   310.7us    1.27ms   9.6% 18.0%   0.65x
+  LN: SIMD                    1.49ms   153.3us   141.5us    1.21ms  10.3%  9.5%   0.56x
+  LN: SIMD+GCD                1.53ms   154.5us   123.5us    1.22ms  10.1%  8.1%   0.58x
+
+  --- Full optimization ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Flash + LN opt              1.70ms   428.7us   120.9us    1.22ms  25.2%  7.1%   0.64x
+
+====================================================================================================
+  GPT-2: d_model=768, n_heads=12, seq=512, batch=1
+  head_dim=64, attn scratch=12.6MB
+====================================================================================================
+  --- Baselines ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  PT naive                    6.74ms    1.87ms   212.0us    4.59ms  27.7%  3.1%   1.00x
+  PT SDPA                     5.34ms   722.0us   182.3us    4.45ms  13.5%  3.4%   0.79x
+
+  --- Python exec ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Numpy per-op               21.67ms   15.99ms    1.16ms    4.61ms  73.8%  5.3%   3.21x
+  C per-op                    4.93ms   925.6us   180.4us    3.73ms  18.8%  3.7%   0.73x
+
+  --- Incremental fusion ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  No passes                  10.10ms    4.69ms   181.5us    5.33ms  46.5%  1.8%   1.50x
+  + fold/DCE                  9.98ms    4.58ms   183.4us    5.27ms  45.9%  1.8%   1.48x
+  + BLAS absorb               9.18ms    5.23ms   162.6us    3.83ms  57.0%  1.8%   1.36x
+  + MATMUL_ADD                9.44ms    5.30ms   173.1us    3.89ms  56.2%  1.8%   1.40x
+  + BIAS_RELU                 9.18ms    5.30ms   158.5us    3.70ms  57.8%  1.7%   1.36x
+
+  --- Attention variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Attn: prim scalar          10.60ms    6.81ms   160.8us    3.64ms  64.3%  1.5%   1.57x
+  Attn: fused scalar         11.39ms    6.67ms   945.3us    3.72ms  58.6%  8.3%   1.69x
+  Attn: fused SIMD            9.71ms    4.99ms   943.4us    3.71ms  51.4%  9.7%   1.44x
+  Attn: fused GCD             5.57ms   902.3us   944.9us    3.71ms  16.2% 17.0%   0.83x
+  Attn: flash GCD             5.77ms    1.27ms   942.0us    3.61ms  22.0% 16.3%   0.86x
+
+  --- LayerNorm variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  LN: scalar                  5.55ms   897.1us   935.8us    3.77ms  16.2% 16.9%   0.82x
+  LN: SIMD                    5.02ms   886.3us   467.8us    3.66ms  17.7%  9.3%   0.74x
+  LN: SIMD+GCD                4.77ms   914.8us   144.0us    3.61ms  19.2%  3.0%   0.71x
+
+  --- Full optimization ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Flash + LN opt              5.07ms    1.21ms   161.2us    3.71ms  23.9%  3.2%   0.75x
+
+====================================================================================================
+  1B: d_model=2048, n_heads=16, seq=512, batch=1  [large — 8 variants]
+  head_dim=128, attn scratch=16.8MB
+====================================================================================================
+  --- Baselines ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  PT naive                   29.78ms    5.37ms   433.7us   24.04ms  18.0%  1.5%   1.00x
+  PT SDPA                    25.67ms    1.47ms   415.9us   23.79ms   5.7%  1.6%   0.86x
+
+  --- Incremental fusion ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  No passes                  32.90ms    6.38ms   229.2us   26.00ms  19.4%  0.7%   1.10x
+
+  --- Attention variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Attn: fused scalar         34.54ms   10.05ms    2.55ms   22.20ms  29.1%  7.4%   1.16x
+  Attn: fused GCD            26.29ms    1.50ms    2.52ms   22.22ms   5.7%  9.6%   0.88x
+  Attn: flash GCD            26.77ms    2.26ms    2.53ms   22.07ms   8.4%  9.5%   0.90x
+
+  --- LayerNorm variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  LN: SIMD+GCD               23.91ms    1.65ms   236.2us   22.13ms   6.9%  1.0%   0.80x
+
+  --- Full optimization ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Flash + LN opt             24.69ms    2.32ms   237.5us   22.09ms   9.4%  1.0%   0.83x
+
+====================================================================================================
+  3B: d_model=3072, n_heads=24, seq=1024, batch=1  [large — 8 variants]
+  head_dim=128, attn scratch=100.7MB
+====================================================================================================
+  --- Baselines ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  PT naive                  112.68ms   22.46ms   746.4us   89.43ms  19.9%  0.7%   1.00x
+  PT SDPA                   100.22ms    8.11ms    1.09ms   90.84ms   8.1%  1.1%   0.89x
+
+  --- Incremental fusion ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  No passes                 136.28ms   34.56ms   607.9us  101.70ms  25.4%  0.4%   1.21x
+
+  --- Attention variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Attn: fused scalar        149.63ms   53.14ms    7.52ms   89.03ms  35.5%  5.0%   1.33x
+  Attn: fused GCD           104.33ms    7.50ms    7.59ms   89.09ms   7.2%  7.3%   0.93x
+  Attn: flash GCD           109.95ms   12.06ms    7.58ms   89.93ms  11.0%  6.9%   0.98x
+
+  --- LayerNorm variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  LN: SIMD+GCD               97.23ms    7.60ms   592.5us   89.73ms   7.8%  0.6%   0.86x
+
+  --- Full optimization ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Flash + LN opt            101.23ms   11.49ms   598.2us   88.62ms  11.4%  0.6%   0.90x
+
+====================================================================================================
+  7B: d_model=4096, n_heads=32, seq=1024, batch=1  [large — 8 variants]
+  head_dim=128, attn scratch=134.2MB
+====================================================================================================
+  --- Baselines ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  PT naive                  182.81ms   32.41ms   650.5us  149.34ms  17.7%  0.4%   1.00x
+  PT SDPA                   162.92ms    9.66ms    1.05ms  152.43ms   5.9%  0.6%   0.89x
+
+  --- Incremental fusion ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  No passes                 213.65ms   45.35ms   753.0us  167.75ms  21.2%  0.4%   1.17x
+
+  --- Attention variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Attn: fused scalar        230.12ms   71.99ms   10.12ms  148.22ms  31.3%  4.4%   1.26x
+  Attn: fused GCD           173.21ms    9.81ms   10.19ms  152.79ms   5.7%  5.9%   0.95x
+  Attn: flash GCD           176.53ms   15.09ms   10.06ms  151.37ms   8.5%  5.7%   0.97x
+
+  --- LayerNorm variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  LN: SIMD+GCD              161.50ms    9.81ms   763.8us  151.10ms   6.1%  0.5%   0.88x
+
+  --- Full optimization ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Flash + LN opt            163.96ms   15.04ms   718.8us  148.16ms   9.2%  0.4%   0.90x
+
+====================================================================================================
+  7B-4K: d_model=4096, n_heads=32, seq=4096, batch=1  [large — 8 variants]
+  head_dim=128, attn scratch=2147.5MB
+====================================================================================================
+  --- Baselines ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  PT naive                    1.10s   519.73ms    4.15ms  578.65ms  47.0%  0.4%   1.00x
+  PT SDPA                   746.32ms  156.00ms    4.65ms  588.59ms  20.9%  0.6%   0.68x
+
+  --- Incremental fusion ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  No passes                   1.28s   526.93ms    2.71ms  747.32ms  41.3%  0.2%   1.16x
+
+  --- Attention variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Attn: fused scalar          1.70s     1.08s    39.62ms  572.57ms  63.8%  2.3%   1.54x
+  Attn: fused GCD           752.79ms  139.68ms   39.88ms  570.04ms  18.6%  5.3%   0.68x
+  Attn: flash GCD           869.05ms  260.08ms   39.58ms  570.64ms  29.9%  4.6%   0.79x
+
+  --- LayerNorm variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  LN: SIMD+GCD              712.94ms  139.88ms    2.69ms  570.35ms  19.6%  0.4%   0.65x
+
+  --- Full optimization ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Flash + LN opt            838.70ms  260.29ms    2.63ms  572.31ms  31.0%  0.3%   0.76x
+
+====================================================================================================
+  1B-8K: d_model=2048, n_heads=16, seq=8192, batch=1  [large — 8 variants]
+  head_dim=128, attn scratch=4295.0MB
+====================================================================================================
+  --- Baselines ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  PT naive                    1.40s     1.09s     4.21ms  297.40ms  78.2%  0.3%   1.00x
+  PT SDPA                   580.58ms  281.58ms    4.67ms  295.20ms  48.5%  0.8%   0.42x
+
+  --- Incremental fusion ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  No passes                   1.59s     1.01s     2.60ms  571.41ms  63.7%  0.2%   1.14x
+
+  --- Attention variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Attn: fused scalar          2.48s     2.16s    39.76ms  284.83ms  86.9%  1.6%   1.77x
+  Attn: fused GCD           649.62ms  324.27ms   39.54ms  285.11ms  49.9%  6.1%   0.46x
+  Attn: flash GCD           939.71ms  616.18ms   39.71ms  283.92ms  65.6%  4.2%   0.67x
+
+  --- LayerNorm variants ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  LN: SIMD+GCD              609.36ms  322.51ms    2.67ms  285.51ms  52.9%  0.4%   0.44x
+
+  --- Full optimization ---
+  Variant                      Total      Attn        LN     Other  Attn%   LN%   vs PT
+  Flash + LN opt            902.67ms  612.26ms    2.69ms  285.57ms  67.8%  0.3%   0.65x
+
+====================================================================================================
+  SUMMARY: Best compiled variant vs PyTorch baselines
+====================================================================================================
+  Config         PT naive    PT SDPA  Best ours vs naive  vs SDPA
+  --------------------------------------------------------------
+  Toy             197.5us    158.7us     22.1us    0.11x    0.14x  (+ BIAS_RELU)
+  Small           755.4us    626.7us    372.4us    0.49x    0.59x  (LN: SIMD)
+  Medium           2.66ms     2.08ms     1.49ms    0.56x    0.72x  (LN: SIMD)
+  GPT-2            6.74ms     5.34ms     4.77ms    0.71x    0.89x  (LN: SIMD+GCD)
+  1B              29.78ms    25.67ms    23.91ms    0.80x    0.93x  (LN: SIMD+GCD)
+  3B             112.68ms   100.22ms    97.23ms    0.86x    0.97x  (LN: SIMD+GCD)
+  7B             182.81ms   162.92ms   161.50ms    0.88x    0.99x  (LN: SIMD+GCD)
+  7B-4K            1.10s    746.32ms   712.94ms    0.65x    0.96x  (LN: SIMD+GCD)
+  1B-8K            1.40s    580.58ms   609.36ms    0.44x    1.05x  (LN: SIMD+GCD)
