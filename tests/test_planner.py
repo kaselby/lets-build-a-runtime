@@ -150,7 +150,7 @@ def test_scratch_allocation_exists():
     scratch_size = 256  # 64 floats
     old = SCRATCH_CALCULATORS.get(OpType.MATMUL)
     try:
-        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape: scratch_size)
+        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape, attrs: scratch_size)
         graph = _build_simple_graph()
         ep = plan(graph)
 
@@ -175,7 +175,7 @@ def test_scratch_not_in_regular_offsets():
     scratch_size = 128
     old = SCRATCH_CALCULATORS.get(OpType.MATMUL)
     try:
-        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape: scratch_size)
+        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape, attrs: scratch_size)
         graph = _build_simple_graph()
         ep = plan(graph)
 
@@ -216,7 +216,7 @@ def test_scratch_no_overlap_with_intermediates():
     scratch_size = 512
     old = SCRATCH_CALCULATORS.get(OpType.MATMUL)
     try:
-        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape: scratch_size)
+        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape, attrs: scratch_size)
         ep = plan(graph)
 
         matmul_node = [n for n in ep.order if n.op == OpType.MATMUL][0]
@@ -245,7 +245,7 @@ def test_scratch_zero_not_allocated():
     """A calculator returning 0 should not create a scratch entry."""
     old = SCRATCH_CALCULATORS.get(OpType.MATMUL)
     try:
-        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape: 0)
+        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape, attrs: 0)
         graph = _build_simple_graph()
         ep = plan(graph)
 
@@ -282,7 +282,7 @@ def test_scratch_passed_to_kernel():
     scratch_size = 256
     old = SCRATCH_CALCULATORS.get(OpType.MATMUL)
     try:
-        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape: scratch_size)
+        register_scratch(OpType.MATMUL, lambda in_shapes, out_shape, attrs: scratch_size)
         graph = _build_simple_graph()
         ep = plan(graph)
         executor = Executor(backends=[MockBackend()])

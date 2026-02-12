@@ -260,32 +260,93 @@ void kernel_softmax(const float* x, float* out, int rows, int cols) {
  *   x: [rows x cols]
  *   gamma, beta: [cols]  (learnable scale and shift)
  *   out: [rows x cols]
- *   Two-pass: first compute mean, then variance.
+ *
+ *   Two-pass, numerically stable (variance from centered values).
+ *
+ *   On macOS, each pass uses Accelerate vDSP SIMD functions and
+ *   rows are parallelized across cores via GCD dispatch_apply:
+ *     vDSP_sve    — vectorized sum (NEON parallel reduction)
+ *     vDSP_vsadd  — vectorized scalar add (center: x - mean)
+ *     vDSP_svesq  — vectorized sum of squares (variance)
+ *     vDSP_vsmul  — vectorized scalar multiply (scale by inv_std)
+ *     vDSP_vma    — vectorized multiply-add (apply gamma and beta)
  * ---------------------------------------------------------------- */
+
+/* Per-row layernorm: compute mean/var and normalize one row. */
+static void layernorm_row(const float* row_in, float* row_out,
+                          const float* gamma, const float* beta,
+                          int cols, float eps) {
+#ifdef __APPLE__
+    vDSP_Length n = (vDSP_Length)cols;
+
+    /* Pass 1: mean via SIMD reduction */
+    float sum;
+    vDSP_sve(row_in, 1, &sum, n);
+    float mean = sum / cols;
+
+    /* Write centered values (x - mean) into output buffer.
+     * This serves double duty: scratch for variance computation
+     * and the start of the normalization pipeline. */
+    float neg_mean = -mean;
+    vDSP_vsadd(row_in, 1, &neg_mean, row_out, 1, n);
+
+    /* Variance from centered values (numerically stable) */
+    float var_sum;
+    vDSP_svesq(row_out, 1, &var_sum, n);
+    float inv_std = 1.0f / sqrtf(var_sum / cols + eps);
+
+    /* Pass 2: scale by inv_std, then apply gamma and beta.
+     * row_out already holds (x - mean) from above. */
+    vDSP_vsmul(row_out, 1, &inv_std, row_out, 1, n);
+    vDSP_vma(row_out, 1, gamma, 1, beta, 1, row_out, 1, n);
+#else
+    /* Scalar fallback */
+    float sum = 0.0f;
+    for (int j = 0; j < cols; j++) sum += row_in[j];
+    float mean = sum / cols;
+
+    float var = 0.0f;
+    for (int j = 0; j < cols; j++) {
+        float d = row_in[j] - mean;
+        row_out[j] = d;      /* store centered value for reuse */
+        var += d * d;
+    }
+    float inv_std = 1.0f / sqrtf(var / cols + eps);
+
+    for (int j = 0; j < cols; j++) {
+        row_out[j] = row_out[j] * inv_std * gamma[j] + beta[j];
+    }
+#endif
+}
+
 void kernel_layernorm(const float* x, const float* gamma, const float* beta,
                       float* out, int rows, int cols, float eps) {
+#ifdef __APPLE__
+    if (rows > 1) {
+        /* Chunk rows so each GCD block does enough work to amortize
+         * dispatch overhead. Target: >=16KB of input per block, with
+         * at most 2× the number of cores to avoid over-splitting. */
+        int min_rows_per_chunk = (16 * 1024) / (cols * (int)sizeof(float));
+        if (min_rows_per_chunk < 1) min_rows_per_chunk = 1;
+        int n_chunks = (rows + min_rows_per_chunk - 1) / min_rows_per_chunk;
+
+        dispatch_queue_t queue = dispatch_get_global_queue(
+            QOS_CLASS_USER_INITIATED, 0);
+        dispatch_apply((size_t)n_chunks, queue, ^(size_t chunk) {
+            int start = (int)chunk * min_rows_per_chunk;
+            int end = start + min_rows_per_chunk;
+            if (end > rows) end = rows;
+            for (int i = start; i < end; i++) {
+                layernorm_row(x + i * cols, out + i * cols,
+                              gamma, beta, cols, eps);
+            }
+        });
+        return;
+    }
+#endif
     for (int i = 0; i < rows; i++) {
-        const float* row_in = x + i * cols;
-        float* row_out = out + i * cols;
-
-        /* Pass 1: mean */
-        float sum = 0.0f;
-        for (int j = 0; j < cols; j++) sum += row_in[j];
-        float mean = sum / cols;
-
-        /* Pass 2: variance */
-        float var = 0.0f;
-        for (int j = 0; j < cols; j++) {
-            float d = row_in[j] - mean;
-            var += d * d;
-        }
-        var /= cols;
-
-        /* Normalize, scale, shift */
-        float inv_std = 1.0f / sqrtf(var + eps);
-        for (int j = 0; j < cols; j++) {
-            row_out[j] = (row_in[j] - mean) * inv_std * gamma[j] + beta[j];
-        }
+        layernorm_row(x + i * cols, out + i * cols,
+                      gamma, beta, cols, eps);
     }
 }
 

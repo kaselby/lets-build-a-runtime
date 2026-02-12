@@ -177,7 +177,7 @@ Benchmarked on Apple M4 Max.
 
 ## Known Limitations
 
-- **No PERMUTE in compiled C dispatch.** General N-dim permutations are unhandled in `executor.c`. Currently safe because transformer permutations are classified as TRANSPOSE, but would silently fail for true N-dim permutations.
+- **No PERMUTE in compiled C dispatch.** General N-dim permutations are unhandled in `executor.c` (hits `default: abort()`). Currently safe because transformer permutations are classified as TRANSPOSE.
 - **Flash attention scratch over-allocation.** The scratch calculator always allocates standard-kernel-sized scratch (S² per slice). Flash needs only 32×32 per slice.
 - **Naive attention recognition.** Manual softmax decomposition creates a DAG pattern that the linear chain matcher can't handle.
 - **No quantization.** Q/DQ insertion and INT8 weight quantization were planned as stretch goals.

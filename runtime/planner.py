@@ -49,10 +49,10 @@ class Lifetime:
 # Scratch buffer registry
 # ---------------------------------------------------------------------------
 
-# Calculator signature: (input_shapes, output_shape) -> bytes needed.
+# Calculator signature: (input_shapes, output_shape, attrs) -> bytes needed.
 # Return 0 for no scratch. The planner calls this for every node whose
 # op type has a registered calculator.
-ScratchCalculator = Callable[[list[tuple[int, ...]], tuple[int, ...]], int]
+ScratchCalculator = Callable[[list[tuple[int, ...]], tuple[int, ...], dict], int]
 SCRATCH_CALCULATORS: dict[OpType, ScratchCalculator] = {}
 
 
@@ -61,20 +61,32 @@ def register_scratch(op: OpType, calc: ScratchCalculator) -> None:
     SCRATCH_CALCULATORS[op] = calc
 
 
-def _attention_scratch(input_shapes: list[tuple[int, ...]], output_shape: tuple[int, ...]) -> int:
-    """Scratch for fused attention: one S×S matrix per batch×head slice.
+FLASH_BR = 32
+FLASH_BC = 32
+
+
+def _attention_scratch(input_shapes: list[tuple[int, ...]], output_shape: tuple[int, ...],
+                       attrs: dict) -> int:
+    """Scratch for fused attention: one score matrix per batch×head slice.
 
     Inputs are [Q, K, V] each shaped [..., seq_len, head_dim] where leading
     dims are batch (e.g. [BH, S, D] or [B, H, S, D] — memory layout is identical).
     Each GCD thread gets its own scratch region so they can run in parallel
     without synchronization.
+
+    Standard kernel needs S×S per slice (full attention matrix).
+    Flash kernel needs B_r×B_c per slice (one tile).
     """
     q_shape = input_shapes[0]
     batch_heads = 1
     for d in q_shape[:-2]:
         batch_heads *= d
     seq_len = q_shape[-2]
-    return batch_heads * seq_len * seq_len * 4  # float32
+    if attrs.get("flash"):
+        scratch_per_slice = FLASH_BR * FLASH_BC
+    else:
+        scratch_per_slice = seq_len * seq_len
+    return batch_heads * scratch_per_slice * 4  # float32
 
 register_scratch(OpType.ATTENTION, _attention_scratch)
 
@@ -96,7 +108,7 @@ def _compute_scratch(order: list[Node], graph: Graph) -> tuple[list[Lifetime], d
 
         input_shapes = [graph.tensors[inp].shape for inp in node.inputs]
         output_shape = graph.tensors[node.output].shape
-        size_bytes = calc(input_shapes, output_shape)
+        size_bytes = calc(input_shapes, output_shape, node.attrs)
 
         if size_bytes <= 0:
             continue
