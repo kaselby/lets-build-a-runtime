@@ -111,11 +111,34 @@ def _attention(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, An
     head_dim = Q.shape[-1]
     scale = 1.0 / np.sqrt(head_dim)
     scores = np.matmul(Q, np.swapaxes(K, -2, -1)) * scale
+    if attrs.get("causal"):
+        seq_len = Q.shape[-2]
+        mask = np.triu(np.full((seq_len, seq_len), -np.inf, dtype=np.float32), k=1)
+        scores = scores + mask
     # numerically stable softmax along last axis
     scores -= np.max(scores, axis=-1, keepdims=True)
     e = np.exp(scores)
     weights = e / np.sum(e, axis=-1, keepdims=True)
     np.matmul(weights, V, out=output)
+
+
+def _pow(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    np.power(inputs[0], attrs["scalar"], out=output)
+
+
+def _tanh(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    np.tanh(inputs[0], out=output)
+
+
+def _gelu(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    x = inputs[0]
+    inner = 0.7978845608 * (x + 0.044715 * np.power(x, 3))
+    np.multiply(0.5 * x, 1.0 + np.tanh(inner), out=output)
+
+
+def _embedding(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    ids, table = inputs[0], inputs[1]
+    output[:] = table[ids.astype(np.intp)]
 
 
 _KERNELS: dict[OpType, KernelFn] = {
@@ -136,6 +159,10 @@ _KERNELS: dict[OpType, KernelFn] = {
     OpType.MATMUL_ADD: _matmul_add,
     OpType.FUSED_BIAS_RELU: _fused_bias_relu,
     OpType.ATTENTION: _attention,
+    OpType.POW: _pow,
+    OpType.TANH: _tanh,
+    OpType.GELU: _gelu,
+    OpType.EMBEDDING: _embedding,
 }
 
 

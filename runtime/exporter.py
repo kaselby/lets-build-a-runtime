@@ -101,9 +101,15 @@ def _process_placeholders(exported, graph: Graph, node_map: dict[str, str]) -> N
             graph.inputs.append(tensor_name)
         elif kind in (InputKind.PARAMETER, InputKind.BUFFER):
             graph.constants.append(tensor_name)
-            # Load actual weight data from the state dict
+            # Load actual weight data — check state_dict first, then constants
+            # (registered buffers like causal masks may be in constants instead)
             state_key = param_targets[fx_node.name]
-            tensor_info.buffer = exported.state_dict[state_key].numpy(force=True)
+            if state_key in exported.state_dict:
+                tensor_info.buffer = exported.state_dict[state_key].numpy(force=True)
+            elif hasattr(exported, 'constants') and state_key in exported.constants:
+                tensor_info.buffer = exported.constants[state_key].numpy(force=True)
+            else:
+                raise ValueError(f"Weight/buffer '{state_key}' not found in state_dict or constants")
 
 
 def _process_compute_nodes(exported, graph: Graph, node_map: dict[str, str]) -> None:
@@ -385,13 +391,38 @@ def _handle_max_dim(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
 
 
 def _handle_getitem(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
-    """Handle operator.getitem — unpacks tuples from ops like max.dim.
+    """Handle operator.getitem — unpacks tuples from ops like max.dim, or split chunks.
 
-    Index 0 (values) aliases to the producer's output tensor.
-    Other indices (e.g., indices from max) are ignored.
+    For split results: emits a SLICE node with byte_offset computed from chunk index.
+    For max.dim: index 0 (values) aliases to the producer's output tensor.
     """
     source_name = fx_node.args[0].name
     index = fx_node.args[1]
+
+    # Check if this is unpacking a split result
+    if source_name in _pending_splits:
+        input_tensor, chunk_size, dim, input_shape = _pending_splits[source_name]
+
+        val = fx_node.meta["val"]
+        shape = tuple(val.shape)
+        dtype = str(val.dtype).replace("torch.", "")
+        dtype_bytes = np.dtype(dtype).itemsize
+
+        # Compute byte offset: index * chunk_size * product(shape[dim+1:]) * dtype_bytes
+        trailing = 1
+        for d in input_shape[dim + 1:]:
+            trailing *= d
+        byte_offset = index * chunk_size * trailing * dtype_bytes
+
+        tensor_name = fx_node.name
+        graph.add_tensor(tensor_name, shape, dtype)
+        graph.add_node(OpType.SLICE, [input_tensor], tensor_name,
+                        {"byte_offset": byte_offset, "dim": dim,
+                         "start": index * chunk_size,
+                         "end": index * chunk_size + chunk_size})
+        node_map[fx_node.name] = tensor_name
+        return
+
     if index == 0 and source_name in node_map:
         node_map[fx_node.name] = node_map[source_name]
 
@@ -470,11 +501,123 @@ def _handle_contiguous(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
     node_map[fx_node.name] = node_map[fx_node.args[0].name]
 
 
+def _handle_addmm(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.addmm(bias, input, weight) — Conv1D layout.
+
+    Weight is [K, N] (Conv1D, transposed from nn.Linear's [N, K]).
+    Pre-transpose weight buffer to [N, K] at export time so the MATMUL
+    can use CblasTrans, matching the nn.Linear path exactly.
+    """
+    bias_arg = fx_node.args[0]
+    input_arg = fx_node.args[1]
+    weight_arg = fx_node.args[2]
+
+    val = fx_node.meta["val"]
+    out_shape = tuple(val.shape)
+    out_dtype = str(val.dtype).replace("torch.", "")
+
+    # Pre-transpose weight buffer from [K, N] to [N, K] at export time
+    weight_name = node_map[weight_arg.name]
+    weight_info = graph.tensors[weight_name]
+    if weight_info.buffer is not None:
+        weight_info.buffer = np.ascontiguousarray(weight_info.buffer.T)
+        weight_info.shape = weight_info.buffer.shape
+
+    # MATMUL(input, weight_t, transpose_b=True) -> intermediate
+    mm_name = f"{fx_node.name}_mm"
+    mm_inputs = [node_map[input_arg.name], weight_name]
+    graph.add_tensor(mm_name, out_shape, out_dtype)
+    graph.add_node(OpType.MATMUL, mm_inputs, mm_name, {"transpose_b": True})
+
+    # ADD(mm_out, bias) -> final output
+    add_name = fx_node.name
+    add_inputs = [mm_name, node_map[bias_arg.name]]
+    graph.add_tensor(add_name, out_shape, out_dtype)
+    graph.add_node(OpType.ADD, add_inputs, add_name)
+    node_map[fx_node.name] = add_name
+
+
+def _handle_dropout(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.dropout — no-op alias (inference mode)."""
+    node_map[fx_node.name] = node_map[fx_node.args[0].name]
+
+
+# Split → SLICE support: split stores metadata, getitem emits SLICE nodes
+_pending_splits: dict[str, tuple[str, int, int, tuple]] = {}  # fx_name -> (input_tensor, chunk_size, dim, input_shape)
+
+
+def _handle_split(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.split.Tensor — deferred, emits SLICE on getitem.
+
+    Stores split metadata (input tensor, chunk_size, dim, shape) keyed
+    by the fx node name. The actual SLICE nodes are emitted when
+    getitem unpacks each chunk.
+    """
+    input_name = node_map[fx_node.args[0].name]
+    chunk_size = fx_node.args[1]
+    dim = fx_node.args[2] if len(fx_node.args) > 2 else 0
+    input_shape = graph.tensors[input_name].shape
+    # Normalize negative dim
+    if dim < 0:
+        dim += len(input_shape)
+    _pending_splits[fx_node.name] = (input_name, chunk_size, dim, input_shape)
+    node_map[fx_node.name] = input_name  # placeholder; getitem produces real outputs
+
+
+def _handle_pow(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.pow.Tensor_Scalar — unary with scalar exponent."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    input_names = [node_map[fx_node.args[0].name]]
+    scalar = float(fx_node.args[1])
+
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.POW, input_names, tensor_name, {"scalar": scalar})
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_tanh(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.tanh — unary, single input."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    input_names = [node_map[fx_node.args[0].name]]
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.TANH, input_names, tensor_name)
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_embedding(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.embedding — table lookup.
+
+    Inputs: [weight_table, indices]. We emit EMBEDDING with
+    inputs=[indices, weight_table] (indices first for the kernel).
+    """
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    weight_name = node_map[fx_node.args[0].name]
+    indices_name = node_map[fx_node.args[1].name]
+    input_names = [indices_name, weight_name]
+
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.EMBEDDING, input_names, tensor_name)
+    node_map[fx_node.name] = tensor_name
+
+
 def _handle_sdpa(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
     """Handle aten.scaled_dot_product_attention → ATTENTION directly.
 
     Takes Q, K, V as the first three args (all tensors). Maps straight
     to our fused ATTENTION op — no fusion pass needed.
+    Args 4+ are attn_mask (None), dropout_p, is_causal.
     """
     val = fx_node.meta["val"]
     shape = tuple(val.shape)
@@ -486,9 +629,19 @@ def _handle_sdpa(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
         node_map[fx_node.args[2].name],  # V
     ]
 
+    # Check for is_causal flag (arg index 5 or kwarg)
+    attrs = {}
+    is_causal = False
+    if len(fx_node.args) > 5:
+        is_causal = bool(fx_node.args[5])
+    elif "is_causal" in fx_node.kwargs:
+        is_causal = bool(fx_node.kwargs["is_causal"])
+    if is_causal:
+        attrs["causal"] = True
+
     tensor_name = fx_node.name
     graph.add_tensor(tensor_name, shape, dtype)
-    graph.add_node(OpType.ATTENTION, input_names, tensor_name)
+    graph.add_node(OpType.ATTENTION, input_names, tensor_name, attrs)
     node_map[fx_node.name] = tensor_name
 
 
@@ -536,4 +689,11 @@ ATEN_HANDLERS.update({
     torch.ops.aten.mean.dim:            _handle_mean,
     # Fused attention (SDPA maps directly to ATTENTION — no fusion pass needed)
     torch.ops.aten.scaled_dot_product_attention.default: _handle_sdpa,
+    # GPT-2 ops
+    torch.ops.aten.addmm.default:       _handle_addmm,
+    torch.ops.aten.dropout.default:     _handle_dropout,
+    torch.ops.aten.split.Tensor:        _handle_split,
+    torch.ops.aten.pow.Tensor_Scalar:   _handle_pow,
+    torch.ops.aten.tanh.default:        _handle_tanh,
+    torch.ops.aten.embedding.default:   _handle_embedding,
 })

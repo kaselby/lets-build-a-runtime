@@ -15,7 +15,7 @@ endif
 
 SRCS = ops.c
 
-all: libruntime.$(LIB_EXT) libexecutor.$(LIB_EXT) libablation.$(LIB_EXT)
+all: libruntime.$(LIB_EXT) libexecutor.$(LIB_EXT)
 
 # Per-op kernels (loaded by c_backend.py)
 libruntime.$(LIB_EXT): $(SRCS)
@@ -25,11 +25,7 @@ libruntime.$(LIB_EXT): $(SRCS)
 libexecutor.$(LIB_EXT): executor.c $(SRCS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
-# Ablation: variant kernels + parametric dispatch (loaded by bench script)
-libablation.$(LIB_EXT): ablation.c $(SRCS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
-
 clean:
-	rm -f libruntime.$(LIB_EXT) libexecutor.$(LIB_EXT) libablation.$(LIB_EXT)
+	rm -f libruntime.$(LIB_EXT) libexecutor.$(LIB_EXT)
 
 .PHONY: all clean

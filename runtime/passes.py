@@ -205,6 +205,12 @@ def _eval_layernorm(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
 
 register_evaluator(OpType.LAYERNORM, _eval_layernorm)
 
+register_evaluator(OpType.POW, lambda ins, attrs: np.power(ins[0], attrs["scalar"]))
+register_evaluator(OpType.TANH, lambda ins, attrs: np.tanh(ins[0]))
+register_evaluator(OpType.GELU, lambda ins, attrs: (
+    0.5 * ins[0] * (1 + np.tanh(0.7978845608 * (ins[0] + 0.044715 * ins[0]**3)))
+))
+
 register_evaluator(OpType.MATMUL_ADD, lambda ins, attrs: (
     ins[0] @ (ins[1].T if attrs.get("transpose_b") else ins[1]) + ins[2]
 ))
@@ -216,6 +222,10 @@ def _eval_attention(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
     Q, K, V = ins[0], ins[1], ins[2]
     scale = 1.0 / np.sqrt(Q.shape[-1])
     scores = np.matmul(Q, np.swapaxes(K, -2, -1)) * scale
+    if attrs.get("causal"):
+        seq_len = Q.shape[-2]
+        mask = np.triu(np.full((seq_len, seq_len), -np.inf, dtype=np.float32), k=1)
+        scores = scores + mask
     scores -= np.max(scores, axis=-1, keepdims=True)
     e = np.exp(scores)
     weights = e / np.sum(e, axis=-1, keepdims=True)
@@ -462,6 +472,132 @@ register_fusion(FusionPattern(
 
 
 # ---------------------------------------------------------------------------
+# GELU recognition
+# ---------------------------------------------------------------------------
+
+def _approx_eq(val: float, target: float, tol: float = 1e-4) -> bool:
+    """Check if a scalar value approximately equals the target."""
+    return abs(val - target) < tol
+
+
+def recognize_gelu(graph: Graph) -> bool:
+    """Recognize the GELU tanh approximation pattern and replace with a single GELU node.
+
+    The pattern (from GPT-2):
+      x → pow(3) → mul(0.044715) → add(x) → mul(sqrt(2/pi)) → tanh → add(1) → mul(half_x)
+    where half_x = mul(x, 0.5)
+
+    Finds TANH nodes and walks backward/forward to verify the full pattern,
+    then replaces the 8-node subgraph with a single GELU(x) → final_output.
+    """
+    changed = False
+
+    for node in list(graph):
+        if node.op != OpType.TANH:
+            continue
+
+        # Walk backward from TANH to find the pattern
+        # TANH input should be MUL with scalar ≈ sqrt(2/pi) = 0.7978845608
+        tanh_input_producer = graph.producer(node.inputs[0])
+        if (tanh_input_producer is None
+                or tanh_input_producer.op != OpType.MUL
+                or "scalar" not in tanh_input_producer.attrs
+                or not _approx_eq(tanh_input_producer.attrs["scalar"], 0.7978845608)):
+            continue
+        mul_sqrt2pi = tanh_input_producer
+
+        # MUL(sqrt2pi) input should be ADD(x + 0.044715*x^3)
+        add_inner = graph.producer(mul_sqrt2pi.inputs[0])
+        if add_inner is None or add_inner.op != OpType.ADD:
+            continue
+        # ADD should have 2 tensor inputs (x and 0.044715*x^3)
+        if len(add_inner.inputs) != 2 or "scalar" in add_inner.attrs:
+            continue
+
+        # One input to ADD is x, the other is MUL(0.044715) → POW(3)
+        # Try both orderings
+        root_x = None
+        mul_coeff_node = None
+        for i in range(2):
+            candidate_mul = graph.producer(add_inner.inputs[i])
+            candidate_x = add_inner.inputs[1 - i]
+            if (candidate_mul is not None
+                    and candidate_mul.op == OpType.MUL
+                    and "scalar" in candidate_mul.attrs
+                    and _approx_eq(candidate_mul.attrs["scalar"], 0.044715)):
+                # Verify MUL(0.044715) input is POW(3) of x
+                pow_node = graph.producer(candidate_mul.inputs[0])
+                if (pow_node is not None
+                        and pow_node.op == OpType.POW
+                        and _approx_eq(pow_node.attrs.get("scalar", 0), 3.0)
+                        and pow_node.inputs[0] == candidate_x):
+                    root_x = candidate_x
+                    mul_coeff_node = candidate_mul
+                    break
+
+        if root_x is None:
+            continue
+        pow_node = graph.producer(mul_coeff_node.inputs[0])
+
+        # Walk forward from TANH: TANH → ADD(1.0) → MUL(half_x)
+        tanh_consumers = graph.consumers(node.output)
+        if len(tanh_consumers) != 1:
+            continue
+        add_one = tanh_consumers[0]
+        if (add_one.op != OpType.ADD
+                or "scalar" not in add_one.attrs
+                or not _approx_eq(add_one.attrs["scalar"], 1.0)):
+            continue
+
+        add_one_consumers = graph.consumers(add_one.output)
+        if len(add_one_consumers) != 1:
+            continue
+        final_mul = add_one_consumers[0]
+        if final_mul.op != OpType.MUL:
+            continue
+
+        # final_mul should multiply (tanh+1) by half_x = x * 0.5
+        # Find which input is the add_one output and which is half_x
+        other_input = None
+        for inp in final_mul.inputs:
+            if inp != add_one.output:
+                other_input = inp
+                break
+        if other_input is None:
+            continue
+
+        half_x_producer = graph.producer(other_input)
+        if (half_x_producer is None
+                or half_x_producer.op != OpType.MUL
+                or "scalar" not in half_x_producer.attrs
+                or not _approx_eq(half_x_producer.attrs["scalar"], 0.5)
+                or half_x_producer.inputs[0] != root_x):
+            continue
+
+        # Pattern matched! Replace all 8 nodes with GELU(x) → final_output
+        subgraph_nodes = [
+            pow_node, mul_coeff_node, add_inner, mul_sqrt2pi,
+            node, add_one, half_x_producer, final_mul,
+        ]
+        final_output = final_mul.output
+
+        # Collect intermediate tensor names to remove (not root_x, not final_output)
+        chain_outputs = {n.output for n in subgraph_nodes}
+
+        # Remove all subgraph nodes
+        for n in subgraph_nodes:
+            graph.remove_node(n.id)
+            if n.output != final_output:
+                graph.remove_tensor(n.output)
+
+        # Add GELU node: input is root_x, output is final_output
+        graph.add_node(OpType.GELU, [root_x], final_output)
+        changed = True
+
+    return changed
+
+
+# ---------------------------------------------------------------------------
 # Dead code elimination
 # ---------------------------------------------------------------------------
 
@@ -507,6 +643,7 @@ def eliminate_dead_code(graph: Graph) -> bool:
 DEFAULT_PIPELINE.extend([
     absorb_into_matmul,
     constant_fold,
+    recognize_gelu,
     fuse,
     eliminate_dead_code,
 ])

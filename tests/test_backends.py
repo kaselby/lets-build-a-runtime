@@ -150,3 +150,144 @@ def test_softmax(backend, shape, axis):
 
     output = run_kernel(backend, "SOFTMAX", [x], x.shape, {"axis": axis})
     np.testing.assert_allclose(output, expected, atol=1e-5)
+
+
+# =====================================================================
+# POW (scalar exponent)
+# =====================================================================
+
+POW_CASES = [
+    ("square",  (4, 16, 64),  2.0),
+    ("cube",    (2, 8, 32),   3.0),
+    ("sqrt",    (4, 16, 64),  0.5),
+    ("inverse", (2, 8, 32),  -1.0),
+    ("2D",      (32, 64),     2.0),
+]
+
+
+@pytest.mark.parametrize("desc,shape,exponent",
+                         POW_CASES, ids=[c[0] for c in POW_CASES])
+def test_pow(backend, desc, shape, exponent):
+    x = np.abs(np.random.randn(*shape).astype(np.float32)) + 0.1  # positive for fractional/negative exp
+    expected = np.power(x, exponent)
+    output = run_kernel(backend, "POW", [x], x.shape, {"scalar": exponent})
+    np.testing.assert_allclose(output, expected, atol=1e-4)
+
+
+# =====================================================================
+# TANH
+# =====================================================================
+
+@pytest.mark.parametrize("shape", [(4, 16, 64), (2, 8, 32), (128,)])
+def test_tanh(backend, shape):
+    x = np.random.randn(*shape).astype(np.float32)
+    expected = np.tanh(x)
+    output = run_kernel(backend, "TANH", [x], x.shape)
+    np.testing.assert_allclose(output, expected, atol=1e-5)
+
+
+# =====================================================================
+# GELU (tanh approximation)
+# =====================================================================
+
+@pytest.mark.parametrize("shape", [(4, 16, 64), (2, 8, 32), (128,)])
+def test_gelu(backend, shape):
+    x = np.random.randn(*shape).astype(np.float32)
+    # Reference: tanh GELU approximation
+    inner = 0.7978845608 * (x + 0.044715 * np.power(x, 3))
+    expected = 0.5 * x * (1 + np.tanh(inner))
+    output = run_kernel(backend, "GELU", [x], x.shape)
+    np.testing.assert_allclose(output, expected, atol=1e-4)
+
+
+# =====================================================================
+# EMBEDDING
+# =====================================================================
+
+EMBEDDING_CASES = [
+    ("small_1d",    8,  32, (4,)),
+    ("small_2d",    8,  16, (2, 3)),
+    ("medium",      64, 128, (4, 8)),
+]
+
+
+@pytest.mark.parametrize("desc,vocab,dim,ids_shape",
+                         EMBEDDING_CASES, ids=[c[0] for c in EMBEDDING_CASES])
+def test_embedding(backend, desc, vocab, dim, ids_shape):
+    table = np.random.randn(vocab, dim).astype(np.float32)
+    ids = np.random.randint(0, vocab, size=ids_shape).astype(np.int64)
+    expected = table[ids]
+    output_shape = ids_shape + (dim,)
+    output = run_kernel(backend, "EMBEDDING", [ids, table], output_shape)
+    np.testing.assert_allclose(output, expected, atol=1e-6)
+
+
+# =====================================================================
+# SLICE (byte offset view)
+# =====================================================================
+
+SLICE_CASES = [
+    ("chunk0_of_3", (12, 8), 0, 4),   # first 4 rows of a (12,8) tensor
+    ("chunk1_of_3", (12, 8), 1, 4),   # middle 4 rows
+    ("chunk2_of_3", (12, 8), 2, 4),   # last 4 rows
+    ("3D_last_dim", (2, 4, 12), 1, 4),  # split along last dim (contiguous chunks)
+]
+
+
+@pytest.mark.parametrize("desc,input_shape,chunk_idx,chunk_size",
+                         SLICE_CASES, ids=[c[0] for c in SLICE_CASES])
+def test_slice(np_backend, desc, input_shape, chunk_idx, chunk_size):
+    """SLICE is a zero-copy view, so test via the executor per-op path
+    rather than run_kernel (SLICE has no kernel, it's handled by executor).
+
+    SLICE works on flat memory with a byte_offset — only valid for splits
+    where chunks are contiguous (leading dim or last dim of inner-most axis).
+    """
+    from runtime.ir import Graph, OpType
+    from runtime.planner import plan
+    from runtime.executor import Executor
+    from runtime.backends.numpy_backend import NumpyBackend
+
+    x = np.random.randn(*input_shape).astype(np.float32)
+
+    ndim = len(input_shape)
+    if ndim == 2:
+        # Split along dim 0 — chunks are contiguous rows
+        dim = 0
+        trailing = input_shape[1]
+        byte_offset = chunk_idx * chunk_size * trailing * 4
+        expected = x[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size, :]
+        out_shape = (chunk_size, input_shape[1])
+    else:
+        # Split along last dim
+        dim = ndim - 1
+        trailing = 1  # nothing after last dim
+        byte_offset = chunk_idx * chunk_size * trailing * 4
+        expected = x[..., chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+        out_shape = input_shape[:-1] + (chunk_size,)
+
+    start = chunk_idx * chunk_size
+    end = start + chunk_size
+    attrs = {"byte_offset": byte_offset, "dim": dim, "start": start, "end": end}
+
+    # Build graph: input -> SLICE -> output
+    g = Graph()
+    g.add_tensor("x", input_shape)
+    g.inputs.append("x")
+    g.add_tensor("sliced", out_shape)
+    g.add_node(OpType.SLICE, ["x"], "sliced", attrs)
+    # Need a consumer so sliced isn't dead — add an identity ADD(sliced, 0)
+    g.add_tensor("out", out_shape)
+    g.add_node(OpType.ADD, ["sliced"], "out", {"scalar": 0.0})
+    g.outputs.append("out")
+
+    ep = plan(g)
+
+    # For dim=0 splits, SLICE output is an alias (no arena allocation).
+    # For non-leading dims, SLICE output needs arena space (it's a copy).
+    if dim == 0:
+        assert "sliced" not in ep.offsets, "dim=0 SLICE output should be an alias"
+
+    executor = Executor(backends=[NumpyBackend()])
+    result = executor.execute(ep, {"x": x})
+    np.testing.assert_allclose(result["out"], expected, atol=1e-6)

@@ -47,16 +47,20 @@ class Backend(Protocol):
 
 MAX_INPUTS = 8
 MAX_DIMS = 16
-FLOAT_PTR = ctypes.POINTER(ctypes.c_float)
 
 
 class COpNode(ctypes.Structure):
-    """Mirrors the OpNode struct in executor.c."""
+    """Mirrors the OpNode struct in executor.c.
+
+    Pointers are void* (c_void_p) — each dispatch case in C casts to
+    the appropriate type. This allows ops with non-float inputs (e.g.,
+    int64 indices for embedding, int8 weights for quantization).
+    """
     _fields_ = [
         ("op", ctypes.c_int),
         ("n_inputs", ctypes.c_int),
-        ("inputs", FLOAT_PTR * MAX_INPUTS),
-        ("output", FLOAT_PTR),
+        ("inputs", ctypes.c_void_p * MAX_INPUTS),
+        ("output", ctypes.c_void_p),
         ("out_shape", ctypes.c_int * MAX_DIMS),
         ("n_dims", ctypes.c_int),
         ("extra", ctypes.c_int * MAX_DIMS),
@@ -96,6 +100,9 @@ class CompiledPlan:
     input_slots: dict[str, list[tuple[int, int]]]
     # Keep references to scratch views so they aren't garbage collected
     _scratch_views: list[np.ndarray] = field(default_factory=list, repr=False)
+    # Non-alias SLICE ops that need runtime evaluation between C segments.
+    # List of (c_node_index, Node) — the c_node_index is where to split C execution.
+    _slice_ops: list[tuple[int, Node]] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -136,6 +143,26 @@ class Executor:
                 graph.tensors[node.output].buffer = input_buf.reshape(
                     graph.tensors[node.output].shape
                 )
+                continue
+            if node.op == OpType.SLICE:
+                # Zero-copy view into the input buffer along a split dimension
+                input_buf = graph.tensors[node.inputs[0]].buffer
+                out_info = graph.tensors[node.output]
+                dim = node.attrs.get("dim")
+                if dim is not None:
+                    start = node.attrs["start"]
+                    end = node.attrs["end"]
+                    slices = tuple(
+                        slice(start, end) if d == dim else slice(None)
+                        for d in range(input_buf.ndim)
+                    )
+                    out_info.buffer = np.ascontiguousarray(input_buf[slices])
+                else:
+                    byte_offset = node.attrs.get("byte_offset", 0)
+                    dtype = np.dtype(out_info.dtype)
+                    elem_offset = byte_offset // dtype.itemsize
+                    flat = input_buf.ravel()[elem_offset:elem_offset + int(np.prod(out_info.shape))]
+                    out_info.buffer = flat.reshape(out_info.shape)
                 continue
             kernel = self._resolve_kernel(node.op)
             input_buffers = [graph.tensors[inp].buffer for inp in node.inputs]
@@ -204,16 +231,49 @@ class Executor:
         # Bind intermediates so we can grab their pointers
         self._bind_intermediates(graph, plan.offsets, arena)
 
-        # Bind RESHAPE aliases (zero-copy views of their input's buffer)
+        # Bind RESHAPE and alias-SLICE outputs (zero-copy views of their input's buffer).
+        # Non-alias SLICE outputs are arena-allocated; their initial binding happens
+        # via _bind_intermediates above. They'll be populated during execute_compiled.
+        from .planner import _find_reshape_aliases
+        aliases = _find_reshape_aliases(plan.order)
+
         for node in plan.order:
             if node.op == OpType.RESHAPE:
                 inp_buf = graph.tensors[node.inputs[0]].buffer
                 out_tensor = graph.tensors[node.output]
                 out_tensor.buffer = inp_buf.reshape(out_tensor.shape)
+            elif node.op == OpType.SLICE and node.output in aliases:
+                # Alias SLICE: zero-copy view at byte_offset
+                inp_buf = graph.tensors[node.inputs[0]].buffer
+                out_tensor = graph.tensors[node.output]
+                byte_offset = node.attrs.get("byte_offset", 0)
+                dtype = np.dtype(out_tensor.dtype)
+                elem_offset = byte_offset // dtype.itemsize
+                flat = inp_buf.ravel()[elem_offset:elem_offset + int(np.prod(out_tensor.shape))]
+                out_tensor.buffer = flat.reshape(out_tensor.shape)
 
-        # Build the COpNode array — skip RESHAPE nodes since they're
-        # zero-copy aliases already bound above (no C work to do)
-        exec_order = [node for node in plan.order if node.op != OpType.RESHAPE]
+        # Separate the execution order into C-dispatchable nodes and
+        # non-alias SLICE ops that need Python evaluation at runtime.
+        # RESHAPE and alias-SLICE are already bound above (zero-copy).
+        from .planner import _find_reshape_aliases
+        aliases = _find_reshape_aliases(plan.order)
+
+        exec_order = []
+        # Non-alias SLICE ops: (c_node_index, Node) — position where to
+        # pause C execution, run the SLICE in Python, then resume.
+        slice_ops: list[tuple[int, Node]] = []
+
+        for node in plan.order:
+            if node.op == OpType.RESHAPE:
+                continue
+            if node.op == OpType.SLICE:
+                if node.output in aliases:
+                    continue  # alias SLICE — already bound
+                # Non-alias SLICE — record its position in the C order
+                slice_ops.append((len(exec_order), node))
+                continue
+            exec_order.append(node)
+
         n = len(exec_order)
         NodeArray = COpNode * n
         nodes = NodeArray()
@@ -222,6 +282,14 @@ class Executor:
         input_names = set(graph.inputs)
         input_slots: dict[str, list[tuple[int, int]]] = {
             name: [] for name in graph.inputs
+        }
+
+        # Track which C-node slots reference non-alias SLICE outputs
+        # so we can re-patch pointers after each SLICE evaluation.
+        slice_output_names = {node.output for _, node in slice_ops}
+        # Map: slice output tensor name -> list of (c_node_idx, input_slot)
+        slice_patch_slots: dict[str, list[tuple[int, int]]] = {
+            name: [] for name in slice_output_names
         }
 
         # Bind scratch buffers as arena views (keep references to prevent GC)
@@ -237,10 +305,14 @@ class Executor:
                 if inp_name in input_names:
                     # Will be patched per call — record the slot
                     input_slots[inp_name].append((i, j))
-                    c_node.inputs[j] = ctypes.cast(0, FLOAT_PTR)  # NULL for now
+                    c_node.inputs[j] = 0  # NULL for now
+                elif inp_name in slice_output_names:
+                    # Will be patched after SLICE evaluation
+                    slice_patch_slots[inp_name].append((i, j))
+                    c_node.inputs[j] = graph.tensors[inp_name].buffer.ctypes.data
                 else:
                     tensor = graph.tensors[inp_name]
-                    c_node.inputs[j] = tensor.buffer.ctypes.data_as(FLOAT_PTR)
+                    c_node.inputs[j] = tensor.buffer.ctypes.data
 
             # Append scratch pointer as extra input if planner allocated one
             if node.id in plan.scratch:
@@ -248,12 +320,12 @@ class Executor:
                 scratch_view = arena[offset:offset + size_bytes].view(np.float32)
                 scratch_views.append(scratch_view)  # prevent GC
                 scratch_idx = c_node.n_inputs
-                c_node.inputs[scratch_idx] = scratch_view.ctypes.data_as(FLOAT_PTR)
+                c_node.inputs[scratch_idx] = scratch_view.ctypes.data
                 c_node.n_inputs += 1
 
             # Resolve output pointer
             out_tensor = graph.tensors[node.output]
-            c_node.output = out_tensor.buffer.ctypes.data_as(FLOAT_PTR)
+            c_node.output = out_tensor.buffer.ctypes.data
 
             # Fill shape info
             shape = out_tensor.shape
@@ -264,33 +336,85 @@ class Executor:
             # Fill op-specific extras
             self._fill_extras(c_node, node, graph)
 
-        return CompiledPlan(
+        compiled = CompiledPlan(
             nodes=nodes,
             n_nodes=n,
             arena=arena,
             graph=graph,
             input_slots=input_slots,
             _scratch_views=scratch_views,
+            _slice_ops=slice_ops,
         )
+        compiled._slice_patch_slots = slice_patch_slots
+        return compiled
 
     def execute_compiled(self, compiled: CompiledPlan,
                          inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Execute a compiled plan. One ctypes call."""
+        """Execute a compiled plan.
+
+        If the plan has no non-alias SLICE ops, this is one C call.
+        Otherwise, execution is split into segments separated by SLICE
+        operations that are handled in Python.
+        """
+        graph = compiled.graph
+
         # Patch input pointers
         for name, slots in compiled.input_slots.items():
             if name not in inputs:
                 raise ValueError(f"Missing input tensor: '{name}'")
-            ptr = inputs[name].ctypes.data_as(FLOAT_PTR)
+            ptr = inputs[name].ctypes.data
             for node_idx, slot_idx in slots:
                 compiled.nodes[node_idx].inputs[slot_idx] = ptr
 
-        # One C call for the whole plan
-        _c_executor_lib.execute(compiled.nodes, compiled.n_nodes)
+        if not compiled._slice_ops:
+            # Fast path: one C call for the whole plan
+            _c_executor_lib.execute(compiled.nodes, compiled.n_nodes)
+        else:
+            # Graphs with non-alias SLICE nodes (e.g., GPT-2 QKV split) need
+            # Python-side SLICE evaluation between C segments.
+            prev_end = 0
+            for c_idx, slice_node in compiled._slice_ops:
+                # Run C nodes from prev_end to c_idx
+                if c_idx > prev_end:
+                    segment_ptr = ctypes.cast(
+                        ctypes.addressof(compiled.nodes) + prev_end * ctypes.sizeof(COpNode),
+                        ctypes.POINTER(COpNode),
+                    )
+                    _c_executor_lib.execute(segment_ptr, c_idx - prev_end)
+
+                # Execute SLICE in Python
+                inp_buf = graph.tensors[slice_node.inputs[0]].buffer
+                out_tensor = graph.tensors[slice_node.output]
+                dim = slice_node.attrs.get("dim")
+                if dim is not None:
+                    start = slice_node.attrs["start"]
+                    end = slice_node.attrs["end"]
+                    slices = tuple(
+                        slice(start, end) if d == dim else slice(None)
+                        for d in range(inp_buf.ndim)
+                    )
+                    np.copyto(out_tensor.buffer, inp_buf[slices])
+                else:
+                    byte_offset = slice_node.attrs.get("byte_offset", 0)
+                    dtype = np.dtype(out_tensor.dtype)
+                    elem_offset = byte_offset // dtype.itemsize
+                    flat = inp_buf.ravel()[elem_offset:elem_offset + int(np.prod(out_tensor.shape))]
+                    np.copyto(out_tensor.buffer, flat.reshape(out_tensor.shape))
+
+                prev_end = c_idx
+
+            # Run remaining C nodes
+            if prev_end < compiled.n_nodes:
+                segment_ptr = ctypes.cast(
+                    ctypes.addressof(compiled.nodes) + prev_end * ctypes.sizeof(COpNode),
+                    ctypes.POINTER(COpNode),
+                )
+                _c_executor_lib.execute(segment_ptr, compiled.n_nodes - prev_end)
 
         # Collect outputs
         return {
-            name: compiled.graph.tensors[name].buffer.copy()
-            for name in compiled.graph.outputs
+            name: graph.tensors[name].buffer.copy()
+            for name in graph.outputs
         }
 
     @staticmethod
@@ -367,9 +491,20 @@ class Executor:
             c_node.extra[0] = struct.unpack('i', struct.pack('f', eps))[0]
 
         elif node.op == OpType.ATTENTION:
-            # extra[0] = seq_len, extra[1] = head_dim
+            # extra[0] = seq_len, extra[1] = head_dim, extra[2] = causal
             # Q shape is [..., seq_len, head_dim] (3D or 4D)
             q_shape = graph.tensors[node.inputs[0]].shape
             c_node.extra[0] = q_shape[-2]  # seq_len
             c_node.extra[1] = q_shape[-1]  # head_dim
+            c_node.extra[2] = 1 if node.attrs.get("causal") else 0
+
+        elif node.op == OpType.POW:
+            # extra[0] = scalar exponent as float bits
+            scalar = node.attrs.get("scalar", 2.0)
+            c_node.extra[0] = struct.unpack('i', struct.pack('f', scalar))[0]
+
+        elif node.op == OpType.EMBEDDING:
+            # extra[0] = embed_dim (from weight table shape[-1])
+            weight_shape = graph.tensors[node.inputs[1]].shape
+            c_node.extra[0] = weight_shape[-1]
 

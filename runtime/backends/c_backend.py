@@ -116,6 +116,24 @@ def _load_library() -> ctypes.CDLL | None:
         fn.argtypes = [FLOAT_PTR, ctypes.c_float, FLOAT_PTR, ctypes.c_int]
         fn.restype = None
 
+    # Pow scalar: (x, scalar, out, n)
+    lib.kernel_pow_scalar.argtypes = [FLOAT_PTR, ctypes.c_float, FLOAT_PTR, ctypes.c_int]
+    lib.kernel_pow_scalar.restype = None
+
+    # Tanh: (x, out, n)
+    lib.kernel_tanh.argtypes = [FLOAT_PTR, FLOAT_PTR, ctypes.c_int]
+    lib.kernel_tanh.restype = None
+
+    # GELU tanh approximation: (x, out, n)
+    lib.kernel_gelu_tanh.argtypes = [FLOAT_PTR, FLOAT_PTR, ctypes.c_int]
+    lib.kernel_gelu_tanh.restype = None
+
+    # Embedding: (ids, table, out, n_ids, embed_dim)
+    LONG_PTR = ctypes.POINTER(ctypes.c_long)
+    lib.kernel_embedding.argtypes = [LONG_PTR, FLOAT_PTR, FLOAT_PTR,
+                                     ctypes.c_int, ctypes.c_int]
+    lib.kernel_embedding.restype = None
+
     return lib
 
 
@@ -497,15 +515,73 @@ def _wrap_attention(lib: ctypes.CDLL) -> KernelFn:
     Inputs: [Q, K, V, scratch] — scratch is appended by the executor
     from the planner's scratch allocation.
     Q, K, V: [..., seq_len, head_dim] (leading dims are batch)
+
+    Falls back to numpy for causal masking if the C kernel doesn't support it.
     """
     def kernel(inputs: list[np.ndarray], output: np.ndarray,
                attrs: dict[str, Any]) -> None:
         Q, K, V, scratch = inputs[0], inputs[1], inputs[2], inputs[3]
         seq_len, head_dim = Q.shape[-2], Q.shape[-1]
         batch_heads = Q.size // (seq_len * head_dim)
-        lib.kernel_attention(_as_ptr(Q), _as_ptr(K), _as_ptr(V),
-                             _as_ptr(output), _as_ptr(scratch),
-                             batch_heads, seq_len, head_dim)
+
+        if attrs.get("causal"):
+            # Causal attention: apply upper-triangular mask before softmax
+            scale = 1.0 / np.sqrt(head_dim)
+            scores = np.matmul(Q, np.swapaxes(K, -2, -1)) * scale
+            mask = np.triu(np.full((seq_len, seq_len), -np.inf, dtype=np.float32), k=1)
+            scores = scores + mask
+            scores -= np.max(scores, axis=-1, keepdims=True)
+            e = np.exp(scores)
+            weights = e / np.sum(e, axis=-1, keepdims=True)
+            np.matmul(weights, V, out=output)
+        else:
+            lib.kernel_attention(_as_ptr(Q), _as_ptr(K), _as_ptr(V),
+                                 _as_ptr(output), _as_ptr(scratch),
+                                 batch_heads, seq_len, head_dim)
+    return kernel
+
+
+def _wrap_pow_scalar(lib: ctypes.CDLL) -> KernelFn:
+    """Wrap kernel_pow_scalar: element-wise x^scalar."""
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        lib.kernel_pow_scalar(_as_ptr(inputs[0]),
+                              ctypes.c_float(attrs["scalar"]),
+                              _as_ptr(output), inputs[0].size)
+    return kernel
+
+
+def _wrap_tanh(lib: ctypes.CDLL) -> KernelFn:
+    """Wrap kernel_tanh: element-wise tanh."""
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        lib.kernel_tanh(_as_ptr(inputs[0]), _as_ptr(output), inputs[0].size)
+    return kernel
+
+
+def _wrap_gelu(lib: ctypes.CDLL) -> KernelFn:
+    """Wrap kernel_gelu_tanh: GELU with tanh approximation."""
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        lib.kernel_gelu_tanh(_as_ptr(inputs[0]), _as_ptr(output), inputs[0].size)
+    return kernel
+
+
+def _wrap_embedding(lib: ctypes.CDLL) -> KernelFn:
+    """Wrap kernel_embedding: table lookup.
+
+    Inputs: [indices (int64), weight_table (float32)]
+    """
+    LONG_PTR = ctypes.POINTER(ctypes.c_long)
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        ids = inputs[0].astype(np.int64, copy=False)
+        table = inputs[1]
+        embed_dim = table.shape[-1]
+        n_ids = ids.size
+        lib.kernel_embedding(ids.ctypes.data_as(LONG_PTR),
+                             _as_ptr(table), _as_ptr(output),
+                             n_ids, embed_dim)
     return kernel
 
 
@@ -534,6 +610,10 @@ class CBackend:
                 OpType.LAYERNORM: _wrap_layernorm(self._lib),
                 OpType.FUSED_BIAS_RELU: _wrap_bias_relu(self._lib),
                 OpType.ATTENTION: _wrap_attention(self._lib),
+                OpType.POW: _wrap_pow_scalar(self._lib),
+                OpType.TANH: _wrap_tanh(self._lib),
+                OpType.GELU: _wrap_gelu(self._lib),
+                OpType.EMBEDDING: _wrap_embedding(self._lib),
             }
 
     @property

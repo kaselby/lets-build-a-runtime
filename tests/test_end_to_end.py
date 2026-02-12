@@ -244,3 +244,91 @@ def test_sdpa_transformer_compiled_reuse(batch, seq, d_model, n_heads):
         result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
         output = result[graph.outputs[0]]
         np.testing.assert_allclose(output, expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# GPT-2 body end-to-end tests
+# ---------------------------------------------------------------------------
+
+import torch.nn as nn
+from transformers import GPT2LMHeadModel, GPT2Config
+
+
+class GPT2Body(nn.Module):
+    """GPT-2 transformer body: blocks + final layernorm. No embeddings or LM head."""
+    def __init__(self, model):
+        super().__init__()
+        self.h = model.transformer.h
+        self.ln_f = model.transformer.ln_f
+
+    def forward(self, hidden_states):
+        for block in self.h:
+            hidden_states = block(hidden_states)[0]
+        return self.ln_f(hidden_states)
+
+
+def _make_gpt2_body():
+    """Create a GPT-2 body model with 2 layers, 12 heads, 768 dim."""
+    config = GPT2Config(
+        n_layer=2,
+        n_head=12,
+        n_embd=768,
+        vocab_size=50257,
+    )
+    full_model = GPT2LMHeadModel(config)
+    full_model.eval()
+    body = GPT2Body(full_model)
+    body.eval()
+    return body
+
+
+GPT2_SEQ_LENGTHS = [1, 16, 64]
+
+
+@pytest.mark.parametrize("seq_len", GPT2_SEQ_LENGTHS)
+@pytest.mark.parametrize("backend_name", ["numpy", "c"])
+def test_gpt2_body_per_op(seq_len, backend_name):
+    """Per-op dispatch: GPT-2 body matches PyTorch across sequence lengths."""
+    model = _make_gpt2_body()
+    x = torch.randn(1, seq_len, 768)
+
+    with torch.no_grad():
+        expected = model(x).numpy()
+
+    graph = export_model(model, (x,))
+    run_pipeline(graph)
+    ep = plan(graph)
+
+    if backend_name == "numpy":
+        executor = Executor(backends=[NumpyBackend()])
+    else:
+        executor = Executor(backends=[CBackend(), NumpyBackend()])
+
+    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    output = result[graph.outputs[0]]
+    np.testing.assert_allclose(output, expected, atol=1e-4)
+
+
+@pytest.mark.parametrize("seq_len", GPT2_SEQ_LENGTHS)
+def test_gpt2_body_compiled(seq_len):
+    """Compiled C executor: GPT-2 body matches PyTorch.
+
+    For seq_len=1, the causal mask is trivial so SLICE produces
+    correct results even in compiled mode. For seq_len>1, the compiled
+    path uses segmented execution for non-contiguous SLICE ops.
+    """
+    model = _make_gpt2_body()
+    x = torch.randn(1, seq_len, 768)
+
+    with torch.no_grad():
+        expected = model(x).numpy()
+
+    graph = export_model(model, (x,))
+    run_pipeline(graph)
+    ep = plan(graph)
+
+    executor = Executor(backends=[CBackend(), NumpyBackend()])
+    compiled = executor.compile_plan(ep)
+    result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+    output = result[graph.outputs[0]]
+    np.testing.assert_allclose(output, expected, atol=1e-4)

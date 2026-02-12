@@ -3,6 +3,7 @@ Transformer ablation benchmark: attention / layernorm / other time breakdown.
 
 Measures performance across:
   - PyTorch baselines (naive F.softmax + SDPA)
+  - ONNX Runtime baselines (no optimizations, full optimizations, multi-threaded)
   - Python executor (numpy + C backends, with fusion)
   - Compiled C executor with incremental fusion
   - Attention kernel variants (scalar, SIMD, SIMD+GCD)
@@ -17,7 +18,10 @@ Run:  python bench_transformer_ablation.py [--configs toy,small,...] [--skip-lar
 import argparse
 import ctypes
 import math
+import os
 import sys
+import tempfile
+import warnings
 from pathlib import Path
 
 # Ensure the project root is on the path so 'runtime' is importable
@@ -33,7 +37,7 @@ import torch.nn.functional as F
 from runtime.backends.c_backend import CBackend
 from runtime.backends.numpy_backend import NumpyBackend
 from runtime.exporter import export_model
-from runtime.executor import COpNode, Executor, FLOAT_PTR, MAX_DIMS, MAX_INPUTS
+from runtime.executor import COpNode, Executor, MAX_DIMS, MAX_INPUTS
 from runtime.ir import OpType
 from runtime.passes import (
     FUSION_PATTERNS,
@@ -43,6 +47,12 @@ from runtime.passes import (
     fuse,
 )
 from runtime.planner import plan
+
+try:
+    import onnxruntime as ort
+    HAS_ORT = True
+except ImportError:
+    HAS_ORT = False
 
 
 # =====================================================================
@@ -249,7 +259,7 @@ def classify_op_indices(graph, exec_order):
 def _patch_inputs(compiled_plan, inputs):
     """Patch graph input pointers into the compiled plan's COpNode array."""
     for name, slots in compiled_plan.input_slots.items():
-        ptr = inputs[name].ctypes.data_as(FLOAT_PTR)
+        ptr = inputs[name].ctypes.data
         for node_idx, slot_idx in slots:
             compiled_plan.nodes[node_idx].inputs[slot_idx] = ptr
 
@@ -453,6 +463,71 @@ def _median(values):
 
 
 # =====================================================================
+# ONNX Runtime helpers
+# =====================================================================
+
+def export_to_onnx(model: nn.Module, x: torch.Tensor) -> str:
+    """Export a PyTorch model to a temporary ONNX file. Returns the path."""
+    import logging
+    fd, path = tempfile.mkstemp(suffix=".onnx")
+    os.close(fd)
+    # Suppress verbose torch.onnx export logging (stdout progress + stderr warnings)
+    import logging
+    loggers = ["torch.onnx", "onnxscript"]
+    old_levels = {name: logging.getLogger(name).level for name in loggers}
+    for name in loggers:
+        logging.getLogger(name).setLevel(logging.ERROR)
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    devnull = open(os.devnull, "w")
+    try:
+        sys.stdout = devnull
+        sys.stderr = devnull
+        with torch.no_grad(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch.onnx.export(model, (x,), path,
+                              input_names=["input"], output_names=["output"],
+                              opset_version=18)
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        devnull.close()
+        for name, level in old_levels.items():
+            logging.getLogger(name).setLevel(level)
+    return path
+
+
+def bench_ort(onnx_path: str, x_np: np.ndarray,
+              opt_level, n_threads: int,
+              warmup: int, iters: int):
+    """Benchmark an ONNX Runtime session. Returns (total_us, 0, 0, 0).
+
+    No per-op breakdown available — only total inference time.
+    """
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = opt_level
+    opts.intra_op_num_threads = n_threads
+    opts.inter_op_num_threads = 1
+    opts.log_severity_level = 3  # suppress warnings
+    session = ort.InferenceSession(onnx_path, opts,
+                                   providers=["CPUExecutionProvider"])
+
+    feed = {"input": x_np}
+    # Warmup
+    for _ in range(warmup):
+        session.run(None, feed)
+
+    # Timed iterations
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter_ns()
+        session.run(None, feed)
+        times.append((time.perf_counter_ns() - t0) / 1000)
+
+    total = _median(times)
+    return total, 0.0, 0.0, total  # no breakdown — all goes in "other"
+
+
+# =====================================================================
 # Variant definitions
 # =====================================================================
 
@@ -467,7 +542,7 @@ class Result:
 @dataclass
 class Variant:
     name: str
-    # "pytorch_naive", "pytorch_sdpa", "python_numpy", "python_c", "compiled"
+    # "pytorch_naive", "pytorch_sdpa", "python_numpy", "python_c", "compiled", "ort"
     mode: str
     pipeline: object = None  # callable or None
     softmax_mode: int = 0    # 0=SIMD, 1=scalar
@@ -475,12 +550,34 @@ class Variant:
     layernorm_mode: int = 2  # 0=scalar, 1=SIMD, 2=SIMD+GCD
     group: str = ""          # for display grouping
     large: bool = True       # include in large-config runs
+    ort_opt_level: object = None   # ort.GraphOptimizationLevel (set at runtime)
+    ort_threads: int = 1           # intra_op_num_threads for ORT
 
 
 VARIANTS = [
     # --- Baselines ---
     Variant("PT naive",           "pytorch_naive",  group="Baselines"),
-    Variant("PT SDPA",            "pytorch_sdpa",   group="Baselines"),
+    Variant("PT SDPA",            "pytorch_sdpa",   group="Baselines"),]
+
+# ORT variants are appended at runtime once we know ort is available
+def _build_ort_variants():
+    if not HAS_ORT:
+        return []
+    return [
+        Variant("ORT no-opt 1T",      "ort", group="ONNX Runtime",
+                ort_opt_level=ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+                ort_threads=1, large=False),
+        Variant("ORT optimized 1T",   "ort", group="ONNX Runtime",
+                ort_opt_level=ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+                ort_threads=1),
+        Variant("ORT optimized MT",   "ort", group="ONNX Runtime",
+                ort_opt_level=ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+                ort_threads=0),  # 0 = ORT picks based on cores
+    ]
+
+VARIANTS += _build_ort_variants()
+
+VARIANTS += [
 
     # --- Python executor ---
     Variant("Numpy per-op",       "python_numpy", pipeline_full, group="Python exec",
@@ -571,6 +668,12 @@ def run_config(cfg: Config, lib):
     x_torch = torch.randn(cfg.batch, cfg.seq_len, cfg.d_model)
     x_np = x_torch.numpy().copy()
 
+    # Export ONNX model once for all ORT variants
+    onnx_path = None
+    has_ort_variants = any(v.mode == "ort" for v in variants)
+    if has_ort_variants and HAS_ORT:
+        onnx_path = export_to_onnx(naive_model, x_torch)
+
     results: dict[str, Result] = {}
 
     header = (f"  {'Variant':<24} {'Total':>9} {'Attn':>9} {'LN':>9} "
@@ -631,19 +734,34 @@ def run_config(cfg: Config, lib):
                     v.softmax_mode, v.attn_mode, v.layernorm_mode,
                     cfg.warmup, cfg.iters)
 
+            elif v.mode == "ort":
+                total, attn, ln, other = bench_ort(
+                    onnx_path, x_np, v.ort_opt_level, v.ort_threads,
+                    cfg.warmup, cfg.iters)
+
             results[v.name] = Result(total, attn, ln, other)
 
             pt_total = results.get("PT naive", Result(1, 0, 0, 0)).total_us
-            attn_pct = (attn / total * 100) if total > 0 else 0
-            ln_pct = (ln / total * 100) if total > 0 else 0
             vs_pt = total / pt_total if pt_total > 0 else 0
 
-            print(f"  {v.name:<24} {_fmt(total):>9} {_fmt(attn):>9} "
-                  f"{_fmt(ln):>9} {_fmt(other):>9} "
-                  f"{attn_pct:5.1f}% {ln_pct:4.1f}% {vs_pt:6.2f}x")
+            if v.mode == "ort":
+                # No per-op breakdown for ORT
+                print(f"  {v.name:<24} {_fmt(total):>9} {'—':>9} "
+                      f"{'—':>9} {'—':>9} "
+                      f"{'—':>6} {'—':>5} {vs_pt:6.2f}x")
+            else:
+                attn_pct = (attn / total * 100) if total > 0 else 0
+                ln_pct = (ln / total * 100) if total > 0 else 0
+                print(f"  {v.name:<24} {_fmt(total):>9} {_fmt(attn):>9} "
+                      f"{_fmt(ln):>9} {_fmt(other):>9} "
+                      f"{attn_pct:5.1f}% {ln_pct:4.1f}% {vs_pt:6.2f}x")
 
         except Exception as e:
             print(f"  {v.name:<24} FAILED: {e}")
+
+    # Cleanup temp ONNX file
+    if onnx_path and os.path.exists(onnx_path):
+        os.unlink(onnx_path)
 
     return results
 
@@ -669,6 +787,7 @@ def main():
 
     lib = _load_ablation_lib()
     print(f"Loaded ablation library")
+    print(f"ONNX Runtime: {'v' + ort.__version__ if HAS_ORT else 'not available'}")
     print(f"Running {len(configs)} configs x {len(VARIANTS)} variants")
 
     all_results = {}
@@ -677,18 +796,21 @@ def main():
 
     # Summary
     print(f"\n{'='*100}")
-    print("  SUMMARY: Best compiled variant vs PyTorch baselines")
+    print("  SUMMARY: Best compiled variant vs baselines")
     print(f"{'='*100}")
-    print(f"  {'Config':<12} {'PT naive':>10} {'PT SDPA':>10} {'Best ours':>10} "
-          f"{'vs naive':>8} {'vs SDPA':>8}")
-    print(f"  {'-'*62}")
+    print(f"  {'Config':<12} {'PT naive':>10} {'PT SDPA':>10} {'ORT opt':>10} "
+          f"{'Best ours':>10} {'vs PT':>7} {'vs SDPA':>7} {'vs ORT':>7}")
+    print(f"  {'-'*82}")
     for cfg in configs:
         r = all_results.get(cfg.name, {})
         pt_naive = r.get("PT naive", Result(0, 0, 0, 0)).total_us
         pt_sdpa = r.get("PT SDPA", Result(0, 0, 0, 0)).total_us
+        ort_opt = r.get("ORT optimized 1T", r.get("ORT optimized MT", Result(0, 0, 0, 0))).total_us
+        # Find best compiled variant (exclude baselines, python exec, and ORT)
         best_name, best_total = "", float("inf")
         for name, res in r.items():
-            if name.startswith("PT ") or name in ("Numpy per-op", "C per-op"):
+            if name.startswith("PT ") or name.startswith("ORT ") \
+                    or name in ("Numpy per-op", "C per-op"):
                 continue
             if res.total_us < best_total:
                 best_total = res.total_us
@@ -696,8 +818,13 @@ def main():
         if best_total < float("inf"):
             vs_naive = best_total / pt_naive if pt_naive > 0 else 0
             vs_sdpa = best_total / pt_sdpa if pt_sdpa > 0 else 0
+            vs_ort = best_total / ort_opt if ort_opt > 0 else 0
+            ort_str = _fmt(ort_opt) if ort_opt > 0 else "—"
+            vs_ort_str = f"{vs_ort:6.2f}x" if ort_opt > 0 else "     —"
             print(f"  {cfg.name:<12} {_fmt(pt_naive):>10} {_fmt(pt_sdpa):>10} "
-                  f"{_fmt(best_total):>10} {vs_naive:7.2f}x {vs_sdpa:7.2f}x  ({best_name})")
+                  f"{ort_str:>10} {_fmt(best_total):>10} "
+                  f"{vs_naive:6.2f}x {vs_sdpa:6.2f}x {vs_ort_str}"
+                  f"  ({best_name})")
 
 
 if __name__ == "__main__":

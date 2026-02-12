@@ -52,6 +52,13 @@ class OpType(Enum):
     FUSED_BIAS_RELU = auto()    # Fused bias add + relu; inputs: [x, bias]
     ATTENTION = auto()          # Fused multi-head attention; inputs: [Q, K, V], scratch: [BH × S × S]
 
+    # --- GPT-2 ops (values 18-22) ---
+    SLICE = auto()           # Zero-copy slice; attrs["byte_offset"]
+    POW = auto()             # Element-wise power; attrs["scalar"]
+    TANH = auto()            # Element-wise tanh
+    GELU = auto()            # GELU activation (tanh approximation)
+    EMBEDDING = auto()       # Table lookup; inputs: [indices, weight_table]
+
 
 @dataclass
 class TensorInfo:

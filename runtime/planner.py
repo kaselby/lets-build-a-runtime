@@ -167,30 +167,43 @@ def plan(graph: Graph) -> ExecutionPlan:
     )
 
 
-def _find_reshape_aliases(order: list[Node]) -> dict[str, str]:
-    """Build a map of RESHAPE output tensors to their root (non-RESHAPE) inputs.
+def _find_reshape_aliases(order: list[Node]) -> dict[str, tuple[str, int]]:
+    """Build a map of RESHAPE/SLICE output tensors to their root input and byte offset.
 
+    RESHAPE aliases have offset 0 (same start as input).
+    SLICE aliases are only created for contiguous splits (no dim attr or
+    dim=0), where the byte_offset flat-view approach works. Non-contiguous
+    SLICE outputs (splits along non-leading dims) need their own arena space
+    and are handled as copies by the executor.
     Follows chains: if A → RESHAPE → B → RESHAPE → C, both B and C
-    map to A. This ensures all aliases point to the tensor that actually
-    needs arena space.
+    map to (A, 0). This ensures all aliases point to the tensor that
+    actually needs arena space.
     """
-    aliases: dict[str, str] = {}
+    aliases: dict[str, tuple[str, int]] = {}
     for node in order:
         if node.op == OpType.RESHAPE:
             input_name = node.inputs[0]
-            # Follow the chain to the root
-            root = aliases.get(input_name, input_name)
-            aliases[node.output] = root
+            root, base_offset = aliases.get(input_name, (input_name, 0))
+            aliases[node.output] = (root, base_offset)
+        elif node.op == OpType.SLICE:
+            # Only alias if the split produces a contiguous view (no dim attr
+            # means legacy byte_offset-only, or dim=0 where chunks are contiguous)
+            dim = node.attrs.get("dim")
+            if dim is None or dim == 0:
+                input_name = node.inputs[0]
+                root, base_offset = aliases.get(input_name, (input_name, 0))
+                byte_offset = node.attrs.get("byte_offset", 0)
+                aliases[node.output] = (root, base_offset + byte_offset)
     return aliases
 
 
 def _compute_lifetimes(graph: Graph, order: list[Node],
-                       aliases: dict[str, str] | None = None) -> list[Lifetime]:
+                       aliases: dict[str, tuple[str, int]] | None = None) -> list[Lifetime]:
     """Compute the lifetime of each intermediate tensor.
 
     Inputs and constants are excluded — they live outside the arena.
-    Aliases (from RESHAPE) are resolved to their root tensor, extending
-    the root's lifetime to cover the alias's consumers.
+    Aliases (from RESHAPE/SLICE) are resolved to their root tensor,
+    extending the root's lifetime to cover the alias's consumers.
     """
     aliases = aliases or {}
     external = set(graph.inputs) | set(graph.constants)
@@ -203,18 +216,18 @@ def _compute_lifetimes(graph: Graph, order: list[Node],
     alias_set = set(aliases.keys())
 
     for step, node in enumerate(order):
-        # RESHAPE outputs don't get arena space — skip them.
+        # RESHAPE/SLICE outputs don't get arena space — skip them.
         # Non-alias outputs are born at this step.
         if node.output not in external and node.output not in alias_set:
             born_at[node.output] = step
 
         # Each input tensor's death is extended to at least this step.
-        # Resolve aliases so consuming a reshaped tensor extends the
-        # root tensor's lifetime.
+        # Resolve aliases so consuming a reshaped/sliced tensor extends
+        # the root tensor's lifetime.
         for inp in node.inputs:
-            resolved = aliases.get(inp, inp)
-            if resolved not in external:
-                dies_at[resolved] = step
+            root, _offset = aliases.get(inp, (inp, 0))
+            if root not in external:
+                dies_at[root] = step
 
     # Build Lifetime objects for all intermediate tensors
     lifetimes = []

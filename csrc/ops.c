@@ -648,3 +648,70 @@ void kernel_bias_relu(const float* a, const float* bias, float* out,
     }
 }
 
+/* ----------------------------------------------------------------
+ * POW_SCALAR: out = x^scalar  (element-wise)
+ *   x: [n] (flat)
+ *   out: [n] (flat)
+ * ---------------------------------------------------------------- */
+void kernel_pow_scalar(const float* x, float scalar, float* out, int n) {
+    for (int i = 0; i < n; i++) {
+        out[i] = powf(x[i], scalar);
+    }
+}
+
+/* ----------------------------------------------------------------
+ * TANH: out = tanh(x)  (element-wise)
+ *   x: [n] (flat)
+ *   out: [n] (flat)
+ * ---------------------------------------------------------------- */
+void kernel_tanh(const float* x, float* out, int n) {
+    for (int i = 0; i < n; i++) {
+        out[i] = tanhf(x[i]);
+    }
+}
+
+/* ----------------------------------------------------------------
+ * GELU (tanh approximation):
+ *   out = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+ *
+ *   On macOS, uses Accelerate's vvtanhf for SIMD vectorization of
+ *   the tanh part, same approach as kernel_softmax with vvexpf.
+ * ---------------------------------------------------------------- */
+void kernel_gelu_tanh(const float* x, float* out, int n) {
+#ifdef __APPLE__
+    /* Compute the tanh argument: sqrt(2/pi) * (x + 0.044715 * x^3) */
+    for (int i = 0; i < n; i++) {
+        float xi = x[i];
+        out[i] = 0.7978845608f * (xi + 0.044715f * xi * xi * xi);
+    }
+    /* Vectorized tanh via Accelerate (NEON SIMD) */
+    vvtanhf(out, out, &n);
+    /* Final: 0.5 * x * (1 + tanh_result) */
+    for (int i = 0; i < n; i++) {
+        out[i] = 0.5f * x[i] * (1.0f + out[i]);
+    }
+#else
+    for (int i = 0; i < n; i++) {
+        float xi = x[i];
+        out[i] = 0.5f * xi * (1.0f + tanhf(0.7978845608f * (xi + 0.044715f * xi * xi * xi)));
+    }
+#endif
+}
+
+/* ----------------------------------------------------------------
+ * EMBEDDING: table lookup
+ *   ids: [seq_len] (integer token IDs, stored as long)
+ *   table: [vocab_size x embed_dim] (row-major)
+ *   out: [seq_len x embed_dim]
+ *
+ *   Copies one row of the embedding table per token via memcpy.
+ * ---------------------------------------------------------------- */
+void kernel_embedding(const long* ids, const float* table, float* out,
+                      int seq_len, int embed_dim) {
+    for (int i = 0; i < seq_len; i++) {
+        memcpy(out + i * embed_dim,
+               table + ids[i] * embed_dim,
+               embed_dim * sizeof(float));
+    }
+}
+

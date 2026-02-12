@@ -471,3 +471,182 @@ def test_mlp_fusion_correctness():
     executor = Executor(backends=[NumpyBackend()])
     result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
     np.testing.assert_allclose(result[graph.outputs[0]], expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# GELU recognition pass
+# ---------------------------------------------------------------------------
+
+from runtime.passes import recognize_gelu
+
+
+def _build_gelu_graph():
+    """Build a graph with the 8-node GELU tanh approximation pattern.
+
+    Pattern: x -> pow(3) -> mul(0.044715) -> add(x) -> mul(sqrt(2/pi))
+             -> tanh -> add(1.0) -> mul(half_x)
+    where half_x = mul(x, 0.5)
+    """
+    g = Graph()
+    shape = (4, 8)
+
+    # Graph input
+    g.add_tensor("x", shape)
+    g.inputs.append("x")
+
+    # pow(x, 3)
+    g.add_tensor("pow_out", shape)
+    g.add_node(OpType.POW, ["x"], "pow_out", {"scalar": 3.0})
+
+    # mul(pow_out, 0.044715)
+    g.add_tensor("mul_coeff_out", shape)
+    g.add_node(OpType.MUL, ["pow_out"], "mul_coeff_out", {"scalar": 0.044715})
+
+    # add(x, mul_coeff_out)  — tensor-tensor add
+    g.add_tensor("add_inner_out", shape)
+    g.add_node(OpType.ADD, ["x", "mul_coeff_out"], "add_inner_out")
+
+    # mul(add_inner_out, sqrt(2/pi))
+    g.add_tensor("mul_sqrt2pi_out", shape)
+    g.add_node(OpType.MUL, ["add_inner_out"], "mul_sqrt2pi_out", {"scalar": 0.7978845608})
+
+    # tanh(mul_sqrt2pi_out)
+    g.add_tensor("tanh_out", shape)
+    g.add_node(OpType.TANH, ["mul_sqrt2pi_out"], "tanh_out")
+
+    # add(tanh_out, 1.0)
+    g.add_tensor("add_one_out", shape)
+    g.add_node(OpType.ADD, ["tanh_out"], "add_one_out", {"scalar": 1.0})
+
+    # mul(x, 0.5) — half_x
+    g.add_tensor("half_x", shape)
+    g.add_node(OpType.MUL, ["x"], "half_x", {"scalar": 0.5})
+
+    # mul(add_one_out, half_x) — final_output
+    g.add_tensor("final", shape)
+    g.add_node(OpType.MUL, ["add_one_out", "half_x"], "final")
+    g.outputs.append("final")
+
+    return g
+
+
+def test_gelu_recognition_collapses():
+    """The 8-node GELU pattern should collapse to a single GELU node."""
+    g = _build_gelu_graph()
+    assert len(g.nodes) == 8
+
+    changed = recognize_gelu(g)
+    assert changed is True
+
+    nodes = list(g)
+    assert len(nodes) == 1
+    assert nodes[0].op == OpType.GELU
+    assert nodes[0].inputs == ["x"]
+    assert nodes[0].output == "final"
+
+
+def test_gelu_recognition_correctness():
+    """Collapsed GELU should produce the same result as the 8-node pattern."""
+    g = _build_gelu_graph()
+
+    # Compute reference from the formula
+    x = np.random.randn(4, 8).astype(np.float32)
+    inner = 0.7978845608 * (x + 0.044715 * np.power(x, 3))
+    expected = 0.5 * x * (1 + np.tanh(inner))
+
+    recognize_gelu(g)
+    eliminate_dead_code(g)
+    ep = plan(g)
+    executor = Executor(backends=[NumpyBackend()])
+    result = executor.execute(ep, {"x": x})
+    np.testing.assert_allclose(result["final"], expected, atol=1e-5)
+
+
+def test_gelu_recognition_negative_partial():
+    """A partial GELU pattern (missing the tanh) should NOT be recognized."""
+    g = Graph()
+    shape = (4, 8)
+    g.add_tensor("x", shape)
+    g.inputs.append("x")
+    # Just pow -> mul -> add (incomplete pattern)
+    g.add_tensor("pow_out", shape)
+    g.add_node(OpType.POW, ["x"], "pow_out", {"scalar": 3.0})
+    g.add_tensor("mul_out", shape)
+    g.add_node(OpType.MUL, ["pow_out"], "mul_out", {"scalar": 0.044715})
+    g.add_tensor("add_out", shape)
+    g.add_node(OpType.ADD, ["x", "mul_out"], "add_out")
+    g.outputs.append("add_out")
+
+    changed = recognize_gelu(g)
+    assert changed is False
+    assert len(g.nodes) == 3  # unchanged
+
+
+def test_gelu_recognition_negative_wrong_scalar():
+    """GELU pattern with wrong scalar should NOT match."""
+    g = _build_gelu_graph()
+    # Tamper with the sqrt(2/pi) scalar to make it wrong
+    for node in g.nodes.values():
+        if node.op == OpType.MUL and node.attrs.get("scalar") == 0.7978845608:
+            node.attrs["scalar"] = 0.5  # wrong value
+            break
+
+    changed = recognize_gelu(g)
+    assert changed is False
+
+
+def test_gelu_in_full_pipeline():
+    """GELU recognition should integrate with the full pipeline.
+
+    Build a graph: x -> MATMUL -> ADD (bias) -> GELU_pattern -> output
+    After full pipeline: should have MATMUL_ADD and GELU nodes.
+    """
+    g = Graph()
+    shape = (4, 8)
+    dim = 8
+
+    g.add_tensor("x", shape)
+    g.inputs.append("x")
+
+    w = np.random.randn(dim, dim).astype(np.float32)
+    g.add_tensor("w", (dim, dim))
+    g.tensors["w"].buffer = w
+    g.constants.append("w")
+
+    b = np.random.randn(dim).astype(np.float32)
+    g.add_tensor("b", (dim,))
+    g.tensors["b"].buffer = b
+    g.constants.append("b")
+
+    # MATMUL(x, w)
+    g.add_tensor("mm", shape)
+    g.add_node(OpType.MATMUL, ["x", "w"], "mm")
+
+    # ADD(mm, b) — bias
+    g.add_tensor("biased", shape)
+    g.add_node(OpType.ADD, ["mm", "b"], "biased")
+
+    # GELU pattern on biased
+    g.add_tensor("pow_out", shape)
+    g.add_node(OpType.POW, ["biased"], "pow_out", {"scalar": 3.0})
+    g.add_tensor("mul_coeff_out", shape)
+    g.add_node(OpType.MUL, ["pow_out"], "mul_coeff_out", {"scalar": 0.044715})
+    g.add_tensor("add_inner_out", shape)
+    g.add_node(OpType.ADD, ["biased", "mul_coeff_out"], "add_inner_out")
+    g.add_tensor("mul_sqrt2pi_out", shape)
+    g.add_node(OpType.MUL, ["add_inner_out"], "mul_sqrt2pi_out", {"scalar": 0.7978845608})
+    g.add_tensor("tanh_out", shape)
+    g.add_node(OpType.TANH, ["mul_sqrt2pi_out"], "tanh_out")
+    g.add_tensor("add_one_out", shape)
+    g.add_node(OpType.ADD, ["tanh_out"], "add_one_out", {"scalar": 1.0})
+    g.add_tensor("half_x", shape)
+    g.add_node(OpType.MUL, ["biased"], "half_x", {"scalar": 0.5})
+    g.add_tensor("final", shape)
+    g.add_node(OpType.MUL, ["add_one_out", "half_x"], "final")
+    g.outputs.append("final")
+
+    run_pipeline(g)
+    ops = [n.op for n in g]
+    assert OpType.GELU in ops
+    # MATMUL + ADD should be fused into MATMUL_ADD (priority 1, after GELU recognition)
+    assert OpType.MATMUL_ADD in ops

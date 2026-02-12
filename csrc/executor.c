@@ -31,6 +31,11 @@
 #define OP_MATMUL_ADD 15
 #define OP_FUSED_BIAS_RELU 16
 #define OP_ATTENTION 17
+#define OP_SLICE     18
+#define OP_POW       19
+#define OP_TANH      20
+#define OP_GELU      21
+#define OP_EMBEDDING 22
 
 #define MAX_INPUTS 8
 #define MAX_DIMS   16
@@ -38,8 +43,8 @@
 typedef struct {
     int op;
     int n_inputs;
-    float* inputs[MAX_INPUTS];
-    float* output;
+    void* inputs[MAX_INPUTS];
+    void* output;
     int out_shape[MAX_DIMS];
     int n_dims;
     int extra[MAX_DIMS];  /* op-specific: axes, flags, etc. */
@@ -79,6 +84,11 @@ void kernel_bias_relu(const float* a, const float* bias, float* out,
 void kernel_attention(const float* Q, const float* K, const float* V,
                       float* output, float* scratch,
                       int batch_heads, int seq_len, int head_dim);
+void kernel_pow_scalar(const float* x, float scalar, float* out, int n);
+void kernel_tanh(const float* x, float* out, int n);
+void kernel_gelu_tanh(const float* x, float* out, int n);
+void kernel_embedding(const long* ids, const float* table, float* out,
+                      int seq_len, int embed_dim);
 
 /* ----------------------------------------------------------------
  * Dispatch
@@ -249,14 +259,15 @@ static void dispatch(OpNode* node) {
             int K = node->extra[0];
             int trans_b = node->extra[1];
             int b_is_2d = node->extra[2];
-            float* bias = node->inputs[2];
+            const float* bias = (const float*)node->inputs[2];
+            float* out = (float*)node->output;
 
             int rows = 1;
             for (int i = 0; i < node->n_dims - 1; i++)
                 rows *= node->out_shape[i];
             for (int r = 0; r < rows; r++)
                 for (int c = 0; c < N; c++)
-                    node->output[r * N + c] = bias[c];
+                    out[r * N + c] = bias[c];
 
             if (b_is_2d) {
                 int M_total = 1;
@@ -292,6 +303,43 @@ static void dispatch(OpNode* node) {
             kernel_attention(node->inputs[0], node->inputs[1], node->inputs[2],
                              node->output, node->inputs[3],
                              batch_heads, seq_len, head_dim);
+            break;
+        }
+        case OP_SLICE:
+            /* Zero-copy: handled by Python alias binding, like RESHAPE */
+            break;
+        case OP_POW: {
+            /* extra[0] = scalar exponent as float bits */
+            int n = 1;
+            for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
+            union { int i; float f; } s;
+            s.i = node->extra[0];
+            kernel_pow_scalar(node->inputs[0], s.f, node->output, n);
+            break;
+        }
+        case OP_TANH: {
+            int n = 1;
+            for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
+            kernel_tanh(node->inputs[0], node->output, n);
+            break;
+        }
+        case OP_GELU: {
+            int n = 1;
+            for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
+            kernel_gelu_tanh(node->inputs[0], node->output, n);
+            break;
+        }
+        case OP_EMBEDDING: {
+            /* inputs: [ids, table], extra[0] = embed_dim
+             * ids are long* (int64), table is float* */
+            int embed_dim = node->extra[0];
+            int seq_len = 1;
+            for (int i = 0; i < node->n_dims - 1; i++)
+                seq_len *= node->out_shape[i];
+            kernel_embedding((const long*)node->inputs[0],
+                             (const float*)node->inputs[1],
+                             (float*)node->output,
+                             seq_len, embed_dim);
             break;
         }
         default:
