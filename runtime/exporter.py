@@ -271,15 +271,10 @@ def _handle_mean(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
 
     # DIV by element count along the reduced axis
     count = int(input_val.shape[axis])
-    scalar_name = f"{fx_node.name}_count"
-    np_dtype = getattr(np, dtype)
-    scalar_info = graph.add_tensor(scalar_name, shape, dtype)
-    scalar_info.buffer = np.full(shape, count, dtype=np_dtype)
-    graph.constants.append(scalar_name)
 
     tensor_name = fx_node.name
     graph.add_tensor(tensor_name, shape, dtype)
-    graph.add_node(OpType.DIV, [sum_name, scalar_name], tensor_name)
+    graph.add_node(OpType.DIV, [sum_name], tensor_name, {"scalar": float(count)})
     node_map[fx_node.name] = tensor_name
 
 

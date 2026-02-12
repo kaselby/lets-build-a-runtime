@@ -48,6 +48,11 @@ def _load_library() -> ctypes.CDLL | None:
                                      ctypes.c_float, ctypes.c_float]  # alpha, beta
     lib.kernel_matmul_ab.restype = None
 
+    lib.kernel_matmul_beta.argtypes = [FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_float]
+    lib.kernel_matmul_beta.restype = None
+
     lib.kernel_add.argtypes = [FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
                                ctypes.c_int, ctypes.c_int]
     lib.kernel_add.restype = None
@@ -104,6 +109,12 @@ def _load_library() -> ctypes.CDLL | None:
                                      FLOAT_PTR, FLOAT_PTR,
                                      ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.kernel_attention.restype = None
+
+    # Scalar binary ops: (a, s, out, n)
+    for name in ("kernel_add_scalar", "kernel_div_scalar", "kernel_sub_scalar", "kernel_mul_scalar"):
+        fn = getattr(lib, name)
+        fn.argtypes = [FLOAT_PTR, ctypes.c_float, FLOAT_PTR, ctypes.c_int]
+        fn.restype = None
 
     return lib
 
@@ -238,13 +249,109 @@ def _broadcast_matmul(lib, a, b, output, M, N, K, trans_b,
             coords[d] = 0
 
 
+def _wrap_matmul_add(lib: ctypes.CDLL) -> KernelFn:
+    """Wrap kernel_matmul_beta for fused matmul + bias add.
+
+    Inputs: [A, B, bias]
+    1. Pre-fill output with broadcast bias (each row = bias vector)
+    2. Call sgemm with beta=1.0 to accumulate A@B into the bias-filled output
+    """
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        a, b, bias = inputs[0], inputs[1], inputs[2]
+        trans_b = 1 if attrs.get("transpose_b") else 0
+        alpha = attrs.get("alpha", 1.0)
+        K = a.shape[-1]
+        N = b.shape[-2] if trans_b else b.shape[-1]
+        M = a.shape[-2] if a.ndim >= 2 else 1
+
+        # Pre-fill output with broadcast bias (handles any number of dims)
+        output[...] = bias
+
+        def _call_matmul_add(M_, N_, K_, batches_, trans_b_):
+            lib.kernel_matmul_beta(_as_ptr(a), _as_ptr(b), _as_ptr(output),
+                                   M_, N_, K_, batches_, trans_b_,
+                                   ctypes.c_float(alpha))
+
+        if a.ndim > 2 and b.ndim == 2:
+            # ND×2D fast path: flatten A's batch dims into M, single sgemm
+            M_total = 1
+            for d in a.shape[:-1]:
+                M_total *= d
+            _call_matmul_add(M_total, N, K, 1, trans_b)
+        else:
+            a_batch = a.shape[:-2] if a.ndim > 2 else ()
+            b_batch = b.shape[:-2] if b.ndim > 2 else ()
+
+            if a_batch == b_batch:
+                # Matching batch dims — single C call with batch loop
+                batches = 1
+                for d in a_batch:
+                    batches *= d
+                _call_matmul_add(M, N, K, max(batches, 1), trans_b)
+            else:
+                # Broadcasting over batch dims — odometer with per-slice sgemm
+                _broadcast_matmul_add(lib, a, b, output, bias, M, N, K, trans_b,
+                                      a_batch, b_batch, alpha)
+    return kernel
+
+
+def _broadcast_matmul_add(lib, a, b, output, bias, M, N, K, trans_b,
+                          a_batch, b_batch, alpha):
+    """Batched matmul+add with broadcasting over batch dimensions."""
+    out_batch = output.shape[:-2]
+    ndim_batch = len(out_batch)
+    a_bstrides = _broadcast_strides(a_batch, out_batch)
+    b_bstrides = _broadcast_strides(b_batch, out_batch)
+
+    total_batches = 1
+    for d in out_batch:
+        total_batches *= d
+
+    a_mat = M * K           # elements per A slice
+    b_mat = N * K           # elements per B slice
+    out_mat = M * N         # elements per output slice
+
+    a_base = a.ctypes.data
+    b_base = b.ctypes.data
+    out_base = output.ctypes.data
+
+    coords = [0] * ndim_batch
+    a_off = 0
+    b_off = 0
+
+    for i in range(total_batches):
+        a_ptr = ctypes.cast(a_base + a_off * 4, FLOAT_PTR)
+        b_ptr = ctypes.cast(b_base + b_off * 4, FLOAT_PTR)
+        out_ptr = ctypes.cast(out_base + i * out_mat * 4, FLOAT_PTR)
+
+        # Pre-fill this batch slice with broadcast bias
+        for r in range(M):
+            for c in range(N):
+                out_ptr[r * N + c] = bias[c]
+
+        lib.kernel_matmul_beta(a_ptr, b_ptr, out_ptr,
+                               M, N, K, 1, trans_b,
+                               ctypes.c_float(alpha))
+
+        for d in range(ndim_batch - 1, -1, -1):
+            coords[d] += 1
+            a_off += a_bstrides[d] * a_mat
+            b_off += b_bstrides[d] * b_mat
+            if coords[d] < out_batch[d]:
+                break
+            a_off -= coords[d] * a_bstrides[d] * a_mat
+            b_off -= coords[d] * b_bstrides[d] * b_mat
+            coords[d] = 0
+
+
 def _wrap_add(lib: ctypes.CDLL) -> KernelFn:
     """Wrap kernel_add with broadcasting and scalar support."""
     def kernel(inputs: list[np.ndarray], output: np.ndarray,
                attrs: dict[str, Any]) -> None:
         a = inputs[0]
         if "scalar" in attrs:
-            np.add(a, attrs["scalar"], out=output)
+            lib.kernel_add_scalar(_as_ptr(a), ctypes.c_float(attrs["scalar"]), _as_ptr(output), a.size)
             return
         b = inputs[1]
         if a.shape == b.shape:
@@ -293,16 +400,24 @@ _NUMPY_BINOPS = {
     "kernel_mul": np.multiply,
 }
 
+_SCALAR_KERNELS = {
+    "kernel_div": "kernel_div_scalar",
+    "kernel_sub": "kernel_sub_scalar",
+    "kernel_mul": "kernel_mul_scalar",
+}
+
 
 def _wrap_elementwise_binary(lib: ctypes.CDLL, fname: str, bcast_op: int) -> KernelFn:
     """Wrap an element-wise binary kernel with broadcasting and scalar support."""
     cfn = getattr(lib, fname)
+    scalar_fname = _SCALAR_KERNELS[fname]
+    scalar_cfn = getattr(lib, scalar_fname)
     np_fn = _NUMPY_BINOPS[fname]
     def kernel(inputs: list[np.ndarray], output: np.ndarray,
                attrs: dict[str, Any]) -> None:
         a = inputs[0]
         if "scalar" in attrs:
-            np_fn(a, attrs["scalar"], out=output)
+            scalar_cfn(_as_ptr(a), ctypes.c_float(attrs["scalar"]), _as_ptr(output), a.size)
             return
         b = inputs[1]
         if a.shape == b.shape:
@@ -405,6 +520,7 @@ class CBackend:
         if self._lib is not None:
             self._kernels = {
                 OpType.MATMUL: _wrap_matmul(self._lib),
+                OpType.MATMUL_ADD: _wrap_matmul_add(self._lib),
                 OpType.ADD: _wrap_add(self._lib),
                 OpType.RELU: _wrap_relu(self._lib),
                 OpType.TRANSPOSE: _wrap_transpose(self._lib),

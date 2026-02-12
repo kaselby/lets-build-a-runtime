@@ -10,6 +10,8 @@
  */
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* Must match the Python-side OpType enum values */
 #define OP_MATMUL    1
@@ -292,6 +294,9 @@ static void dispatch(OpNode* node) {
                              batch_heads, seq_len, head_dim);
             break;
         }
+        default:
+            fprintf(stderr, "executor: unknown op %d\n", node->op);
+            abort();
     }
 }
 

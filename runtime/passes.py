@@ -173,7 +173,7 @@ def register_evaluator(op: OpType, fn: NumpyEvaluator) -> None:
 register_evaluator(OpType.ADD, lambda ins, attrs: ins[0] + (attrs["scalar"] if "scalar" in attrs else ins[1]))
 register_evaluator(OpType.RELU, lambda ins, attrs: np.maximum(ins[0], 0))
 register_evaluator(OpType.MATMUL, lambda ins, attrs: (
-    ins[0] @ (ins[1].T if attrs.get("transpose_b") else ins[1]) * attrs.get("alpha", 1.0)
+    ins[0] @ (np.swapaxes(ins[1], -2, -1) if attrs.get("transpose_b") else ins[1]) * attrs.get("alpha", 1.0)
 ))
 register_evaluator(OpType.TRANSPOSE, lambda ins, attrs: np.swapaxes(ins[0], attrs["dim0"], attrs["dim1"]))
 register_evaluator(OpType.PERMUTE, lambda ins, attrs: np.transpose(ins[0], attrs["axes"]))
