@@ -414,11 +414,11 @@ void kernel_broadcast_binop(
  *   buffer is reused by slice 0, others are thread-local allocations.
  * ---------------------------------------------------------------- */
 
-/* Per-slice attention: sgemm → softmax → sgemm */
+/* Per-slice attention: sgemm → [causal mask] → softmax → sgemm */
 static void attention_slice(const float* Q_bh, const float* K_bh,
                             const float* V_bh, float* O_bh,
                             float* scratch, int seq_len, int head_dim,
-                            float scale) {
+                            float scale, int causal) {
     /* S = Q @ K^T * scale */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq_len, seq_len, head_dim,
@@ -427,6 +427,13 @@ static void attention_slice(const float* Q_bh, const float* K_bh,
                 K_bh, head_dim,
                 0.0f,
                 scratch, seq_len);
+
+    /* Causal mask: set upper triangle to -inf so softmax zeroes them out */
+    if (causal) {
+        for (int i = 0; i < seq_len; i++)
+            for (int j = i + 1; j < seq_len; j++)
+                scratch[i * seq_len + j] = -INFINITY;
+    }
 
     /* Softmax in-place (SIMD on Apple) */
     kernel_softmax(scratch, scratch, seq_len, seq_len);
@@ -443,7 +450,8 @@ static void attention_slice(const float* Q_bh, const float* K_bh,
 
 void kernel_attention(const float* Q, const float* K, const float* V,
                       float* output, float* scratch,
-                      int batch_heads, int seq_len, int head_dim) {
+                      int batch_heads, int seq_len, int head_dim,
+                      int causal) {
     float scale = 1.0f / sqrtf((float)head_dim);
     int slice = seq_len * head_dim;
     int scratch_per_slice = seq_len * seq_len;
@@ -456,7 +464,7 @@ void kernel_attention(const float* Q, const float* K, const float* V,
             attention_slice(Q + bh * slice, K + bh * slice,
                             V + bh * slice, output + bh * slice,
                             scratch + bh * scratch_per_slice,
-                            seq_len, head_dim, scale);
+                            seq_len, head_dim, scale, causal);
         });
         return;
     }
@@ -467,7 +475,7 @@ void kernel_attention(const float* Q, const float* K, const float* V,
         attention_slice(Q + bh * slice, K + bh * slice,
                         V + bh * slice, output + bh * slice,
                         scratch + bh * scratch_per_slice,
-                        seq_len, head_dim, scale);
+                        seq_len, head_dim, scale, causal);
     }
 }
 

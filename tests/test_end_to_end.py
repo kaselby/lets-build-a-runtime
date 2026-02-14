@@ -247,6 +247,43 @@ def test_sdpa_transformer_compiled_reuse(batch, seq, d_model, n_heads):
 
 
 # ---------------------------------------------------------------------------
+# Causal naive transformer end-to-end tests (explicit mask fusion)
+# ---------------------------------------------------------------------------
+
+from conftest import CausalNaiveTransformerBlock
+
+CAUSAL_CONFIGS = [
+    (1, 8, 64, 4),
+    (2, 16, 64, 4),
+]
+
+
+@pytest.mark.parametrize("batch,seq,d_model,n_heads", CAUSAL_CONFIGS)
+def test_causal_transformer_compiled_executor(batch, seq, d_model, n_heads):
+    """Compiled C executor: causal naive transformer matches PyTorch.
+
+    The model uses explicit mask addition (not SDPA), which exercises
+    the causal_attention fusion pattern and the C kernel's causal flag.
+    """
+    model = CausalNaiveTransformerBlock(d_model, n_heads, seq_len=seq)
+    model.eval()
+    x = torch.randn(batch, seq, d_model)
+
+    with torch.no_grad():
+        expected = model(x).numpy()
+
+    graph = export_model(model, (x,))
+    run_pipeline(graph)
+    ep = plan(graph)
+
+    executor = Executor(backends=[CBackend(), NumpyBackend()])
+    compiled = executor.compile_plan(ep)
+    result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+    output = result[graph.outputs[0]]
+    np.testing.assert_allclose(output, expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
 # GPT-2 body end-to-end tests
 # ---------------------------------------------------------------------------
 

@@ -59,6 +59,18 @@ class OpType(Enum):
     GELU = auto()            # GELU activation (tanh approximation)
     EMBEDDING = auto()       # Table lookup; inputs: [indices, weight_table]
 
+    # --- Mask/infrastructure ops (values 23+, constant-folded away) ---
+    CAST = auto()           # Type cast; attrs["target_dtype"]
+    EXPAND = auto()         # Broadcast expand; attrs["shape"]
+    SLICE_TENSOR = auto()   # Direct tensor slice; attrs["dim", "start", "end"]
+    DIFF = auto()           # torch.diff; attrs["n", "dim"], optional prepend input
+    CMP_NE = auto()         # Not-equal comparison; attrs["scalar"] or 2-input
+    CMP_LE = auto()         # Less-than-or-equal; 2-input
+    CMP_EQ = auto()         # Equality comparison; 2-input
+    CUMSUM = auto()         # Cumulative sum; attrs["dim"]
+    BITWISE_AND = auto()    # Bitwise AND; 2-input
+    INDEX = auto()          # Advanced indexing; inputs: [tensor, idx1, idx2, ...]
+
 
 @dataclass
 class TensorInfo:

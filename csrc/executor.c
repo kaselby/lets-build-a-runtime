@@ -83,7 +83,8 @@ void kernel_bias_relu(const float* a, const float* bias, float* out,
                       int M, int N);
 void kernel_attention(const float* Q, const float* K, const float* V,
                       float* output, float* scratch,
-                      int batch_heads, int seq_len, int head_dim);
+                      int batch_heads, int seq_len, int head_dim,
+                      int causal);
 void kernel_pow_scalar(const float* x, float scalar, float* out, int n);
 void kernel_tanh(const float* x, float* out, int n);
 void kernel_gelu_tanh(const float* x, float* out, int n);
@@ -293,16 +294,17 @@ static void dispatch(OpNode* node) {
             break;
         }
         case OP_ATTENTION: {
-            /* inputs: [Q, K, V, scratch], extras: [seq_len, head_dim]
+            /* inputs: [Q, K, V, scratch], extras: [seq_len, head_dim, causal]
              * out_shape = [..., seq_len, head_dim] (leading dims are batch) */
             int seq_len = node->extra[0];
             int head_dim = node->extra[1];
+            int causal = node->extra[2];
             int batch_heads = 1;
             for (int i = 0; i < node->n_dims - 2; i++)
                 batch_heads *= node->out_shape[i];
             kernel_attention(node->inputs[0], node->inputs[1], node->inputs[2],
                              node->output, node->inputs[3],
-                             batch_heads, seq_len, head_dim);
+                             batch_heads, seq_len, head_dim, causal);
             break;
         }
         case OP_SLICE:

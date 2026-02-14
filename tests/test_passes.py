@@ -650,3 +650,54 @@ def test_gelu_in_full_pipeline():
     assert OpType.GELU in ops
     # MATMUL + ADD should be fused into MATMUL_ADD (priority 1, after GELU recognition)
     assert OpType.MATMUL_ADD in ops
+
+
+# ---------------------------------------------------------------------------
+# Causal attention fusion: MATMUL → ADD(mask) → SOFTMAX → MATMUL
+# ---------------------------------------------------------------------------
+
+def test_causal_attention_fusion_structure():
+    """CausalNaiveTransformerBlock should produce fused ATTENTION with causal=True.
+
+    The model applies an explicit upper-triangular -inf mask via ADD before
+    softmax. The causal_attention fusion should collapse MATMUL→ADD→SOFTMAX→MATMUL
+    into a single ATTENTION node with causal=True, dropping the mask constant.
+    """
+    from conftest import CausalNaiveTransformerBlock
+    model = CausalNaiveTransformerBlock(d_model=64, n_heads=4, seq_len=16)
+    model.eval()
+    graph = export_model(model, (torch.randn(2, 16, 64),))
+    run_pipeline(graph)
+
+    attention_nodes = [n for n in graph if n.op == OpType.ATTENTION]
+    assert len(attention_nodes) == 1
+    assert attention_nodes[0].attrs.get("causal") is True
+    # The mask constant should not appear in the fused ATTENTION's inputs
+    attn_inputs = set(attention_nodes[0].inputs)
+    for name in graph.constants:
+        if name in attn_inputs:
+            # No constant input to ATTENTION should be a causal mask
+            from runtime.passes import _is_causal_mask
+            assert not _is_causal_mask(name, graph)
+
+
+@pytest.mark.parametrize("batch,seq,d_model,n_heads", [
+    (1, 8, 64, 4),
+    (2, 16, 64, 4),
+])
+def test_causal_attention_fusion_correctness(batch, seq, d_model, n_heads):
+    """Causal attention fusion should produce the same result as PyTorch."""
+    from conftest import CausalNaiveTransformerBlock
+    model = CausalNaiveTransformerBlock(d_model=d_model, n_heads=n_heads, seq_len=seq)
+    model.eval()
+    x = torch.randn(batch, seq, d_model)
+
+    with torch.no_grad():
+        expected = model(x).numpy()
+
+    graph = export_model(model, (x,))
+    run_pipeline(graph)
+    ep = plan(graph)
+    executor = Executor(backends=[NumpyBackend()])
+    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    np.testing.assert_allclose(result[graph.outputs[0]], expected, atol=1e-4)

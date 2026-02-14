@@ -233,6 +233,64 @@ def _eval_attention(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
 
 register_evaluator(OpType.ATTENTION, _eval_attention)
 
+# --- Mask/infrastructure op evaluators (constant-folded, never executed) ---
+
+# CAST: convert dtype
+register_evaluator(OpType.CAST, lambda ins, attrs: ins[0].astype(attrs["target_dtype"]))
+
+# EXPAND: broadcast to target shape
+register_evaluator(OpType.EXPAND, lambda ins, attrs: np.broadcast_to(ins[0], attrs["shape"]))
+
+# SLICE_TENSOR: slice along a dimension
+def _eval_slice_tensor(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
+    x = ins[0]
+    dim = attrs["dim"]
+    start = attrs.get("start", 0)
+    end = attrs.get("end", x.shape[dim])
+    slices = tuple(slice(start, end) if d == dim else slice(None) for d in range(x.ndim))
+    return x[slices]
+register_evaluator(OpType.SLICE_TENSOR, _eval_slice_tensor)
+
+# DIFF: np.diff with optional prepend
+def _eval_diff(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
+    x = ins[0]
+    n = attrs.get("n", 1)
+    dim = attrs.get("dim", -1)
+    prepend = ins[1] if len(ins) > 1 else None
+    return np.diff(x, n=n, axis=dim, prepend=prepend)
+register_evaluator(OpType.DIFF, _eval_diff)
+
+# CMP_NE: not-equal (scalar or tensor)
+register_evaluator(OpType.CMP_NE, lambda ins, attrs: ins[0] != (attrs["scalar"] if "scalar" in attrs else ins[1]))
+
+# CMP_LE: less-than-or-equal
+register_evaluator(OpType.CMP_LE, lambda ins, attrs: ins[0] <= ins[1])
+
+# CMP_EQ: equality
+register_evaluator(OpType.CMP_EQ, lambda ins, attrs: ins[0] == ins[1])
+
+# CUMSUM: cumulative sum along axis
+register_evaluator(OpType.CUMSUM, lambda ins, attrs: np.cumsum(ins[0], axis=attrs["dim"]))
+
+# BITWISE_AND: element-wise AND
+register_evaluator(OpType.BITWISE_AND, lambda ins, attrs: ins[0] & ins[1])
+
+# INDEX: advanced (fancy) indexing
+def _eval_index(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
+    tensor = ins[0]
+    n_indices = attrs.get("n_indices", len(ins) - 1)
+    none_positions = set(attrs.get("none_positions", []))
+    indices = []
+    tensor_idx = 1
+    for i in range(n_indices):
+        if i in none_positions:
+            indices.append(slice(None))
+        else:
+            indices.append(ins[tensor_idx])
+            tensor_idx += 1
+    return tensor[tuple(indices)]
+register_evaluator(OpType.INDEX, _eval_index)
+
 
 def constant_fold(graph: Graph) -> bool:
     """Evaluate nodes whose inputs are all constants.
@@ -259,6 +317,11 @@ def constant_fold(graph: Graph) -> bool:
         # Promote the output tensor to a constant.
         # Ensure contiguous layout — evaluators may return views (e.g. swapaxes)
         # and downstream C kernels need contiguous data.
+        # Also enforce declared dtype — numpy may promote (e.g. int64 + 0.0 → float64)
+        # which would break downstream ops expecting the original type.
+        declared_dtype = np.dtype(graph.tensors[node.output].dtype)
+        if result.dtype != declared_dtype:
+            result = result.astype(declared_dtype)
         graph.tensors[node.output].buffer = np.ascontiguousarray(result)
         graph.constants.append(node.output)
         constant_set.add(node.output)
@@ -267,6 +330,84 @@ def constant_fold(graph: Graph) -> bool:
         changed = True
 
     return changed
+
+
+# ---------------------------------------------------------------------------
+# Mask absorption into attention
+# ---------------------------------------------------------------------------
+
+def absorb_mask_into_attention(graph: Graph) -> bool:
+    """Replace ATTENTION(Q, K, V, constant_mask) with ATTENTION(Q, K, V, causal=True).
+
+    After constant folding, attention mask tensors from HuggingFace-style models
+    become constants. If the mask is a standard causal pattern (lower-triangular True
+    for bool masks, or upper-triangular -inf for float masks), we can replace it with
+    the causal flag and let the kernel compute the mask on the fly.
+
+    This is a general optimization — it recognizes the *result* (a causal mask constant),
+    not the specific ops that generated it.
+    """
+    changed = False
+    constant_set = set(graph.constants)
+
+    for node in list(graph):
+        if node.op != OpType.ATTENTION:
+            continue
+        if len(node.inputs) != 4:
+            continue  # Already has only Q, K, V — no mask to absorb
+        if node.attrs.get("causal"):
+            continue  # Already marked causal
+
+        mask_name = node.inputs[3]
+        if mask_name not in constant_set:
+            continue  # Non-constant mask — can’t fold
+
+        mask_info = graph.tensors[mask_name]
+        if mask_info.buffer is None:
+            continue
+
+        buf = mask_info.buffer
+
+        # Check if this is a causal mask
+        if _is_bool_causal_mask(buf) or _is_float_causal_mask(buf):
+            node.attrs["causal"] = True
+            # Remove mask from inputs
+            graph._consumers[mask_name].remove(node.id)
+            node.inputs = node.inputs[:3]  # Keep only Q, K, V
+            graph._order = None  # Invalidate cached order
+            changed = True
+
+    return changed
+
+
+def _is_bool_causal_mask(buf: np.ndarray) -> bool:
+    """Check if a bool array is a causal mask (lower-triangular True)."""
+    if buf.dtype != np.bool_:
+        return False
+    if buf.ndim < 2 or buf.shape[-1] != buf.shape[-2]:
+        return False
+    S = buf.shape[-1]
+    if S < 2:
+        return True  # Trivially causal for seq_len=1
+    # Check first 2D slice (broadcast means all slices are the same)
+    mat = buf.reshape(-1, S, S)[0]
+    expected = np.tril(np.ones((S, S), dtype=np.bool_))
+    return np.array_equal(mat, expected)
+
+
+def _is_float_causal_mask(buf: np.ndarray) -> bool:
+    """Check if a float array is a causal mask (upper-triangular -inf, rest ~0)."""
+    if not np.issubdtype(buf.dtype, np.floating):
+        return False
+    if buf.ndim < 2 or buf.shape[-1] != buf.shape[-2]:
+        return False
+    S = buf.shape[-1]
+    if S < 2:
+        return True
+    mat = buf.reshape(-1, S, S)[0]
+    lower = np.tril(mat)
+    upper_strict = mat[np.triu_indices(S, k=1)]
+    return np.allclose(lower, 0, atol=1e-6) and np.all(upper_strict < -1e4)
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +441,11 @@ class FusionPattern:
     # Optional attr builder: given matched nodes, produce attrs for the
     # fused node. Use for carrying forward flags like transpose dims.
     build_attrs: Callable[[list[Node], Graph], dict] | None = None
+    # Optional input builder: given matched nodes, graph, and the default
+    # external inputs, return the actual inputs for the fused node. Use
+    # when fusion needs to drop inputs (e.g., removing a mask constant
+    # when replacing explicit masking with a kernel flag).
+    build_inputs: Callable[[list[Node], Graph, list[str]], list[str]] | None = None
 
 
 # Registry of fusion patterns
@@ -389,6 +535,12 @@ def _apply_fusion(chain: list[Node], pattern: FusionPattern, graph: Graph) -> No
 
     attrs = pattern.build_attrs(chain, graph) if pattern.build_attrs else {}
 
+    # Let the pattern customize which inputs the fused node receives.
+    # Default: all external inputs. Patterns can drop inputs (e.g., a mask
+    # constant that's replaced by a kernel flag).
+    if pattern.build_inputs:
+        external_inputs = pattern.build_inputs(chain, graph, external_inputs)
+
     # Remove original nodes and intermediate tensors FIRST —
     # remove_node pops _producer[output], so if we added the fused node
     # first, removing the last chain node would clobber its producer entry.
@@ -468,6 +620,75 @@ register_fusion(FusionPattern(
     fused_op=OpType.ATTENTION,
     priority=0,
     validator=_validate_attention,
+))
+
+
+# Causal attention fusion: MATMUL(Q @ K^T) → ADD(mask) → SOFTMAX → MATMUL(weights @ V)
+# Models that apply an explicit causal mask before softmax (rather than using SDPA's
+# is_causal flag) produce this 4-node pattern. The ADD's second input is a constant
+# upper-triangular -inf mask. We validate the mask shape and values, drop it from the
+# fused node's inputs via build_inputs, and set causal=True so the C kernel applies
+# the mask computationally (a branch is cheaper than reading an S×S tensor).
+
+def _is_causal_mask(tensor_name: str, graph: Graph) -> bool:
+    """Check if a tensor is a causal (upper-triangular -inf) attention mask."""
+    info = graph.tensors[tensor_name]
+    if tensor_name not in graph.constants or info.buffer is None:
+        return False
+    buf = info.buffer
+    # Shape should be broadcastable to [B, H, S, S] — typically [1, 1, S, S] or [S, S]
+    if buf.ndim < 2 or buf.shape[-1] != buf.shape[-2]:
+        return False
+    # Check the last two dims: diagonal and below should be ~0, above should be -inf
+    mat = buf.reshape(-1, buf.shape[-2], buf.shape[-1])[0]  # take first slice
+    S = mat.shape[0]
+    if S < 2:
+        return True  # trivially causal for seq_len=1
+    lower = np.tril(mat)
+    upper_strict = mat[np.triu_indices(S, k=1)]
+    return np.allclose(lower, 0, atol=1e-6) and np.all(upper_strict < -1e4)
+
+
+def _validate_causal_attention(chain: list[Node], graph: Graph) -> bool:
+    """Verify the MATMUL→ADD(mask)→SOFTMAX→MATMUL chain is causal attention."""
+    qk_matmul, add_mask, softmax, wv_matmul = chain
+    if not qk_matmul.attrs.get("transpose_b"):
+        return False
+    if softmax.attrs.get("axis") != len(graph.tensors[softmax.output].shape) - 1:
+        return False
+    # The ADD's non-chain input should be a causal mask constant
+    mask_input = None
+    for inp in add_mask.inputs:
+        if inp != qk_matmul.output:
+            mask_input = inp
+            break
+    if mask_input is None:
+        return False
+    return _is_causal_mask(mask_input, graph)
+
+
+def _build_causal_attention_inputs(
+    chain: list[Node], graph: Graph, external_inputs: list[str]
+) -> list[str]:
+    """Drop the mask tensor — the kernel computes causal masking internally."""
+    qk_matmul, add_mask, softmax, wv_matmul = chain
+    # Find the mask input (the ADD's non-chain input)
+    mask_input = None
+    for inp in add_mask.inputs:
+        if inp != qk_matmul.output:
+            mask_input = inp
+            break
+    return [inp for inp in external_inputs if inp != mask_input]
+
+
+register_fusion(FusionPattern(
+    name="causal_attention",
+    pattern=[OpType.MATMUL, OpType.ADD, OpType.SOFTMAX, OpType.MATMUL],
+    fused_op=OpType.ATTENTION,
+    priority=0,
+    validator=_validate_causal_attention,
+    build_attrs=lambda chain, graph: {"causal": True},
+    build_inputs=_build_causal_attention_inputs,
 ))
 
 
@@ -643,6 +864,7 @@ def eliminate_dead_code(graph: Graph) -> bool:
 DEFAULT_PIPELINE.extend([
     absorb_into_matmul,
     constant_fold,
+    absorb_mask_into_attention,
     recognize_gelu,
     fuse,
     eliminate_dead_code,

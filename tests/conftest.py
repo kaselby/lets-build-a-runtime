@@ -74,6 +74,48 @@ class NaiveTransformerBlock(nn.Module):
         return x
 
 
+class CausalNaiveTransformerBlock(nn.Module):
+    """Same as NaiveTransformerBlock but with explicit causal mask addition.
+
+    Uses a registered buffer for the upper-triangular -inf mask and adds it
+    to the attention scores before softmax. This produces the 4-node pattern
+    MATMUL→ADD(mask)→SOFTMAX→MATMUL that the causal_attention fusion targets.
+
+    seq_len is fixed at construction (must match input) since the mask is a
+    registered buffer with a concrete shape.
+    """
+    def __init__(self, d_model=64, n_heads=4, seq_len=16):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+        self.ln1 = nn.LayerNorm(d_model)
+        self.wq = nn.Linear(d_model, d_model)
+        self.wk = nn.Linear(d_model, d_model)
+        self.wv = nn.Linear(d_model, d_model)
+        self.wo = nn.Linear(d_model, d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn1 = nn.Linear(d_model, d_model * 4)
+        self.ffn2 = nn.Linear(d_model * 4, d_model)
+        mask = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
+        self.register_buffer('causal_mask', mask.unsqueeze(0).unsqueeze(0))
+
+    def forward(self, x):
+        B, S, D = x.shape
+        h = self.ln1(x)
+        q = self.wq(h).reshape(B, S, self.n_heads, self.d_k).permute(0, 2, 1, 3)
+        k = self.wk(h).reshape(B, S, self.n_heads, self.d_k).permute(0, 2, 1, 3)
+        v = self.wv(h).reshape(B, S, self.n_heads, self.d_k).permute(0, 2, 1, 3)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        scores = scores + self.causal_mask
+        weights = F.softmax(scores, dim=-1)
+        attn = torch.matmul(weights, v)
+        attn = attn.permute(0, 2, 1, 3).reshape(B, S, D)
+        x = x + self.wo(attn)
+        x = x + self.ffn2(torch.relu(self.ffn1(self.ln2(x))))
+        return x
+
+
 class SDPATransformerBlock(nn.Module):
     """Same architecture as NaiveTransformerBlock but using F.scaled_dot_product_attention.
 

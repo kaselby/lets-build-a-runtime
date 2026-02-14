@@ -104,10 +104,11 @@ def _load_library() -> ctypes.CDLL | None:
                                      ctypes.c_int, ctypes.c_int]
     lib.kernel_bias_relu.restype = None
 
-    # Attention: (Q, K, V, output, scratch, batch_heads, seq_len, head_dim)
+    # Attention: (Q, K, V, output, scratch, batch_heads, seq_len, head_dim, causal)
     lib.kernel_attention.argtypes = [FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
                                      FLOAT_PTR, FLOAT_PTR,
-                                     ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int]
     lib.kernel_attention.restype = None
 
     # Scalar binary ops: (a, s, out, n)
@@ -515,29 +516,16 @@ def _wrap_attention(lib: ctypes.CDLL) -> KernelFn:
     Inputs: [Q, K, V, scratch] — scratch is appended by the executor
     from the planner's scratch allocation.
     Q, K, V: [..., seq_len, head_dim] (leading dims are batch)
-
-    Falls back to numpy for causal masking if the C kernel doesn't support it.
     """
     def kernel(inputs: list[np.ndarray], output: np.ndarray,
                attrs: dict[str, Any]) -> None:
         Q, K, V, scratch = inputs[0], inputs[1], inputs[2], inputs[3]
         seq_len, head_dim = Q.shape[-2], Q.shape[-1]
         batch_heads = Q.size // (seq_len * head_dim)
-
-        if attrs.get("causal"):
-            # Causal attention: apply upper-triangular mask before softmax
-            scale = 1.0 / np.sqrt(head_dim)
-            scores = np.matmul(Q, np.swapaxes(K, -2, -1)) * scale
-            mask = np.triu(np.full((seq_len, seq_len), -np.inf, dtype=np.float32), k=1)
-            scores = scores + mask
-            scores -= np.max(scores, axis=-1, keepdims=True)
-            e = np.exp(scores)
-            weights = e / np.sum(e, axis=-1, keepdims=True)
-            np.matmul(weights, V, out=output)
-        else:
-            lib.kernel_attention(_as_ptr(Q), _as_ptr(K), _as_ptr(V),
-                                 _as_ptr(output), _as_ptr(scratch),
-                                 batch_heads, seq_len, head_dim)
+        causal = 1 if attrs.get("causal") else 0
+        lib.kernel_attention(_as_ptr(Q), _as_ptr(K), _as_ptr(V),
+                             _as_ptr(output), _as_ptr(scratch),
+                             batch_heads, seq_len, head_dim, causal)
     return kernel
 
 

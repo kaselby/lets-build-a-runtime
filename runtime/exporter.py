@@ -629,6 +629,10 @@ def _handle_sdpa(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
         node_map[fx_node.args[2].name],  # V
     ]
 
+    # Check for attn_mask tensor (arg index 3)
+    if len(fx_node.args) > 3 and fx_node.args[3] is not None and hasattr(fx_node.args[3], "name"):
+        input_names.append(node_map[fx_node.args[3].name])
+
     # Check for is_causal flag (arg index 5 or kwarg)
     attrs = {}
     is_causal = False
@@ -642,6 +646,199 @@ def _handle_sdpa(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
     tensor_name = fx_node.name
     graph.add_tensor(tensor_name, shape, dtype)
     graph.add_node(OpType.ATTENTION, input_names, tensor_name, attrs)
+    node_map[fx_node.name] = tensor_name
+
+
+
+def _handle_arange(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.arange.default(end) — evaluate at export time as constant."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    end = fx_node.args[0]
+    data = np.arange(end, dtype=np.dtype(dtype))
+
+    tensor_name = fx_node.name
+    tensor_info = graph.add_tensor(tensor_name, shape, dtype)
+    tensor_info.buffer = data
+    graph.constants.append(tensor_name)
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_arange_start(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.arange.start(start, end) — evaluate at export time as constant."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    start = fx_node.args[0]
+    end = fx_node.args[1]
+    data = np.arange(start, end, dtype=np.dtype(dtype))
+
+    tensor_name = fx_node.name
+    tensor_info = graph.add_tensor(tensor_name, shape, dtype)
+    tensor_info.buffer = data
+    graph.constants.append(tensor_name)
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_new_ones(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.new_ones.default — evaluate at export time as constant."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    data = np.ones(shape, dtype=np.dtype(dtype))
+
+    tensor_name = fx_node.name
+    tensor_info = graph.add_tensor(tensor_name, shape, dtype)
+    tensor_info.buffer = data
+    graph.constants.append(tensor_name)
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_assert_metadata(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten._assert_tensor_metadata — pure no-op, skip entirely."""
+    pass
+
+
+def _handle_to_dtype(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.to.dtype_layout — alias if same dtype, else CAST node."""
+    val = fx_node.meta["val"]
+    out_dtype = str(val.dtype).replace("torch.", "")
+
+    input_val = fx_node.args[0].meta["val"]
+    in_dtype = str(input_val.dtype).replace("torch.", "")
+
+    if in_dtype == out_dtype:
+        # Same dtype — just alias
+        node_map[fx_node.name] = node_map[fx_node.args[0].name]
+    else:
+        # Different dtype — emit CAST node
+        shape = tuple(val.shape)
+        input_names = [node_map[fx_node.args[0].name]]
+        tensor_name = fx_node.name
+        graph.add_tensor(tensor_name, shape, out_dtype)
+        graph.add_node(OpType.CAST, input_names, tensor_name, {"target_dtype": out_dtype})
+        node_map[fx_node.name] = tensor_name
+
+
+def _handle_expand(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.expand.default — broadcast expansion."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    input_names = [node_map[fx_node.args[0].name]]
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.EXPAND, input_names, tensor_name, {"shape": shape})
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_slice_tensor(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.slice.Tensor — direct tensor slicing with dim/start/end."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    input_names = [node_map[fx_node.args[0].name]]
+
+    dim = fx_node.args[1] if len(fx_node.args) > 1 else 0
+    start = fx_node.args[2] if len(fx_node.args) > 2 else 0
+    # Default end to the size of the dimension in the input
+    if len(fx_node.args) > 3:
+        end = fx_node.args[3]
+    else:
+        input_shape = tuple(fx_node.args[0].meta["val"].shape)
+        end = input_shape[dim]
+
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.SLICE_TENSOR, input_names, tensor_name,
+                   {"dim": dim, "start": start, "end": end})
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_diff(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.diff.default — diff with optional prepend tensor."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    input_names = [node_map[fx_node.args[0].name]]
+    n = fx_node.args[1] if len(fx_node.args) > 1 else 1
+    dim = fx_node.args[2] if len(fx_node.args) > 2 else -1
+    attrs = {"n": n, "dim": dim}
+
+    # Check for prepend tensor (4th arg)
+    if len(fx_node.args) > 3 and fx_node.args[3] is not None and hasattr(fx_node.args[3], "name"):
+        input_names.append(node_map[fx_node.args[3].name])
+        attrs["has_prepend"] = True
+
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.DIFF, input_names, tensor_name, attrs)
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_ne_scalar(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.ne.Scalar — not-equal comparison with scalar."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    input_names = [node_map[fx_node.args[0].name]]
+    scalar_value = fx_node.args[1]
+
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.CMP_NE, input_names, tensor_name, {"scalar": scalar_value})
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_cumsum(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.cumsum.default — cumulative sum along a dimension."""
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    input_names = [node_map[fx_node.args[0].name]]
+    dim = fx_node.args[1]
+
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.CUMSUM, input_names, tensor_name, {"dim": dim})
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_index(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    """Handle aten.index.Tensor — advanced/fancy indexing.
+
+    args[0] = tensor to index, args[1] = list of index tensors (some may be None).
+    """
+    val = fx_node.meta["val"]
+    shape = tuple(val.shape)
+    dtype = str(val.dtype).replace("torch.", "")
+
+    indices_list = fx_node.args[1]
+    input_names = [node_map[fx_node.args[0].name]]
+    attrs = {"n_indices": len(indices_list)}
+
+    none_positions = []
+    for i, idx in enumerate(indices_list):
+        if idx is None:
+            none_positions.append(i)
+        else:
+            input_names.append(node_map[idx.name])
+
+    if none_positions:
+        attrs["none_positions"] = none_positions
+
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.INDEX, input_names, tensor_name, attrs)
     node_map[fx_node.name] = tensor_name
 
 
@@ -696,4 +893,21 @@ ATEN_HANDLERS.update({
     torch.ops.aten.pow.Tensor_Scalar:   _handle_pow,
     torch.ops.aten.tanh.default:        _handle_tanh,
     torch.ops.aten.embedding.default:   _handle_embedding,
+    # HF GPT-2 mask/infrastructure ops
+    torch.ops.aten.arange.default:                      _handle_arange,
+    torch.ops.aten.arange.start:                        _handle_arange_start,
+    torch.ops.aten.new_ones.default:                    _handle_new_ones,
+    torch.ops.aten._assert_tensor_metadata.default:     _handle_assert_metadata,
+    torch.ops.aten.to.dtype_layout:                     _handle_to_dtype,
+    torch.ops.aten.expand.default:                      _handle_expand,
+    torch.ops.aten.slice.Tensor:                        _handle_slice_tensor,
+    torch.ops.aten.diff.default:                        _handle_diff,
+    torch.ops.aten.ne.Scalar:                           _handle_ne_scalar,
+    torch.ops.aten.le.Tensor:                           _make_simple_handler(OpType.CMP_LE),
+    torch.ops.aten.eq.Tensor:                           _make_simple_handler(OpType.CMP_EQ),
+    torch.ops.aten.cumsum.default:                      _handle_cumsum,
+    torch.ops.aten.__and__.Tensor:                      _make_simple_handler(OpType.BITWISE_AND),
+    torch.ops.aten.index.Tensor:                        _handle_index,
+    # No-op aliases
+    torch.ops.aten.alias.default:                       _handle_contiguous,
 })
