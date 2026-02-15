@@ -12,14 +12,45 @@ arena allocations for them. The executor passes scratch as an extra
 kernel input, transparent to the graph IR.
 """
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from enum import Enum, auto
 import heapq
 
 import numpy as np
 
 from .ir import Graph, Node, OpType
 from .ops import OP_REGISTRY
+
+
+# ---------------------------------------------------------------------------
+# Planner configuration
+# ---------------------------------------------------------------------------
+
+class OrderStrategy(Enum):
+    """Topological ordering heuristic for execution scheduling."""
+    NAIVE = auto()            # Plain Kahn's, FIFO — no memory awareness
+    MEMORY_AWARE_V1 = auto()  # Freed-bytes scored at push time (default)
+    MEMORY_AWARE_V2 = auto()  # Lazy re-score on pop, net pressure scoring
+    MEMORY_AWARE_V3 = auto()  # Event-driven with version counters
+
+
+class FitStrategy(Enum):
+    """Arena gap-selection strategy for offset assignment."""
+    FIRST_FIT = auto()   # Lowest offset that fits (default)
+    BEST_FIT = auto()    # Smallest gap that fits (tightest packing)
+
+
+@dataclass(frozen=True)
+class PlannerConfig:
+    """Configuration for the memory planner's strategy choices.
+
+    All defaults match the current behavior so existing code is unaffected.
+    """
+    order: OrderStrategy = OrderStrategy.MEMORY_AWARE_V1
+    fit: FitStrategy = FitStrategy.FIRST_FIT
+    enable_inplace: bool = True
+    enable_aliases: bool = True
 
 
 @dataclass
@@ -118,6 +149,45 @@ def _memory_aware_order(graph: Graph) -> list[Node]:
     return order
 
 
+def _naive_toposort(graph: Graph) -> list[Node]:
+    """Plain Kahn's algorithm with FIFO ordering — no memory awareness.
+
+    Baseline for measuring how much memory-aware ordering saves.
+    """
+    in_degree: dict[int, int] = {}
+    for node in graph.nodes.values():
+        in_degree[node.id] = sum(1 for t in node.inputs if t in graph._producer)
+
+    queue = deque(nid for nid, deg in in_degree.items() if deg == 0)
+    order: list[Node] = []
+
+    while queue:
+        nid = queue.popleft()
+        node = graph.nodes[nid]
+        order.append(node)
+        for consumer_id in graph._consumers.get(node.output, []):
+            in_degree[consumer_id] -= 1
+            if in_degree[consumer_id] == 0:
+                queue.append(consumer_id)
+
+    return order
+
+
+def _get_order(graph: Graph, strategy: OrderStrategy) -> list[Node]:
+    """Dispatch to the requested ordering strategy."""
+    if strategy == OrderStrategy.NAIVE:
+        return _naive_toposort(graph)
+    if strategy == OrderStrategy.MEMORY_AWARE_V1:
+        return _memory_aware_order(graph)
+    if strategy == OrderStrategy.MEMORY_AWARE_V2:
+        from .order import memory_aware_order_v2
+        return memory_aware_order_v2(graph)
+    if strategy == OrderStrategy.MEMORY_AWARE_V3:
+        from .order import memory_aware_order_event_driven
+        return memory_aware_order_event_driven(graph)
+    raise ValueError(f"Unknown ordering strategy: {strategy}")
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution (graph-level only — follows alias ops in producer chain)
 # ---------------------------------------------------------------------------
@@ -145,7 +215,7 @@ def _resolve_alias(name: str, graph: Graph) -> str:
 # ---------------------------------------------------------------------------
 
 def _compute_lifetimes(
-    graph: Graph, order: list[Node]
+    graph: Graph, order: list[Node], config: PlannerConfig | None = None,
 ) -> tuple[dict[str, Lifetime], dict[str, str]]:
     """Compute lifetimes with unified alias and in-place memory sharing.
 
@@ -160,6 +230,8 @@ def _compute_lifetimes(
         lifetimes: tensor name -> Lifetime for arena-owning tensors only.
         memory_root: tensor name -> arena-owning root for shared tensors.
     """
+    if config is None:
+        config = PlannerConfig()
     external = set(graph.inputs) | set(graph.constants)
 
     # memory_root[name] = the tensor that owns this name's arena memory.
@@ -201,7 +273,7 @@ def _compute_lifetimes(
         op_def = OP_REGISTRY.get(node.op)
 
         # Alias: share input's memory (but not external buffers — they aren't ours)
-        if op_def is not None and op_def.is_alias(node):
+        if config.enable_aliases and op_def is not None and op_def.is_alias(node):
             alias_input = _resolve_alias(node.inputs[0], graph)
             root = get_root(alias_input)
             if root not in external:
@@ -209,7 +281,7 @@ def _compute_lifetimes(
                 continue
 
         # In-place: share if input is dying and same byte size
-        if op_def is not None and op_def.inplace and node.inputs:
+        if config.enable_inplace and op_def is not None and op_def.inplace and node.inputs:
             alias_input = _resolve_alias(node.inputs[0], graph)
             if (alias_input not in external
                     and consumed[alias_input] == total_consumers[alias_input]
@@ -278,8 +350,11 @@ def _compute_scratch(order: list[Node], graph: Graph) -> tuple[dict[str, Lifetim
 # Arena offset assignment
 # ---------------------------------------------------------------------------
 
-def _assign_offsets(lifetimes: dict[str, Lifetime], n_steps: int) -> tuple[dict[str, int], int]:
-    """Assign arena offsets using greedy first-fit with an active set.
+def _assign_offsets(
+    lifetimes: dict[str, Lifetime], n_steps: int,
+    fit: FitStrategy = FitStrategy.FIRST_FIT,
+) -> tuple[dict[str, int], int]:
+    """Assign arena offsets using a greedy gap-selection strategy.
 
     Walks execution steps in order, maintaining only the currently-alive
     allocations. Tensors are added to the active set at birth and evicted
@@ -287,6 +362,8 @@ def _assign_offsets(lifetimes: dict[str, Lifetime], n_steps: int) -> tuple[dict[
 
     Returns (offsets dict, total arena size in bytes).
     """
+    fit_fn = _best_fit if fit == FitStrategy.BEST_FIT else _first_fit
+
     # Group by birth step
     born_at: dict[int, list[str]] = defaultdict(list)
     for name, lt in lifetimes.items():
@@ -310,7 +387,7 @@ def _assign_offsets(lifetimes: dict[str, Lifetime], n_steps: int) -> tuple[dict[
         for name in born_at.get(step, []):
             lt = lifetimes[name]
             regions = sorted(active.values())
-            offset = _first_fit(regions, lt.size_bytes)
+            offset = fit_fn(regions, lt.size_bytes)
             offsets[name] = offset
             active[name] = (offset, lt.size_bytes)
             arena_size = max(arena_size, offset + lt.size_bytes)
@@ -328,29 +405,49 @@ def _first_fit(alive_regions: list[tuple[int, int]], size: int) -> int:
     return candidate
 
 
+def _best_fit(alive_regions: list[tuple[int, int]], size: int) -> int:
+    """Find the smallest gap where `size` bytes fit without overlapping alive regions."""
+    best_offset = -1
+    best_waste = float('inf')
+
+    candidate = 0
+    for region_offset, region_size in alive_regions:
+        gap = region_offset - candidate
+        if gap >= size and gap - size < best_waste:
+            best_offset = candidate
+            best_waste = gap - size
+        candidate = max(candidate, region_offset + region_size)
+
+    return candidate if best_offset < 0 else best_offset
+
+
 # ---------------------------------------------------------------------------
 # Plan
 # ---------------------------------------------------------------------------
 
-def plan(graph: Graph) -> ExecutionPlan:
+def plan(graph: Graph, config: PlannerConfig | None = None) -> ExecutionPlan:
     """Analyze a graph and produce an execution plan with memory layout.
 
     Computes tensor lifetimes from the topological order, then assigns
-    arena offsets using a greedy first-fit algorithm. Alias ops (RESHAPE)
-    and in-place ops (elementwise) share their input's arena memory.
+    arena offsets using a gap-selection strategy. Alias ops (RESHAPE)
+    and in-place ops (elementwise) share their input's arena memory
+    unless disabled via config.
     """
+    if config is None:
+        config = PlannerConfig()
+
     errors = graph.validate()
     if errors:
         raise ValueError(f"Cannot plan invalid graph: {errors}")
 
-    order = _memory_aware_order(graph)
+    order = _get_order(graph, config.order)
 
-    lifetimes, memory_root = _compute_lifetimes(graph, order)
+    lifetimes, memory_root = _compute_lifetimes(graph, order, config)
 
     scratch_lifetimes, scratch_info = _compute_scratch(order, graph)
     all_lifetimes = {**lifetimes, **scratch_lifetimes}
 
-    all_offsets, arena_size = _assign_offsets(all_lifetimes, n_steps=len(order))
+    all_offsets, arena_size = _assign_offsets(all_lifetimes, n_steps=len(order), fit=config.fit)
 
     # Copy offsets for shared tensors (alias + in-place)
     for name, root in memory_root.items():

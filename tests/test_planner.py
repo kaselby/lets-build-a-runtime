@@ -18,7 +18,10 @@ from runtime.ir import Graph, OpType
 from runtime.ops import OP_REGISTRY
 from runtime.planner import (
     ExecutionPlan,
+    FitStrategy,
     Lifetime,
+    OrderStrategy,
+    PlannerConfig,
     _assign_offsets,
     _compute_lifetimes,
     _compute_scratch,
@@ -649,3 +652,120 @@ class TestPlan:
         arena = ep.allocate_arena()
         assert arena.dtype == np.uint8
         assert len(arena) == ep.arena_size
+
+
+# ---------------------------------------------------------------------------
+# PlannerConfig tests
+# ---------------------------------------------------------------------------
+
+class TestPlannerConfig:
+
+    def test_default_config_unchanged(self):
+        """plan(g) and plan(g, PlannerConfig()) should produce identical results."""
+        g = _build_linear_chain()
+
+        ep_default = plan(g)
+        ep_explicit = plan(g, PlannerConfig())
+
+        assert ep_default.arena_size == ep_explicit.arena_size
+        assert ep_default.offsets == ep_explicit.offsets
+
+    def test_no_inplace_increases_arena(self):
+        """enable_inplace=False should use >= default arena size for in-place chains."""
+        g = _build_linear_chain()
+
+        ep_with_inplace = plan(g)
+        ep_no_inplace = plan(g, PlannerConfig(enable_inplace=False))
+
+        # Without in-place, three separate buffers are needed instead of one
+        assert ep_no_inplace.arena_size >= ep_with_inplace.arena_size
+        # For this specific chain, they should be different
+        assert ep_no_inplace.arena_size > ep_with_inplace.arena_size
+
+    def test_no_aliases_increases_arena(self):
+        """enable_aliases=False should use >= default arena size for graphs with reshapes."""
+        g = _build_reshape_then_inplace()
+
+        ep_with_aliases = plan(g)
+        ep_no_aliases = plan(g, PlannerConfig(enable_aliases=False))
+
+        # Without aliases, RESHAPE output gets its own allocation
+        assert ep_no_aliases.arena_size >= ep_with_aliases.arena_size
+
+    def test_all_strategies_no_overlap(self):
+        """All OrderStrategy × FitStrategy combinations should produce valid allocations."""
+        g = _build_two_independent_chains()
+
+        for order_strategy in [
+            OrderStrategy.NAIVE,
+            OrderStrategy.MEMORY_AWARE_V1,
+            OrderStrategy.MEMORY_AWARE_V2,
+            OrderStrategy.MEMORY_AWARE_V3,
+        ]:
+            for fit_strategy in [FitStrategy.FIRST_FIT, FitStrategy.BEST_FIT]:
+                config = PlannerConfig(order=order_strategy, fit=fit_strategy)
+                ep = plan(g, config)
+                _check_no_overlap(ep)
+
+    def test_naive_order_valid(self):
+        """OrderStrategy.NAIVE should produce a valid topological execution order."""
+        g = _build_linear_chain()
+        config = PlannerConfig(order=OrderStrategy.NAIVE)
+        ep = plan(g, config)
+
+        # Verify it's a valid topological order
+        step_of = {node.output: i for i, node in enumerate(ep.order)}
+        for node in ep.order:
+            for inp in node.inputs:
+                producer = g.producer(inp)
+                if producer is not None:
+                    assert step_of[producer.output] < step_of[node.output]
+
+    def test_best_fit_valid(self):
+        """FitStrategy.BEST_FIT should produce valid non-overlapping allocations."""
+        g = _build_two_independent_chains()
+        config = PlannerConfig(fit=FitStrategy.BEST_FIT)
+        ep = plan(g, config)
+
+        _check_no_overlap(ep)
+
+    def test_best_fit_tighter_packing(self):
+        """FitStrategy.BEST_FIT should produce <= arena size compared to FIRST_FIT."""
+        g = _build_two_independent_chains()
+
+        ep_first = plan(g, PlannerConfig(fit=FitStrategy.FIRST_FIT))
+        ep_best = plan(g, PlannerConfig(fit=FitStrategy.BEST_FIT))
+
+        # BEST_FIT should never use more arena than FIRST_FIT
+        assert ep_best.arena_size <= ep_first.arena_size
+
+    def test_memory_aware_v1_v2_valid(self):
+        """MEMORY_AWARE_V1 and MEMORY_AWARE_V2 should both produce valid orders."""
+        g = _build_two_independent_chains()
+
+        for strategy in [OrderStrategy.MEMORY_AWARE_V1, OrderStrategy.MEMORY_AWARE_V2]:
+            config = PlannerConfig(order=strategy)
+            ep = plan(g, config)
+            _check_no_overlap(ep)
+
+    def test_config_immutable(self):
+        """PlannerConfig should be frozen (immutable)."""
+        config = PlannerConfig()
+        with pytest.raises(AttributeError):
+            config.enable_inplace = False
+
+    def test_config_defaults_match_current_behavior(self):
+        """All config defaults should match the implicit behavior before config existed."""
+        config = PlannerConfig()
+        assert config.order == OrderStrategy.MEMORY_AWARE_V1
+        assert config.fit == FitStrategy.FIRST_FIT
+        assert config.enable_inplace is True
+        assert config.enable_aliases is True
+
+    def test_disabling_both_shared_memory_features(self):
+        """Disabling both in-place and aliases should still produce valid allocations."""
+        g = _build_reshape_then_inplace()
+        config = PlannerConfig(enable_inplace=False, enable_aliases=False)
+        ep = plan(g, config)
+
+        _check_no_overlap(ep)
