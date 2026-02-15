@@ -1,8 +1,7 @@
-"""Export a PyTorch model to our graph IR.
+"""PyTorch exporter: torch.nn.Module -> our graph IR.
 
-Takes a torch.nn.Module, runs it through torch.export (without
-decompositions) and maps the resulting fx.Graph into our
-Graph/Node/TensorInfo representation.
+Uses torch.export to trace the model, then maps the resulting
+ATen ops to our IR via the handler registry in handlers.py.
 
 We handle high-level ops like aten.linear directly rather than
 decomposing them into primitives. This preserves useful information
@@ -22,14 +21,15 @@ import torch
 import torch.nn as nn
 from torch.export.graph_signature import InputKind
 
-from ..ir import Graph
-
-
+from ...ir import Graph
 from .handlers import ATEN_HANDLERS
 
 
-def export_model(model: nn.Module, example_inputs: tuple) -> Graph:
+def export_pytorch(model: nn.Module, example_inputs: tuple) -> Graph:
     """Export a PyTorch model to our Graph IR.
+
+    Sets eval mode and disables gradients for clean tracing,
+    then runs torch.export and maps ATen ops to our IR.
 
     Args:
         model: The PyTorch model to export.
@@ -38,6 +38,13 @@ def export_model(model: nn.Module, example_inputs: tuple) -> Graph:
     Returns:
         A populated Graph ready for optimization passes.
     """
+    model.eval()
+    with torch.no_grad():
+        return _export_core(model, example_inputs)
+
+
+def _export_core(model: nn.Module, example_inputs: tuple) -> Graph:
+    """Core export logic — torch.export + ATen handler dispatch."""
     # Step 1: torch.export (no decomposition — we handle high-level ops directly)
     exported = torch.export.export(model, example_inputs)
 

@@ -41,6 +41,10 @@ def _float_bits(f: float) -> int:
 # the node's attrs (e.g., SLICE is alias only when dim=0).
 AliasPredicate = bool | Callable[[Node], bool]
 
+# Alias offset: byte offset of alias output relative to the input buffer.
+# RESHAPE is always 0 (same start), SLICE returns byte_offset into the input.
+AliasOffset = Callable[[Node], int]
+
 
 @dataclass
 class OpDef:
@@ -56,6 +60,10 @@ class OpDef:
             The planner skips arena allocation for alias outputs and extends
             the root tensor's lifetime instead. Can be a bool or a callable
             (node) -> bool for ops where it depends on attrs.
+        alias_offset: Byte offset of the alias output relative to the input.
+            For RESHAPE this is 0 (same start). For SLICE this is the
+            byte_offset into the input tensor. None = 0. The planner adds
+            this to the root's arena offset when propagating offsets.
         inplace: Safe to write output into the first input's buffer. The kernel
             must not read any input element after that position has been written.
             The planner can assign the output to the same arena offset as a
@@ -67,6 +75,7 @@ class OpDef:
     evaluator: NumpyEvaluator | None = None
     scratch: ScratchCalculator | None = None
     alias: AliasPredicate = False
+    alias_offset: AliasOffset | None = None
     inplace: bool = False
     extras: ExtrasPacker | None = None
 
@@ -303,7 +312,7 @@ OP_REGISTRY: dict[OpType, OpDef] = {
                           evaluator=lambda ins, a: np.power(ins[0], a["scalar"])),
     OpType.TANH:    OpDef(inplace=True,
                           evaluator=lambda ins, a: np.tanh(ins[0])),
-    OpType.GELU:    OpDef(inplace=True,
+    OpType.GELU:    OpDef(inplace=False,  # C kernel not in-place safe (macOS vvtanhf path)
                           evaluator=lambda ins, a: 0.5 * ins[0] * (1 + np.tanh(0.7978845608 * (ins[0] + 0.044715 * ins[0]**3)))),
 
     # --- Reductions ---
@@ -319,7 +328,9 @@ OP_REGISTRY: dict[OpType, OpDef] = {
     OpType.TRANSPOSE:   OpDef(extras=_transpose_extras,
                               evaluator=lambda ins, a: np.swapaxes(ins[0], a["dim0"], a["dim1"])),
     OpType.PERMUTE:     OpDef(evaluator=lambda ins, a: np.transpose(ins[0], a["axes"])),
-    OpType.SLICE:       OpDef(alias=_slice_alias, extras=_slice_extras),
+    OpType.SLICE:       OpDef(alias=_slice_alias,
+                              alias_offset=lambda n: n.attrs.get("byte_offset", 0),
+                              extras=_slice_extras),
 
     # --- Compound ops ---
     OpType.LAYERNORM:   OpDef(extras=_layernorm_extras, evaluator=_eval_layernorm),
@@ -331,7 +342,7 @@ OP_REGISTRY: dict[OpType, OpDef] = {
     # --- Fused ops ---
     OpType.MATMUL_ADD:      OpDef(extras=_matmul_extras,
                                   evaluator=lambda ins, a: ins[0] @ (ins[1].T if a.get("transpose_b") else ins[1]) * a.get("alpha", 1.0) + ins[2]),
-    OpType.FUSED_BIAS_RELU: OpDef(evaluator=lambda ins, a: np.maximum(ins[0] + ins[1], 0)),
+    OpType.FUSED_BIAS_RELU: OpDef(inplace=True, evaluator=lambda ins, a: np.maximum(ins[0] + ins[1], 0)),
     OpType.ATTENTION:       OpDef(extras=_attention_extras, scratch=_attention_scratch,
                                   evaluator=_eval_attention),
 

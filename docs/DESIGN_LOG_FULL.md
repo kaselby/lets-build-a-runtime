@@ -1,12 +1,12 @@
-# Design Decisions
+# Design Log
 
-Detailed technical decisions and rationale. See `CLAUDE.md` for high-level principles.
+Detailed technical decisions, tradeoff analyses, and iteration history. See `DESIGN.md` for the high-level summary.
 
 ## Op Representation
 
 **TRANSPOSE vs PERMUTE are separate ops.** A 2D axis swap has different optimization opportunities (BLAS transpose flags, fusion into matmul) than a general N-dimensional permute (which requires data movement). The exporter inspects the permutation axes and emits the appropriate op.
 
-**addmm decomposition.** `torch.export` emits `aten.addmm(bias, input, weight)` for linear layers. We decompose this into separate MATMUL + ADD nodes so the fusion pass has something to work with.
+**addmm decomposition.** `torch.export` emits `aten.addmm(bias, input, weight)` for linear layers. We decompose this into separate MATMUL + ADD nodes so the fusion pass has something to work with. Originally the exporter pre-transposed Conv1D weights and set `transpose_b` directly; now it emits primitives and the absorption pass handles the optimization (see Exporter Refactoring).
 
 ## Single-Output Nodes vs Multi-Output
 
@@ -49,7 +49,140 @@ The exporter handles the two-phase `aten.split.Tensor` → `operator.getitem` pa
 1. `_handle_split` is a no-op — it maps the split's fx_name to its input tensor in node_map (like dropout).
 2. `_handle_getitem` checks if its source is a split by inspecting the FX graph directly — reading chunk_size, dim, and input shape from the source node's args. It then computes the byte offset and emits a SLICE node.
 
-No shared mutable state between handlers. The getitem handler is self-contained — it reads split metadata from the FX graph rather than relying on a stash dict.
+No shared mutable state between handlers. The getitem handler is self-contained — it reads split metadata from the FX graph rather than relying on a stash dict. The original design used a module-level `_pending_splits` dictionary shared between the split and getitem handlers — this was replaced because shared mutable state across handler calls is a bug risk.
+
+## Exporter Refactoring
+
+The exporter was split from a single `exporter.py` into `exporter/exporter.py` (core pipeline) and `exporter/handlers.py` (op handlers + registry).
+
+### Core pipeline
+
+Three-phase graph walk: placeholders (graph inputs) → compute nodes → outputs. Three passes is deliberate — a single loop would need to handle forward references from outputs to not-yet-processed compute nodes. The clarity is worth the negligible performance cost.
+
+### Handler utilities
+
+Per-handler boilerplate was extracted into shared utilities:
+- **`_output_meta(fx_node)`** — extracts shape/dtype from tracing metadata (was duplicated in every handler)
+- **`_emit(fx_node, graph, node_map, op, inputs, attrs)`** — registers tensor, adds node, updates node_map
+- **`_get_axis(fx_node, arg_index, default)`** — extracts and normalizes axis args, handles negative dims (via `% ndim`), single-element lists, kwargs fallback
+
+Handler factories (`_make_simple_handler`, `_make_binary_handler`, `_make_reduction_handler`) cover common patterns. No-op handlers (contiguous, dropout, alias) were consolidated into a single `_handle_noop`.
+
+### Design change: exporter emits primitives
+
+**Old:** `_handle_linear` set `transpose_b=True` directly on the MATMUL node. `_handle_addmm` pre-transposed the weight buffer at export time. The exporter was embedding BLAS optimization knowledge.
+
+**New:** `_handle_linear` emits `TRANSPOSE(weight) + MATMUL + ADD` as primitives. `_handle_addmm` emits `MATMUL + ADD` without pre-transposing. The absorption pass handles everything: `_absorb_transpose_b` absorbs the explicit TRANSPOSE into `transpose_b=True`, and `_pretranspose_constant_b` pre-transposes Conv1D constant weights and sets `transpose_b=True`.
+
+This is a cleaner separation of concerns: the exporter does mechanical ATen→IR mapping, passes do optimization. Each can be tested independently.
+
+## OpDef Registry
+
+### Motivation
+
+Per-op metadata was scattered across four separate locations: evaluators in a `NUMPY_EVALUATORS` dict in `folding.py`, scratch calculators in `SCRATCH_CALCULATORS` in `planner.py`, alias detection hardcoded in `_find_reshape_aliases` in the planner, and C kernel extras packing in a ~90-line `_fill_extras` if/elif chain in the executor. Adding a new op meant touching all four files and hoping you didn't forget one.
+
+### The OpDef dataclass
+
+Centralizes all Python-side per-op knowledge in one registry entry:
+
+- **`evaluator`** — numpy implementation (constant folding + fallback execution)
+- **`scratch`** — scratch buffer size calculator (planner)
+- **`alias`** — `bool | Callable[[Node], bool]`, whether output shares input memory
+- **`inplace`** — bool, whether the kernel can write output into first input's buffer
+- **`extras`** — packs op-specific params into `COpNode.extra[]` for compiled C dispatch
+
+### What it replaced
+
+| Before | After |
+|--------|-------|
+| `NUMPY_EVALUATORS` dict in folding.py | `op_def.evaluator` |
+| `SCRATCH_CALCULATORS` dict in planner.py | `op_def.scratch` |
+| Hardcoded `if node.op == OpType.RESHAPE` in planner | `op_def.is_alias(node)` |
+| `_find_reshape_aliases()` function | `_resolve_alias()` using `op_def.is_alias()` |
+| `_fill_extras()` 90-line if/elif chain | per-op `op_def.extras(node, graph)` packers |
+| `_float_bits()` helper for float→int bit-cast | shared utility in `ops.py` |
+
+### Alias handling redesign
+
+**Old approach:** The planner pre-computed an alias dict mapping tensor names to `(root, byte_offset)` tuples, threaded it through lifetime computation. Byte offsets were tracked everywhere even though only the executor needs them. Only RESHAPE was an alias — hardcoded check.
+
+**New approach:** `alias` field on OpDef supports both `bool` and `Callable[[Node], bool]`. The `OpDef.is_alias(node)` method handles both. `_resolve_alias(name, graph)` walks the producer chain using `is_alias()`. No byte offsets in the planner — the executor reads `byte_offset` from node attrs directly.
+
+**SLICE alias is per-node.** `_slice_alias(node)` returns True for contiguous slices (dim=0) and False for non-contiguous (dim>0). Contiguous slices share input memory (zero-copy). Non-contiguous slices are regular compute nodes dispatched to a C kernel.
+
+## Unified Alias + In-Place Memory Sharing
+
+### The bug in the original design
+
+The original planner had two separate passes: `_compute_lifetimes` handled aliases via a precomputed alias dict, then `_apply_inplace` retroactively merged lifetimes for elementwise ops. **Chained in-place didn't work** — e.g., EXP → RELU where both could write into the same buffer. The second op couldn't find the merged lifetime from the first because `_apply_inplace` processed ops independently without propagating its decisions.
+
+### The fix: single-pass unification
+
+A single pass in `_compute_lifetimes` handles both alias and in-place sharing through the same `memory_root` mechanism. For each node in execution order:
+
+1. **Alias op** → unconditionally share input's memory: `memory_root[output] = get_root(input)`
+2. **In-place eligible** (dying input, same size) → conditionally share: `memory_root[output] = get_root(input)`
+3. **Otherwise** → new lifetime
+
+Returns `(lifetimes, memory_root)` where `memory_root` maps shared tensors to their arena-owning root. `get_root()` follows both alias and in-place chains, so chained in-place works naturally.
+
+### Consumer counting subtlety
+
+Consumer counting uses `_resolve_alias()` (graph-structural alias resolution only) rather than `get_root()` (which also follows in-place decisions). This is intentional: consumer counts must be stable regardless of in-place decisions to avoid a circular dependency where in-place choices affect consumer counts which affect in-place choices.
+
+## Memory-Aware Topological Ordering
+
+The execution order affects peak memory — scheduling a node that frees large tensors before one that allocates large outputs reduces the live set. Three implementations were compared:
+
+### v1: Original (compute-once-at-push)
+
+Kahn's algorithm with max-heap, priority = `freed_bytes` only. `_freed_bytes` computed at push time, never updated.
+
+**Staleness problem:** scores can only be *under*-estimated, never over-estimated. When `remaining_consumers[t]` drops from 2→1 after another node is scheduled, a node that would now free `t` is stuck in the heap with a stale lower score. The node never gets re-evaluated. Simple (~60 lines), but misses optimization opportunities in graphs with multi-consumer tensors (residual connections, attention).
+
+### v2: Lazy re-score (chosen)
+
+Kahn's + max-heap, priority = `freed_bytes - output_alloc_bytes + inplace_bonus`.
+
+- **On pop**, recomputes score with current `remaining_consumers`. If changed, pushes back and pops next candidate.
+- **Alias-aware**: resolves to alias roots for consumer counting, caches resolutions.
+- **Net delta heuristic**: accounts for both freeing inputs and allocating output. A node freeing 1MB but allocating 2MB is a net memory increase.
+- **Inplace bonus**: small forward-looking bonus (output_size/8) for nodes whose output will be consumed in-place by a downstream op. Nudges the scheduler to set up in-place chains.
+
+Lazy re-score handles the under-estimation problem: stale nodes get popped, re-scored higher, pushed back to correct position. Extra pop-push cycles are O(log N) each and rare in practice. ~115 lines.
+
+### v3: Event-driven (from Codex)
+
+Kahn's + max-heap with version-based stale entry skipping, priority = `freed_bytes - output_alloc_bytes`.
+
+- **Proactive updates**: when `remaining_consumers[root]` drops to 1, immediately finds the last consumer and pushes an updated heap entry.
+- In-place-aware output estimation.
+- **Edge case gap**: event trigger fires at `remaining_consumers == 1`, but `_freed_bytes` checks `remaining_consumers == use_count`. For multi-edge consumers (e.g., `add(x, x)` with `use_count == 2`), the trigger can miss cases. Rare in practice.
+- ~140 lines, significant bookkeeping (version counters, ready_ids, remaining_by_root_node).
+
+### Comparison
+
+| | v1 | v2 (lazy) | v3 (event-driven) |
+|---|---|---|---|
+| Staleness handling | None | Lazy re-score on pop | Proactive push on refcount event |
+| Score metric | freed only | net delta + inplace bonus | net delta + inplace-aware output |
+| Alias-aware | No | Yes (cached) | Yes |
+| Duplicate inputs | Not handled | Handled (seen_roots set) | Handled (edge counts) |
+| Complexity | O(N log N) | O(N log N) amortized | O((N+E) log N) |
+| Code complexity | ~60 lines | ~115 lines | ~140 lines |
+| Edge cases | Staleness | None known | Multi-edge trigger gap |
+
+**v2 was chosen** — best balance of correctness, simplicity, and heuristic quality. The lazy re-score is "good enough" for realistic graphs, the inplace bonus is a genuinely useful addition, and it's much easier to explain in an interview than the event-driven machinery.
+
+### Interview talking points
+
+- Tradeoffs of first-fit vs best-fit offset assignment
+- NP-hardness of optimal topological ordering for minimum memory
+- Memory-aware ordering and in-place reuse are the two main heuristics real runtimes use
+- The planner runs once at compile time, so O(n²) is fine for realistic graph sizes
+- Can walk through the staleness analysis: why freed_bytes can only be under-estimated, why lazy re-eval works
+- Net delta vs freed-only: peak memory is about live set size, need to account for output allocation not just input freeing
 
 ## Weight Transpose Handling
 
@@ -59,7 +192,7 @@ No shared mutable state between handlers. The getitem handler is self-contained 
 2. **Strided views** — reinterpret the `[out, in]` buffer with swapped strides. No copy, but C kernels can't handle non-contiguous data without extra logic.
 3. **BLAS transpose flags** — fuse TRANSPOSE into MATMUL, keep weights in original `[out, in]` layout, call `cblas_sgemm` with `CblasTrans`. This is what `nn.Linear` does internally and is the fastest option at large dimensions.
 
-**We use option 3.** The fusion pass pattern-matches TRANSPOSE → MATMUL and absorbs the transpose as a `transpose_b` attribute on the MATMUL node. The C kernel passes `CblasTrans` to `cblas_sgemm`.
+**We use option 3.** The absorption pass pattern-matches TRANSPOSE → MATMUL and absorbs the transpose as a `transpose_b` attribute on the MATMUL node. The C kernel passes `CblasTrans` to `cblas_sgemm`.
 
 ### Why CblasTrans is faster (the BLAS packing story)
 
@@ -84,15 +217,32 @@ Full analysis in Obsidian: `INTERVIEW PREP/Inference Runtime Project/BLAS Transp
 
 ## BLAS Flag Absorption Pass
 
-The `absorb_transpose_into_matmul` pass handles TRANSPOSE → MATMUL patterns that the exporter didn't catch at export time. The exporter handles `aten.linear` directly (emitting MATMUL with `transpose_b=True`), but manual `x @ w.T` or `torch.mm(x, w.permute(1,0))` in model code produces explicit TRANSPOSE nodes followed by MATMUL.
+The `absorb_into_matmul` pass absorbs adjacent ops into sgemm parameters. Originally a monolithic function, now decomposed into focused helpers:
 
-The pass walks all MATMUL nodes, checks if input B (index 1) is produced by a TRANSPOSE with a sole consumer, and rewires the MATMUL to read the original pre-transpose tensor with `transpose_b=True`. This keeps the weight in its original `[out, in]` layout for the fast CblasTrans path.
+- **`_absorb_transpose_b`** — absorbs TRANSPOSE on B input into `transpose_b=True`. Only absorbs when `{dim0, dim1} == {ndim-2, ndim-1}` (the last-two-dims swap), not head-reshape permutes.
+- **`_pretranspose_constant_b`** — **new in refactor**: for constant B inputs not already transposed (e.g., Conv1D weights stored as `[in, out]`), pre-transposes the weight buffer in-place and sets `transpose_b=True`. This replaces the old approach where `_handle_addmm` in the exporter did the pre-transpose.
+- **`_fold_scalar_into_alpha`** — shared math for folding scalar MUL/DIV into alpha (was duplicated between backward and forward cases)
+- **`_absorb_input_scalars`** — backward scalar absorption on inputs
+- **`_absorb_output_scalar`** — forward scalar absorption on output
+
+The main function is a tight loop calling four helpers.
 
 **This is not a fusion.** Traditional fusion combines ops into a single fused kernel. This is flag absorption — telling BLAS to handle a data layout concern internally. The generic FusionPattern machinery doesn't fit because it collects external inputs in chain order, which would scramble the A/B input ordering. A dedicated pass is cleaner.
 
 **Critical ordering constraint.** This pass must run before constant folding. If constant folding runs first, it evaluates TRANSPOSE(constant_weight) eagerly, materializing a pre-transposed copy. The TRANSPOSE node disappears, the absorption pass finds nothing to do, and we end up on the slow CblasNoTrans path.
 
-The `Graph.rewire_input()` method was added to support this pattern — it changes a node's input tensor and updates the consumer index atomically.
+## Causal Mask Handling
+
+### Unified mask detection
+
+The original code had three separate functions for detecting causal masks: `_is_bool_causal_mask`, `_is_float_causal_mask` in the mask absorption pass, and a third `_is_causal_mask` in the causal attention fusion pattern. These were unified into a single `_is_causal_mask` function that handles both formats:
+
+- **Bool format:** lower-triangular True matrix (from `torch.tril(torch.ones(..., dtype=torch.bool))`)
+- **Float format:** upper-triangular `-inf` matrix (from `torch.where(causal_mask, 0.0, -inf)`)
+
+### Mask absorption pass
+
+`absorb_causal_mask` detects when a constant mask feeding an ATTENTION node is causal, replaces it with a `causal=True` attribute, and removes the mask input. The causal flag flows through the full stack: `OpDef.extras` packer → `COpNode.extra[]` → C `dispatch_attention` → `kernel_attention`/`kernel_attention_flash`.
 
 ## RESHAPE as Zero-Copy Alias
 
@@ -100,11 +250,19 @@ RESHAPE doesn't move data — it reinterprets dimension boundaries on the same c
 
 The runtime handles RESHAPE as a zero-copy alias:
 
-1. **Planner:** Identifies RESHAPE nodes and builds an internal alias map (output → root input, following chains). RESHAPE outputs get no arena allocation. The root tensor's lifetime is extended to cover all alias consumers.
+1. **Planner:** `OpDef.alias = True` for RESHAPE. `_resolve_alias()` walks producer chains. RESHAPE outputs get no arena allocation. The root tensor's lifetime is extended to cover all alias consumers.
 2. **Executor:** When it encounters a RESHAPE node during dispatch, it creates a numpy view of the input buffer with the new shape and assigns it to the output tensor. No kernel is dispatched, no data moves.
 3. **Constant folding:** If RESHAPE's input is a constant, constant folding handles it naturally — `np.reshape` returns a view, which gets promoted to a constant. The RESHAPE node is then removed by DCE.
 
 This matters for transformer models where RESHAPE is used heavily for head splitting (`[B, S, D] → [B, S, H, D_k]`) and merging (`[B, S, H, D_k] → [B, S, D]`). Six reshapes per attention layer, all zero-cost.
+
+## Non-Contiguous SLICE
+
+**The original problem.** The compiled C execution path is supposed to be a single `execute()` call. But graphs with non-contiguous SLICE ops (notably GPT-2's QKV split along dim=2) broke this into segmented execution: run C nodes → pause → do a SLICE copy in Python → resume C nodes. The C executor had no kernel for strided copies.
+
+**The workaround.** `compile_plan` pulled non-alias SLICEs out of the C execution order and recorded their positions. `execute_compiled` then ran C segments between them, executing each SLICE in Python via numpy before resuming. This added Python re-entry overhead and complicated the single-call invariant.
+
+**The fix.** The `OpDef.alias` field for SLICE was changed from `True` to `Callable[[Node], bool]` — `_slice_alias(node)` returns True for dim=0 (contiguous, zero-copy alias) and False for dim>0 (non-contiguous, needs a kernel). A `kernel_slice` was implemented in `csrc/ops.c` that copies a non-contiguous slice into a contiguous output buffer using `[outer, orig_dim_size, start, slice_len, inner]` parameters from the extras array. The segmented execution code was removed entirely, restoring the single-call invariant. ~60 lines of complex segmented execution replaced by ~30 lines of straightforward extras packing + a C kernel.
 
 ## Memory Planning
 
@@ -122,84 +280,125 @@ Some fused kernels need temporary workspace that isn't an input or output — e.
 
 ### How it works
 
-**Registry.** A scratch calculator registry maps OpType to a size function:
+**Registry.** Scratch calculators are registered on `OpDef.scratch`:
 
 ```python
 ScratchCalculator = Callable[[list[tuple[int, ...]], tuple[int, ...]], int]
 #                              input_shapes            output_shape     -> bytes
 ```
 
-The signature takes only the tensor shapes — no graph coupling. Most ops return 0 (no scratch). Attention returns `S * S * sizeof(float)`.
+The signature takes only the tensor shapes — no graph coupling. Most ops have no scratch (field is `None`). Attention returns `batch_heads * S * S * sizeof(float)`.
 
-**Planner.** During planning, `_compute_scratch()` queries the registry for each node. If scratch is needed, it creates a `Lifetime` entry with `born=step, dies=step` (single-step — the scratch is only alive during that one kernel call). These lifetimes go through the same `_assign_offsets` first-fit as regular intermediates. The arena is unified; scratch competes for space with regular tensors and benefits from the same overlap analysis.
+**Planner.** During planning, `_compute_scratch()` queries `OP_REGISTRY` for each node. If scratch is needed, it creates a `Lifetime` entry with `born=step, dies=step` (single-step). These lifetimes go through the same `_assign_offsets` first-fit as regular intermediates. The arena is unified.
 
-The resulting offsets are split: regular tensor offsets go into `plan.offsets`, scratch offsets go into `plan.scratch: dict[int, tuple[int, int]]` (node ID → arena offset, size in bytes). The separation is because they need different binding at execution time — regular intermediates are bound by tensor name via the graph's tensor registry, while scratch is bound by node ID and passed as an extra kernel input.
+**Executor.** When dispatching a node (per-op or compiled), the executor checks `plan.scratch` for that node. If present, it creates a flat `float32` arena view at the recorded offset and appends it to the kernel's input list. The kernel receives `[Q, K, V, scratch]` and doesn't care where the scratch came from.
 
-**Executor.** When dispatching a node (per-op or compiled), the executor checks `plan.scratch` for that node. If present, it creates a flat `float32` arena view at the recorded offset and appends it to the kernel's input list. The kernel receives `[Q, K, V, scratch]` and doesn't care where the scratch came from — it's just another float pointer.
+### Scratch vs parallelism tradeoff
 
-For the compiled C path, scratch pointers are baked into the `COpNode.inputs` array at compile time (at index `n_inputs`, then `n_inputs` is incremented). The numpy views are kept alive via a reference list on the `CompiledPlan` to prevent garbage collection.
+The standard attention kernel can process (batch, head) slices in parallel via GCD `dispatch_apply`. Each concurrent slice needs its own scratch buffer.
 
-### What about in-place scratch?
+**The current approach:** The scratch calculator allocates `batch_heads * S * S * sizeof(float)`. Each GCD thread indexes into its region at `scratch + bh * scratch_per_slice`. Zero synchronization, zero allocation in the kernel. This over-allocates when `batch_heads >> num_cores`, but the scratch has a single-step lifetime so the planner reclaims it immediately.
 
-Some kernels can reuse an input buffer as workspace (because they're done reading it before they start writing). In those cases, the kernel just uses the pointer it already has — no planner involvement, no scratch allocation. This is an internal kernel optimization, invisible to the rest of the system. For attention specifically, we can't reuse Q/K/V as scratch since they're the wrong size (S×D vs S×S) and we need all three throughout the computation.
-
-### Scratch vs parallelism tradeoff (open question)
-
-The standard attention kernel can process (batch, head) slices in parallel via GCD `dispatch_apply`. Each concurrent slice needs its own S×S scratch buffer — you can't have two threads writing to the same scratch simultaneously. This creates a tension with the "planner owns all memory" principle.
-
-**The current implementation cheats.** Slice 0 uses the planner-provided scratch buffer; slices 1+ `malloc` their own inside the kernel. This violates the design principle and adds per-call allocation overhead (though the comment claims ~50ns malloc vs ~500us work per slice).
-
-**Option A: Parallel-aware scratch.** The scratch calculator allocates `batch_heads * S * S * sizeof(float)` instead of `S * S`. Each GCD thread offsets into its portion (`scratch + bh * S * S`). No malloc, planner owns everything. But this uses the same total memory as the *unfused* path's intermediate tensors (`scores`, `probs`, etc. are all `[B, H, S, S]`), eliminating the memory benefit of fusion. We've traded memory savings for parallelism — which may be the right tradeoff, but it's worth being explicit about.
-
-**Option B: Sequential standard, parallel flash.** The standard kernel runs slices sequentially with a single S×S scratch buffer. The flash kernel runs in parallel — its scratch is only `B_r × B_c = 32 × 32 = 4KB` per slice, so even `batch_heads` copies is negligible. This preserves the standard kernel's memory advantage (one S×S buffer) while giving parallelism where it's cheap (flash). The downside is the standard kernel leaves performance on the table by not threading.
-
-**Option C: Accept the malloc.** For kernels where the scratch per thread is small relative to the work per thread, the malloc/free cost is genuinely negligible. This pragmatically violates the "planner owns all memory" principle but keeps the code simple. The principle exists to avoid per-call allocation overhead, and if the overhead is demonstrably <0.01% of kernel time, the principle has been satisfied in spirit.
-
-**Current decision: unresolved.** The flash kernel's tiny scratch makes this moot for the primary use case. For the standard kernel, Option B (sequential standard, parallel flash) is the cleanest architecture. Option C (accept the malloc) is the pragmatic fallback if sequential standard is too slow and we haven't wired up flash yet.
+**Flash attention scratch is tiny regardless.** The flash kernel's per-slice scratch is `32×32×4` = 4KB (one tile, not the full S×S matrix), so even at `batch_heads=128` it's only 512KB total.
 
 ## Optimization Pass Pipeline
 
-Passes are plain callables `(Graph) -> bool`. The pipeline is a list, run in order. `run_until_stable()` runs the pipeline repeatedly until no pass reports changes — useful when passes create opportunities for each other.
+Passes are plain callables `(Graph) -> bool`. The pipeline is a list, run in order. `run_until_stable()` runs the pipeline repeatedly until no pass reports changes.
 
-**Default ordering: MATMUL absorption → constant folding → pattern fusion → dead code elimination.** MATMUL absorption runs first, folding transposes into `transpose_b` flags and scalar MUL/DIV into `alpha` before constant folding can eagerly materialize them (see Weight Transpose Handling above). Pattern-based fusion runs next, claiming specific patterns via the `FusionPattern` registry with priority-based ordering. DCE cleans up dead nodes and unused constants last.
+**Default ordering: MATMUL absorption → constant folding → causal mask absorption → pattern fusion → DAG fusion → dead code elimination.** MATMUL absorption runs first so constant folding doesn't eagerly materialize transposes. Causal mask absorption runs before fusion so the causal flag is available for the CAUSAL_ATTENTION pattern. DAG fusion runs after chain fusion since it handles patterns (like GELU) that chain fusion can't.
 
-The pipeline is designed to be reconfigurable. The `run_pipeline` / `run_until_stable` infrastructure supports reordering, repeating, or swapping passes without changes.
+**Pattern-based fusion** uses a registry of `FusionPattern` objects with priority-based grouping. Within each priority level, patterns are matched greedily longest-first. Patterns include optional validators and attr builders. Currently registered:
+- **Priority 0:** `ATTENTION`, `CAUSAL_ATTENTION`, `BIAS_RELU`
+- **Priority 1:** `MATMUL_ADD`
 
-**Pattern-based fusion** uses a registry of `FusionPattern` objects with priority-based grouping. Within each priority level, patterns are matched greedily longest-first. Patterns include optional validators (structural checks beyond op type matching) and attr builders (for carrying forward flags like transpose dims to the fused node). The sole-consumer constraint is critical for fusion correctness: an intermediate tensor can only be eliminated if exactly one node consumes it.
+**DAG fusion** handles non-linear subgraph patterns. Currently recognizes the GELU tanh approximation — an 8-node subgraph where `x` fans out to `x^3` and `x` paths that reconverge through multiplication. This can't use `FusionPattern` because the chain matcher requires sole-consumer constraints at each step, and DAG patterns have multi-consumer intermediate nodes by definition. The `fuse_dags` pass is extensible to SiLU, GeGLU, etc. (~10-15 lines per new pattern).
 
-Currently registered patterns:
-- **Priority 0:** `ATTENTION` (MATMUL→SOFTMAX→MATMUL, validated by transpose_b and last-axis softmax) and `BIAS_RELU` (ADD+RELU where ADD is a 1D bias broadcast). These run first to claim their nodes before lower-priority patterns.
-- **Priority 1:** `MATMUL_ADD` (catches standalone bias adds not claimed by BIAS_RELU).
+**Constant folding and DCE** work as a pair. Folding promotes a node's output to a constant and removes the node, but leaves the input constants in place. DCE cleans up any that become dead. Constant folding reads evaluators from `OP_REGISTRY` instead of maintaining its own evaluator dict.
 
-**Constant folding and DCE** work as a pair. Folding promotes a node's output to a constant and removes the node, but leaves the input constants in place. DCE then cleans up any input constants that have no remaining consumers. This avoids duplicating weight memory — the original weight is only freed when nothing else references it. Constant folding wraps results in `np.ascontiguousarray()` to guarantee C-compatible memory layout.
+**Fold-only ops** (CAST, EXPAND, SLICE_TENSOR, CMP_NE, etc., enum values >= 100) are infrastructure ops that must be eliminated by constant folding. They have evaluators in `OP_REGISTRY` but no C kernels. Both executors raise `RuntimeError` if one reaches execution. These exist for subgraphs like GPT-2's causal mask generation — fully constant at export time, but the exporter needs to represent the ops so constant folding can evaluate them. If a future model uses these ops with runtime inputs, execution would fail; this is a known limitation.
 
 ## Numpy Evaluators
 
-`passes.py` maintains a registry of numpy evaluator functions (`NUMPY_EVALUATORS`) that compute any op on numpy arrays. Used by constant folding to evaluate ops at build time. These are separate from the numpy backend's in-place kernels — the evaluators return new arrays (what constant folding needs), while the backend kernels write into pre-allocated output buffers via numpy's `out=` parameter (what the executor needs). The two have different memory contracts and should not be conflated.
+Constant folding evaluators now live in `OP_REGISTRY` as `OpDef.evaluator` fields, replacing the standalone `NUMPY_EVALUATORS` dict in the old `folding.py`. These are separate from the numpy backend's in-place kernels — the evaluators return new arrays (what constant folding needs), while the backend kernels write into pre-allocated output buffers via numpy's `out=` parameter (what the executor needs). The two have different memory contracts and should not be conflated.
 
-## Executor and Backends
+## Executor Architecture
 
-**Plan vs Executor split.** The `ExecutionPlan` is the static, "compiled" artifact — graph, node order, arena size, offset assignments. The `Executor` is the runtime — it holds backends, allocates memory, binds buffers, and dispatches kernels. Mirrors the ONNX Runtime distinction between `InferenceSession` (runtime) and the optimized graph (static).
+### Structural evolution
 
-**Backend priority dispatch.** Backends are tried in order for each op — first match wins. `[c_backend, numpy_backend]` means C handles what it can, numpy catches the rest. Maps to ONNX Runtime's Execution Provider concept (CPU EP, CUDA EP, etc.).
+The executor was originally a single `executor.py` containing both the compiled and per-op dispatch paths, the `COpNode` struct definition, C library loading, arena management, and all the buffer binding logic. This was split into:
 
-**Kernel contract: write into pre-allocated output.** Kernels receive input buffers, a pre-allocated output buffer, and an attrs dict. They write the result into the output buffer — no allocations, no return values. This is the natural contract for C kernels and keeps the memory planner in full control.
+- **`executor/common.py`** — `Executor` ABC, `COpNode` struct, C library loading, arena management, buffer binding
+- **`executor/compiled.py`** — `CompiledExecutor`: builds COpNode struct array, one C call per inference
+- **`executor/interpreted.py`** — `InterpretedExecutor`: Python loop with backend chain dispatch
 
-**Arena reuse across calls.** The executor keeps its arena buffer between inference calls and only reallocates if a larger plan is encountered. Output tensors are copied out of the arena before returning, so the caller isn't holding views into memory that gets overwritten on the next call.
+### Executor ABC
+
+- `compile(plan)` — one-time preparation (build struct array or stash plan)
+- `run(inputs)` — per-call inference (patch pointers + C call, or Python dispatch loop)
+- Shared: `_get_arena()`, `_bind_inputs()`, `_bind_intermediates()`
+
+Both executors subclass this — same interface, easy to swap in tests/benchmarks.
+
+### CompiledExecutor cleanup
+
+- `_fill_extras` replaced by `OP_REGISTRY` dispatch (4 lines vs ~90 lines of if/elif)
+- SLICE handling simplified: contiguous slices are aliases (skipped), non-contiguous slices dispatch to C kernel. Segmented execution eliminated entirely.
+- `_build_node` populates one COpNode struct — input pointers, scratch, output, shape, extras
+- `run()` is minimal: patch input pointers, one C call, copy outputs
+
+### InterpretedExecutor
+
+Backend protocol + kernel resolution preserved for ablation use. Same compile/run interface as compiled executor. Alias ops skipped via `OP_REGISTRY` (no hardcoded op checks).
+
+### Session API
+
+`session.py` wraps the full pipeline: `InferenceSession(model, sample_inputs)` → `session.run(inputs)`. Mirrors ONNX Runtime's `InferenceSession` pattern. Handles export, optimization, planning, and executor creation internally.
+
+## C Dispatch: Switch to Function Pointer Table
+
+### The problem with switch dispatch
+
+The original `executor.c` used a ~250-line `switch` statement for op dispatch. Every new op meant adding a case, and the cases mixed dispatch logic (extracting dimensions, handling flags) with kernel calls. No way to add an op without touching the switch.
+
+### Function pointer table
+
+Replaced with a `dispatch_fn` array indexed by `OpType` enum value, using C99 designated initializers:
+
+```c
+typedef void (*dispatch_fn)(const OpNode*);
+
+static dispatch_fn DISPATCH_TABLE[DISPATCH_TABLE_SIZE] = {
+    [OP_ADD]       = dispatch_add,
+    [OP_RELU]      = dispatch_relu,
+    [OP_MATMUL]    = dispatch_matmul,
+    // ...
+};
+```
+
+Each op is a self-contained `dispatch_xxx(OpNode*)` function that extracts its own parameters and calls the kernel. Three inline helpers eliminate repeated patterns:
+- `total_elements(node)` — product of output shape
+- `extra_float(node, idx)` — bit-cast extra[idx] from int to float
+- `leading_dims(node, trailing)` — product of all dims except trailing
+
+Adding a new op: add enum value in ir.py, write a dispatch function, add one table line. No monolithic switch to edit.
+
+### Range-based enum numbering
+
+OpType values are grouped by category: 10-19 unary, 20-29 binary, 30-39 reductions, 40-49 BLAS, 50-59 shape, 60-69 normalization, 70-79 fused, 100+ fold-only. Both Python (`ir.py`) and C (`executor.c`) use the same `enum OpType`. The C dispatch table has `DISPATCH_TABLE_SIZE = 100`, naturally enforcing that fold-only ops (>= 100) can't be dispatched.
 
 ## C Operators
 
-C kernels live in `csrc/ops.c`, compiled to a shared library via the `csrc/Makefile`. MATMUL uses `cblas_sgemm` from Accelerate (macOS) or OpenBLAS (Linux). Element-wise ops (ADD, RELU, DIV, SUB, MUL, EXP), reductions (MAX, SUM), SOFTMAX, TRANSPOSE, and RESHAPE are hand-written loops. Fused attention kernels (standard and flash) combine sgemm + softmax + sgemm into single calls with SIMD softmax and GCD threading on macOS (see Fused Attention Kernels section).
+C kernels live in `csrc/ops.c`, compiled to a shared library via the `csrc/Makefile`. MATMUL uses `cblas_sgemm` from Accelerate (macOS) or OpenBLAS (Linux). Element-wise ops (ADD, RELU, DIV, SUB, MUL, EXP, TANH, GELU), reductions (MAX, SUM), SOFTMAX, TRANSPOSE, SLICE, and LAYERNORM are hand-written loops. Fused attention kernels (standard and flash) combine sgemm + softmax + sgemm into single calls with SIMD softmax and GCD threading on macOS.
 
 The C backend (`runtime/backends/c_backend.py`) loads the library via ctypes. Each wrapper extracts float pointers from numpy arrays using `.ctypes.data_as()` and passes dimensions as ints. Zero-copy: C operates directly on the same memory backing the numpy arrays.
 
 **N-dim handling in wrappers.** C kernels are flat/2D (they take M, N, K etc.). The Python wrappers handle higher-dimensional inputs. Fast paths for common cases, general broadcast for everything else:
 - **MATMUL ND×2D** (e.g., `[B, S, D] @ [D, N]^T` for linear layers): flatten A's batch dims into M, call a single sgemm.
 - **MATMUL matching batch dims** (e.g., `[B, H, S, D] @ [B, H, D, S]`): loop over batch slices, one sgemm per slice.
-- **MATMUL broadcast batch dims** (e.g., `[B, H, S, D] @ [H, D, S]`): odometer loop over the broadcast batch shape, computing A/B slice offsets via broadcast strides, one sgemm per slice.
+- **MATMUL broadcast batch dims** (e.g., `[B, H, S, D] @ [H, D, S]`): odometer loop over the broadcast batch shape, one sgemm per slice.
 - **ADD bias** (`[..., N] + [N]`): dedicated kernel with M×N loop.
 - **ADD/SUB/MUL/DIV same shape**: flat kernel, no broadcast overhead.
-- **ADD/SUB/MUL/DIV general broadcast**: `kernel_broadcast_binop` in C (see below).
+- **ADD/SUB/MUL/DIV general broadcast**: `kernel_broadcast_binop` in C.
 
 ## N-dim Broadcasting
 
@@ -220,11 +419,19 @@ For MATMUL, broadcasting applies to batch dimensions only. The same broadcast-st
 
 The compiled executor eliminates all Python from the hot path. Python builds the execution plan and "compiles" it into a flat C struct array (`OpNode`) with all buffer pointers and dimensions pre-resolved. A single ctypes call dispatches the entire graph.
 
-**OpNode struct:** Each node in the plan becomes a fixed-size C struct containing the op type, input/output float pointers, output shape, and op-specific extras (e.g., K dimension for matmul). Uses fixed-size arrays (`MAX_INPUTS=8`, `MAX_DIMS=16`) to avoid dynamic allocation in C. The larger limits accommodate fused ops that carry multiple inputs and broadcast strides in the extras array.
+**OpNode struct:** Each node in the plan becomes a fixed-size C struct containing the op type, input/output float pointers, output shape, and op-specific extras (e.g., K dimension for matmul). Uses fixed-size arrays (`MAX_INPUTS=8`, `MAX_DIMS=16`) to avoid dynamic allocation in C.
 
-**Compile once, execute many.** `compile_plan()` resolves all tensor names to pointers, precomputes dimensions, and records which struct slots correspond to graph inputs. `execute_compiled()` patches just the input pointers and makes one C call. Arena views, constant pointers, and output pointers are all stable between calls.
+**Compile once, execute many.** `compile(plan)` resolves all tensor names to pointers, precomputes dimensions, and records which struct slots correspond to graph inputs. `run(inputs)` patches just the input pointers and makes one C call. Arena views, constant pointers, and output pointers are all stable between calls.
 
 **Input patching.** Graph input tensors may feed multiple nodes. The compiled plan tracks a mapping of input name → list of (node_index, slot_index) pairs. Before each call, the executor patches those slots with the caller's input pointer. Everything else is unchanged.
+
+## C Build Structure
+
+**Single source of truth for kernels.** `ops.c` contains all kernel implementations. `executor.c` contains only the dispatch table and dispatch functions, forward-declaring the kernel functions it calls. Both files are compiled together into `libexecutor`.
+
+Two shared libraries are built:
+- `libruntime` (ops.c only) — loaded by `CBackend` for per-op dispatch
+- `libexecutor` (executor.c + ops.c) — loaded by `CompiledExecutor` for compiled dispatch
 
 ## Performance Results
 
@@ -281,7 +488,7 @@ The C kernel is a two-pass approach (mean first, then variance) — simpler than
 
 ## 2D to N-dim: Compiled Executor Hardening
 
-The compiled C executor (`executor.c`) was originally written and tested with 2D MLP tensors. Moving to 3D+ transformer tensors exposed several implicit 2D assumptions in the C dispatch cases. These were all correct in the per-op path (where Python wrappers handle shape decomposition) but broke in the compiled path (where the C switch statement does it inline).
+The compiled C executor (`executor.c`) was originally written and tested with 2D MLP tensors. Moving to 3D+ transformer tensors exposed several implicit 2D assumptions in the C dispatch cases. These were all correct in the per-op path (where Python wrappers handle shape decomposition) but broke in the compiled path (where C does it inline).
 
 **Bugs found and fixed:**
 
@@ -293,7 +500,7 @@ The compiled C executor (`executor.c`) was originally written and tested with 2D
 
 4. **ADD dispatch assumed bias broadcasting.** `kernel_add` reads `b[j]` (broadcasting the last dim), which is correct for bias adds but wrong for element-wise adds like residual connections (`x + attn_out`). Fix: `extra[0]` flag distinguishes element-wise (flat loop) from bias broadcast.
 
-**The per-op C backend wrappers already handled all these cases** — they check `.ndim`, `.shape == .shape`, etc. The lesson: compiled executors that bake shapes into structs need to explicitly encode the same dispatch logic that dynamic wrappers get for free. Every Python `if a.ndim > 2` needs a corresponding C dispatch path.
+**The lesson:** compiled executors that bake shapes into structs need to explicitly encode the same dispatch logic that dynamic wrappers get for free. Every Python `if a.ndim > 2` needs a corresponding C dispatch path.
 
 ## Attention Fusion Strategy
 
@@ -309,9 +516,9 @@ Recognition strategy (multi-level pattern matching):
 
 2. **F.softmax (implemented):** The key insight is that `absorb_into_matmul` folds the scalar DIV (by √d_k) into the first MATMUL's `alpha` parameter. This reduces the 4-node chain `MATMUL → DIV → SOFTMAX → MATMUL` to 3 nodes `MATMUL(alpha=1/√d_k) → SOFTMAX → MATMUL`, which fits the generic `FusionPattern` infrastructure. The validator checks `transpose_b=True` (Q @ K^T pattern) and softmax on the last axis. External inputs collected by `_apply_fusion` are naturally `[Q, K, V]` — exactly what the ATTENTION kernel expects.
 
-3. **Naive (not yet implemented):** The manual softmax decomposition creates a DAG — the DIV output feeds both MAX and SUB, violating the sole-consumer constraint in `_try_match`. This needs either a specialized attention recognition pass or an extended pattern matcher that supports DAG patterns.
+3. **Naive (not yet implemented):** The manual softmax decomposition creates a DAG — the DIV output feeds both MAX and SUB, violating the sole-consumer constraint in `_try_match`. The DAG fusion framework could potentially be extended for this, but the subgraph is significantly more complex than GELU (~11 nodes with multiple fan-out/reconverge points).
 
-**N-dim batch support.** The ATTENTION op handles arbitrary leading batch dimensions. Q/K/V can be 3D `[BH, S, D]` or 4D `[B, H, S, D]` — the memory layout is byte-identical, so the C kernel doesn't care. The planner scratch calculator, executor `_fill_extras`, C backend wrapper, and compiled C dispatch all use `shape[-2]` for seq_len and `shape[-1]` for head_dim, with batch_heads derived from the remaining dimensions. This was needed because SDPA and F.softmax attention operate on 4D tensors after head splitting.
+**N-dim batch support.** The ATTENTION op handles arbitrary leading batch dimensions. Q/K/V can be 3D `[BH, S, D]` or 4D `[B, H, S, D]` — the memory layout is byte-identical, so the C kernel doesn't care.
 
 **ATTENTION is the atomic unit, not SOFTMAX.** We do NOT canonicalize manual softmax into a SOFTMAX op first. The flash attention algorithm interleaves softmax computation with matmuls tile-by-tile — it never computes a full standalone softmax. Canonicalizing to SOFTMAX would lose the structure flash attention needs.
 
@@ -323,14 +530,15 @@ Both produce identical results. The graph passes don't care which runs.
 
 ## Fused Attention Kernels
 
-Two fused attention kernel implementations in `csrc/ops.c`, sharing the same interface. Both take Q, K, V as `[batch_heads, seq_len, head_dim]`, a scratch buffer, and produce the output. The graph-level ATTENTION op is backend-agnostic — the backend can dispatch to either kernel.
+Two fused attention kernel implementations in `csrc/ops.c`, sharing the same interface. Both take Q, K, V as `[batch_heads, seq_len, head_dim]`, a scratch buffer, a causal flag, and produce the output. The graph-level ATTENTION op is backend-agnostic — the backend can dispatch to either kernel.
 
 ### Standard kernel (`kernel_attention`)
 
 For each (batch, head) slice:
 1. `S = Q @ K^T * scale` — single `cblas_sgemm` with `alpha = 1/sqrt(d_k)`, folding the scale into the matmul for free
-2. `P = softmax(S)` — row-wise, in-place on the scratch buffer
-3. `O = P @ V` — single `cblas_sgemm`
+2. If causal: apply `-INFINITY` mask to above-diagonal entries
+3. `P = softmax(S)` — row-wise, in-place on the scratch buffer
+4. `O = P @ V` — single `cblas_sgemm`
 
 Scratch requirement: `S × S` floats per concurrent thread. Materializes the full attention matrix but eliminates all intermediate tensor allocations that the unfused graph would need.
 
@@ -340,6 +548,7 @@ Tiled online-softmax attention that never materializes the full S×S matrix. For
 
 1. For each K/V block of B_c=32 rows:
    - `S_tile = Q_block @ K_block^T * scale` via sgemm (B_r × B_c tile)
+   - If causal: mask above-diagonal entries in the tile
    - Online softmax update: find tile-row max, compute correction factor `exp(m_old - m_new)`, rescale accumulated O and running sum, compute `exp(S - m_new)`, accumulate new sum
    - `O_block += P_tile @ V_block` via sgemm with `beta=1.0` to accumulate
 2. Final normalization: `O /= l` (running sum per row)
@@ -365,11 +574,9 @@ The key win is `vvexpf`: `expf` is an expensive multi-instruction polynomial app
 
 ### GCD threading
 
-Both attention kernels parallelize across (batch, head) slices using Grand Central Dispatch (`dispatch_apply`). Each slice is completely independent — different regions of Q/K/V/output memory. The only shared resource is the scratch buffer, solved by having slice 0 reuse the caller-provided buffer and other slices malloc their own (negligible: ~50ns malloc vs ~500us of work per slice).
+Both attention kernels parallelize across (batch, head) slices using Grand Central Dispatch (`dispatch_apply`). Each slice is completely independent — different regions of Q/K/V/output memory. Each GCD thread indexes into its own scratch region (planner-allocated).
 
 GCD is native to macOS (no build dependencies), manages its own thread pool, and handles work-stealing automatically. The `dispatch_apply` call blocks until all slices complete.
-
-**Scratch buffer issue.** The current implementation mallocs per-thread scratch buffers inside the kernel, violating the "planner owns all memory" principle. See "Scratch vs parallelism tradeoff" in the Scratch Buffers section for the full analysis and options.
 
 **Impact on multi-head attention (bh=8):**
 
@@ -446,7 +653,7 @@ A note on implementation: `_apply_fusion` must remove original chain nodes *befo
 
 The `fuse_matmul_add` pass catches standalone MATMUL → ADD pairs where the ADD wasn't claimed by pattern fusion (e.g., the final linear layer in an MLP, which has no activation after it). It replaces them with a single `MATMUL_ADD` node.
 
-**The sgemm beta trick.** `cblas_sgemm` computes `C = alpha * A @ B + beta * C`. By pre-filling the output buffer with the broadcast bias and setting `beta=1.0`, sgemm adds the bias as part of its accumulation — eliminating the separate ADD kernel and its memory round-trip. The C dispatch in `executor.c` broadcasts the 1D bias `[N]` into every row of the `[M, N]` output, then calls `kernel_matmul_beta()` with `beta=1.0`.
+**The sgemm beta trick.** `cblas_sgemm` computes `C = alpha * A @ B + beta * C`. By pre-filling the output buffer with the broadcast bias and setting `beta=1.0`, sgemm adds the bias as part of its accumulation — eliminating the separate ADD kernel and its memory round-trip. The C dispatch broadcasts the 1D bias `[N]` into every row of the `[M, N]` output, then calls `kernel_matmul_beta()` with `beta=1.0`.
 
 **Why this runs after pattern fusion.** Pattern fusion should get first crack at ADD nodes — if there's an ADD+RELU chain, fusing them into FUSED_BIAS_RELU (one post-matmul pass doing both add and relu) is better than absorbing the ADD into sgemm (which would leave RELU as a separate dispatch). The beta trick is only advantageous for isolated bias adds where there's nothing else to chain with.
 
@@ -454,38 +661,21 @@ The `fuse_matmul_add` pass catches standalone MATMUL → ADD pairs where the ADD
 
 **Carries forward attrs.** The fused node inherits the original MATMUL's attributes (notably `transpose_b`), so the CblasTrans optimization for `nn.Linear` weights is preserved through the fusion.
 
-## Attention Scratch Allocation
+## DAG Fusion Framework
 
-**Planner-owned, not kernel-allocated.** The attention kernels (both standard and flash) use GCD `dispatch_apply` to parallelize across batch×head slices. Each concurrent thread needs its own scratch buffer for the attention matrix (or tile). Originally each thread called `malloc`/`free` — this violated the "planner owns all memory" principle.
+### Motivation
 
-**Fix: planner allocates `batch_heads × per_slice_scratch`.** The scratch calculator registered for `ATTENTION` computes `batch_heads × seq_len × seq_len × 4` bytes. Each GCD thread indexes into its region at `scratch + bh * scratch_per_slice`. Zero synchronization, zero allocation in the kernel.
+The `FusionPattern` registry handles linear chain patterns (A→B→C) but can't match non-linear subgraphs where an intermediate node has multiple consumers. GELU's tanh approximation (`0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`) is an 8-node DAG where `x` fans out to `pow` and `mul` paths that reconverge. The sole-consumer constraint in `_try_match` rejects this at the first fan-out point.
 
-**Memory tradeoff.** This over-allocates when `batch_heads >> num_cores`, since GCD only runs ~`num_cores` blocks concurrently. The ideal allocation is `min(batch_heads, num_cores)` scratch regions, but mapping iteration indices to scratch slots in GCD requires an atomic pool (GCD doesn't expose thread indices). We chose simplicity over optimal memory — the scratch has a single-step lifetime so the planner reclaims it immediately.
+### Approach
 
-**Flash attention scratch is tiny regardless.** The flash kernel's per-slice scratch is `32×32×4` = 4KB (one tile, not the full S×S matrix), so even at `batch_heads=128` it's only 512KB total.
+The `fuse_dags` pass walks the graph looking for "seed" nodes that begin known DAG patterns. For GELU, the seed is a POW node with exponent=3. From there, it verifies the full 8-node subgraph structurally: POW → MUL(0.044715) → ADD(x) → MUL(sqrt(2/pi)) → TANH → ADD(1) → MUL(x) → MUL(0.5). At each step, it validates op types, constant values, and input/output relationships.
 
-## C Build Structure
+The matching is more manual than chain fusion — each DAG pattern is a custom verification function rather than a declarative pattern spec. But for the handful of activation functions that need this treatment, the explicitness is a feature: each pattern is self-documenting and easy to debug.
 
-**Single source of truth for kernels.** `ops.c` contains all kernel implementations. `executor.c` contains only the dispatch loop and forward-declares the kernel functions it calls. Both files are compiled together into `libexecutor`. This eliminates the previous pattern of duplicating every kernel as a `static` function in `executor.c`.
+### Extensibility
 
-Two shared libraries are built:
-- `libruntime` (ops.c only) — loaded by `c_backend.py` for per-op dispatch
-- `libexecutor` (executor.c + ops.c) — loaded by `executor.py` for compiled dispatch
-
-## Non-Contiguous SLICE Breaks Compiled Execution
-
-**The problem.** The compiled C execution path (`execute_compiled`) is supposed to be a single `execute()` call — the whole point is eliminating Python overhead between ops. But graphs with non-contiguous SLICE ops (notably GPT-2's QKV split) break this into segmented execution: run C nodes → pause → do a SLICE copy in Python → resume C nodes. This is a workaround for a missing C kernel, not a design decision.
-
-**Why it exists.** SLICE ops come in two flavors:
-
-- *Alias SLICEs* — contiguous chunks. Splitting along dim 0 (or using a flat byte_offset) produces chunks that are contiguous in memory. These are treated like RESHAPE: bind a pointer at compile time, skip at execution time. No problem.
-- *Non-alias SLICEs* — non-contiguous chunks. Splitting along a non-leading dimension (e.g., GPT-2 projects to `[B, S, 3*D]` then splits along dim=2 to get Q, K, V each `[B, S, D]`). The three chunks are interleaved in memory, so you can't just take a pointer offset — you need a strided copy to produce a contiguous output.
-
-The planner distinguishes these in `_find_reshape_aliases`: `dim is None or dim == 0` → alias, otherwise → non-alias with its own arena allocation. The per-op Python executor handles the strided copy via `np.ascontiguousarray(input_buf[slices])`. But the C executor's `OP_SLICE` dispatch is a no-op `break` — there's no C kernel for the strided copy.
-
-**The workaround.** `compile_plan` pulls non-alias SLICEs out of the C execution order and records their positions. `execute_compiled` then runs C segments between them, executing each SLICE in Python via numpy before resuming. This adds Python re-entry overhead and complicates what should be a clean single-call path.
-
-**The fix.** Implement a strided copy kernel in C (`kernel_slice`) that copies a non-contiguous slice into a contiguous output buffer, and dispatch it from `executor.c` like any other op. The segmented execution code in `compile_plan`/`execute_compiled` can then be removed, restoring the single-call invariant.
+Adding a new DAG pattern (SiLU, GeGLU, etc.) is ~10-15 lines: a seed detection condition and a subgraph verification function. The `fuse_dags` pass iterates all registered DAG matchers.
 
 ## RESHAPE of Graph Inputs in Compiled Dispatch
 
@@ -513,7 +703,7 @@ RESHAPE is zero-copy in both execution paths:
 - **Per-op dispatch:** The Python loop creates a numpy view (`input_buf.reshape(shape)`) and assigns it as the output tensor's buffer. Works fine because inputs are bound before execution starts.
 - **Compiled dispatch:** `compile_plan` pre-binds RESHAPE outputs as views during compilation so that downstream COpNodes get valid pointers. This is where the crash happens — graph input buffers don't exist yet.
 
-The planner treats RESHAPE outputs as aliases of their input (sharing the same arena offset via `_find_reshape_aliases`). They're excluded from the C execution order since there's no kernel to run.
+The planner treats RESHAPE outputs as aliases of their input (sharing the same arena offset via `_resolve_alias`). They're excluded from the C execution order since there's no kernel to run.
 
 ### Possible Fixes
 

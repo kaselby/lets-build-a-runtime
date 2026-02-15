@@ -15,7 +15,7 @@ import torch
 from runtime.backends.c_backend import CBackend
 from runtime.backends.numpy_backend import NumpyBackend
 from runtime.exporter import export_model
-from runtime.executor import Executor
+from runtime.executor import InterpretedExecutor, CompiledExecutor
 from runtime.passes import (
     absorb_into_matmul, constant_fold,
     eliminate_dead_code, fuse,
@@ -97,22 +97,24 @@ def test_ablation():
 
         # --- Numpy backend, per-op (full pipeline) ---
         graph_np, ep_np = setup(pipelines["+fusion"])
-        exec_np = Executor(backends=[NumpyBackend()])
+        exec_np = InterpretedExecutor(backends=[NumpyBackend()])
+        exec_np.compile(ep_np)
 
         # --- C backend, per-op (full pipeline) ---
         graph_c, ep_c = setup(pipelines["+fusion"])
-        exec_c = Executor(backends=[CBackend(), NumpyBackend()])
+        exec_c = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
+        exec_c.compile(ep_c)
 
         # --- Compiled C, each fusion level ---
-        compiled = {}
-        executors = {}
+        compiled_executors = {}
         for key, pipeline in pipelines.items():
             g, ep = setup(pipeline)
-            ex = Executor(backends=[CBackend(), NumpyBackend()])
-            compiled[key] = ex.compile_plan(ep)
-            executors[key] = ex
+            ex = CompiledExecutor()
+            ex.compile(ep)
+            compiled_executors[key] = (ex, g)
 
-        inp = graph_np.inputs[0]
+        inp_np = graph_np.inputs[0]
+        inp_c = graph_c.inputs[0]
 
         # Collect timings
         times = {"pt": [], "np": [], "cop": []}
@@ -122,12 +124,12 @@ def test_ablation():
         for _ in range(TRIALS):
             with torch.no_grad():
                 times["pt"].append(_bench(lambda: model(x_torch)))
-            times["np"].append(_bench(lambda: exec_np.execute(ep_np, {inp: x_np})))
-            times["cop"].append(_bench(lambda: exec_c.execute(ep_c, {inp: x_np})))
+            times["np"].append(_bench(lambda: exec_np.run({inp_np: x_np})))
+            times["cop"].append(_bench(lambda: exec_c.run({inp_c: x_np})))
             for k in pipe_keys:
-                ex, cp = executors[k], compiled[k]
+                ex, g = compiled_executors[k]
                 times[k].append(_bench(
-                    lambda ex=ex, cp=cp: ex.execute_compiled(cp, {inp: x_np})))
+                    lambda ex=ex, g=g: ex.run({g.inputs[0]: x_np})))
 
         med = {k: _median(v) for k, v in times.items()}
         pt = med["pt"]
@@ -191,17 +193,16 @@ def test_transformer_ablation():
         x_np = x_torch.numpy().copy()
 
         # Compiled C at each fusion level
-        compiled = {}
-        executors = {}
+        compiled_executors = {}
         inp_name = None
         for key, pipeline in pipelines.items():
             graph = export_model(naive, (x_torch,))
             for p in pipeline:
                 p(graph)
             ep = plan(graph)
-            ex = Executor(backends=[CBackend(), NumpyBackend()])
-            compiled[key] = ex.compile_plan(ep)
-            executors[key] = ex
+            ex = CompiledExecutor()
+            ex.compile(ep)
+            compiled_executors[key] = (ex, graph)
             if inp_name is None:
                 inp_name = graph.inputs[0]
 
@@ -214,9 +215,9 @@ def test_transformer_ablation():
                 times["pt_naive"].append(_bench(lambda: naive(x_torch), warmup=20, iters=200))
                 times["pt_sdpa"].append(_bench(lambda: sdpa(x_torch), warmup=20, iters=200))
             for k in pipe_keys:
-                ex, cp = executors[k], compiled[k]
+                ex, g = compiled_executors[k]
                 times[k].append(_bench(
-                    lambda ex=ex, cp=cp: ex.execute_compiled(cp, {inp_name: x_np}),
+                    lambda ex=ex, g=g: ex.run({g.inputs[0]: x_np}),
                     warmup=20, iters=200))
 
         med = {k: _median(v) for k, v in times.items()}

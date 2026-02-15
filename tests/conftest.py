@@ -4,15 +4,18 @@ pytest discovers conftest.py automatically — fixtures defined here are
 available to all test files in this directory without explicit imports.
 """
 
+import math
+
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from runtime.backends.c_backend import CBackend
 from runtime.backends.numpy_backend import NumpyBackend
+from runtime.backends.c_backend import CBackend
 from runtime.exporter import export_model
-from runtime.executor import Executor
+from runtime.executor import InterpretedExecutor, CompiledExecutor
 from runtime.ir import OpType
 from runtime.passes import run_pipeline
 from runtime.planner import plan
@@ -32,10 +35,6 @@ class SimpleMLP(nn.Module):
 
     def forward(self, x):
         return self.fc3(torch.relu(self.fc2(torch.relu(self.fc1(x)))))
-
-
-import math
-import torch.nn.functional as F
 
 
 class NaiveTransformerBlock(nn.Module):
@@ -185,13 +184,24 @@ def run_kernel(backend, op_name, inputs, output_shape, attrs=None):
     return output
 
 
-def run_pipeline_to_result(model, x_torch, backend_name="c"):
-    """Full pipeline: export → optimize → plan → execute → return output dict."""
+def run_interpreted(model, x_torch, backend_name="c"):
+    """Full pipeline: export → optimize → plan → interpreted execute."""
     graph = export_model(model, (x_torch,))
     run_pipeline(graph)
     ep = plan(graph)
     if backend_name == "numpy":
-        executor = Executor(backends=[NumpyBackend()])
+        executor = InterpretedExecutor(backends=[NumpyBackend()])
     else:
-        executor = Executor(backends=[CBackend(), NumpyBackend()])
-    return executor.execute(ep, {graph.inputs[0]: x_torch.numpy().copy()})
+        executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
+    executor.compile(ep)
+    return executor.run({graph.inputs[0]: x_torch.numpy().copy()})
+
+
+def run_compiled(model, x_torch):
+    """Full pipeline: export → optimize → plan → compiled execute."""
+    graph = export_model(model, (x_torch,))
+    run_pipeline(graph)
+    ep = plan(graph)
+    executor = CompiledExecutor()
+    executor.compile(ep)
+    return executor.run({graph.inputs[0]: x_torch.numpy().copy()})

@@ -200,11 +200,13 @@ def _compute_lifetimes(
 
         op_def = OP_REGISTRY.get(node.op)
 
-        # Alias: unconditionally share input's memory
+        # Alias: share input's memory (but not external buffers — they aren't ours)
         if op_def is not None and op_def.is_alias(node):
             alias_input = _resolve_alias(node.inputs[0], graph)
-            memory_root[node.output] = get_root(alias_input)
-            continue
+            root = get_root(alias_input)
+            if root not in external:
+                memory_root[node.output] = root
+                continue
 
         # In-place: share if input is dying and same byte size
         if op_def is not None and op_def.inplace and node.inputs:
@@ -356,7 +358,14 @@ def plan(graph: Graph) -> ExecutionPlan:
         while root in memory_root:
             root = memory_root[root]
         if root in all_offsets:
-            all_offsets[name] = all_offsets[root]
+            base = all_offsets[root]
+            # Apply alias byte offset (e.g., SLICE into the middle of a buffer)
+            producer = graph.producer(name)
+            if producer is not None:
+                op_def = OP_REGISTRY.get(producer.op)
+                if op_def is not None and op_def.alias_offset is not None:
+                    base += op_def.alias_offset(producer)
+            all_offsets[name] = base
 
     # Separate scratch offsets from regular tensor offsets
     scratch_names = {name for name, _ in scratch_info.values()}

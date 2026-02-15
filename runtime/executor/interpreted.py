@@ -51,10 +51,11 @@ class InterpretedExecutor(Executor):
 
         self._bind_inputs(graph, inputs)
         self._bind_intermediates(graph, plan.offsets, arena)
+        external = set(graph.inputs) | set(graph.constants)
 
         for node in plan.order:
             op_def = OP_REGISTRY.get(node.op)
-            if op_def is not None and op_def.is_alias(node):
+            if op_def is not None and op_def.is_alias(node) and node.inputs[0] not in external:
                 continue
             if node.op.value >= 100:
                 raise RuntimeError(

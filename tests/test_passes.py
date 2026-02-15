@@ -11,8 +11,7 @@ import torch
 import torch.nn as nn
 
 from runtime.exporter import export_model
-from runtime.ir import OpType
-from runtime.ir import Graph
+from runtime.ir import OpType, Graph
 from runtime.passes import (
     absorb_into_matmul,
     constant_fold,
@@ -21,10 +20,19 @@ from runtime.passes import (
     run_pipeline,
     FusionPattern,
     FUSION_PATTERNS,
+    absorb_mask_into_attention,
 )
+from runtime.passes.fusion import fuse_dags
 from runtime.planner import plan
-from runtime.executor import Executor
+from runtime.executor import InterpretedExecutor
 from runtime.backends.numpy_backend import NumpyBackend
+
+
+def _execute(ep, inputs):
+    """Helper: run an execution plan via the interpreted executor."""
+    executor = InterpretedExecutor(backends=[NumpyBackend()])
+    executor.compile(ep)
+    return executor.run(inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -72,8 +80,7 @@ def test_absorb_preserves_correctness():
     graph = export_model(model, (x,))
     absorb_into_matmul(graph)
     ep = plan(graph)
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    result = _execute(ep, {graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
 
     np.testing.assert_allclose(output, expected, atol=1e-5)
@@ -121,8 +128,7 @@ def test_constant_fold_preserves_correctness():
     constant_fold(graph)
     eliminate_dead_code(graph)
     ep = plan(graph)
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    result = _execute(ep, {graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
 
     np.testing.assert_allclose(output, expected, atol=1e-5)
@@ -167,8 +173,7 @@ def test_full_pipeline_correctness(batch, dim):
     graph = export_model(model, (x,))
     run_pipeline(graph)
     ep = plan(graph)
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    result = _execute(ep, {graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
 
     np.testing.assert_allclose(output, expected, atol=1e-4)
@@ -238,8 +243,7 @@ def test_bias_relu_correctness():
     )
     fuse(g)
     ep = plan(g)
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {"x": x})
+    result = _execute(ep, {"x": x})
     np.testing.assert_allclose(result["relu_out"], expected, atol=1e-6)
 
 
@@ -347,8 +351,7 @@ def test_matmul_add_correctness():
     )
     fuse(g)
     ep = plan(g)
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {"x": x})
+    result = _execute(ep, {"x": x})
     np.testing.assert_allclose(result["add_out"], expected, atol=1e-5)
 
 
@@ -376,8 +379,7 @@ def test_matmul_add_correctness_transpose_b():
 
     fuse(g)
     ep = plan(g)
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {"x": x})
+    result = _execute(ep, {"x": x})
     np.testing.assert_allclose(result["add_out"], expected, atol=1e-5)
 
 
@@ -468,17 +470,13 @@ def test_mlp_fusion_correctness():
     graph = export_model(model, (x,))
     run_pipeline(graph)
     ep = plan(graph)
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    result = _execute(ep, {graph.inputs[0]: x.numpy().copy()})
     np.testing.assert_allclose(result[graph.outputs[0]], expected, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
-# GELU recognition pass
+# DAG fusion: GELU recognition
 # ---------------------------------------------------------------------------
-
-from runtime.passes import recognize_gelu
-
 
 def _build_gelu_graph():
     """Build a graph with the 8-node GELU tanh approximation pattern.
@@ -535,7 +533,7 @@ def test_gelu_recognition_collapses():
     g = _build_gelu_graph()
     assert len(g.nodes) == 8
 
-    changed = recognize_gelu(g)
+    changed = fuse_dags(g)
     assert changed is True
 
     nodes = list(g)
@@ -554,11 +552,10 @@ def test_gelu_recognition_correctness():
     inner = 0.7978845608 * (x + 0.044715 * np.power(x, 3))
     expected = 0.5 * x * (1 + np.tanh(inner))
 
-    recognize_gelu(g)
+    fuse_dags(g)
     eliminate_dead_code(g)
     ep = plan(g)
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {"x": x})
+    result = _execute(ep, {"x": x})
     np.testing.assert_allclose(result["final"], expected, atol=1e-5)
 
 
@@ -577,7 +574,7 @@ def test_gelu_recognition_negative_partial():
     g.add_node(OpType.ADD, ["x", "mul_out"], "add_out")
     g.outputs.append("add_out")
 
-    changed = recognize_gelu(g)
+    changed = fuse_dags(g)
     assert changed is False
     assert len(g.nodes) == 3  # unchanged
 
@@ -591,7 +588,7 @@ def test_gelu_recognition_negative_wrong_scalar():
             node.attrs["scalar"] = 0.5  # wrong value
             break
 
-    changed = recognize_gelu(g)
+    changed = fuse_dags(g)
     assert changed is False
 
 
@@ -672,13 +669,6 @@ def test_causal_attention_fusion_structure():
     attention_nodes = [n for n in graph if n.op == OpType.ATTENTION]
     assert len(attention_nodes) == 1
     assert attention_nodes[0].attrs.get("causal") is True
-    # The mask constant should not appear in the fused ATTENTION's inputs
-    attn_inputs = set(attention_nodes[0].inputs)
-    for name in graph.constants:
-        if name in attn_inputs:
-            # No constant input to ATTENTION should be a causal mask
-            from runtime.passes import _is_causal_mask
-            assert not _is_causal_mask(name, graph)
 
 
 @pytest.mark.parametrize("batch,seq,d_model,n_heads", [
@@ -698,6 +688,59 @@ def test_causal_attention_fusion_correctness(batch, seq, d_model, n_heads):
     graph = export_model(model, (x,))
     run_pipeline(graph)
     ep = plan(graph)
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    result = _execute(ep, {graph.inputs[0]: x.numpy().copy()})
     np.testing.assert_allclose(result[graph.outputs[0]], expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Attention fusion: MATMUL → SOFTMAX → MATMUL
+# ---------------------------------------------------------------------------
+
+def test_attention_fusion_structure():
+    """NaiveTransformerBlock should produce fused ATTENTION (non-causal).
+
+    The model uses F.softmax (no explicit mask), which produces the 3-node
+    pattern MATMUL→SOFTMAX→MATMUL that fuses into ATTENTION.
+    """
+    from conftest import NaiveTransformerBlock
+    model = NaiveTransformerBlock(d_model=64, n_heads=4)
+    model.eval()
+    graph = export_model(model, (torch.randn(2, 16, 64),))
+    run_pipeline(graph)
+
+    attention_nodes = [n for n in graph if n.op == OpType.ATTENTION]
+    assert len(attention_nodes) == 1
+    assert not attention_nodes[0].attrs.get("causal")
+
+
+# ---------------------------------------------------------------------------
+# Causal mask absorption (standalone pass test)
+# ---------------------------------------------------------------------------
+
+def test_absorb_causal_mask_standalone():
+    """absorb_mask_into_attention should detect and absorb a causal mask constant."""
+    g = Graph()
+    g.add_tensor("Q", (2, 4, 16, 32))
+    g.inputs.append("Q")
+    g.add_tensor("K", (2, 4, 16, 32))
+    g.inputs.append("K")
+    g.add_tensor("V", (2, 4, 16, 32))
+    g.inputs.append("V")
+
+    # Build a causal mask constant (upper-triangular -inf)
+    mask_data = np.triu(np.full((16, 16), -np.inf, dtype=np.float32), k=1)
+    g.add_tensor("mask", (16, 16))
+    g.tensors["mask"].buffer = mask_data
+    g.constants.append("mask")
+
+    g.add_tensor("attn_out", (2, 4, 16, 32))
+    g.add_node(OpType.ATTENTION, ["Q", "K", "V", "mask"], "attn_out")
+    g.outputs.append("attn_out")
+
+    changed = absorb_mask_into_attention(g)
+    assert changed is True
+
+    attn = list(g)[0]
+    assert attn.attrs.get("causal") is True
+    assert "mask" not in attn.inputs
+    assert len(attn.inputs) == 3  # Q, K, V only

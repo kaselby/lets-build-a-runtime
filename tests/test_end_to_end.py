@@ -8,11 +8,12 @@ and our runtime agree on the output, the whole pipeline is correct.
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 from runtime.backends.c_backend import CBackend
 from runtime.backends.numpy_backend import NumpyBackend
 from runtime.exporter import export_model
-from runtime.executor import Executor
+from runtime.executor import InterpretedExecutor, CompiledExecutor
 from runtime.passes import run_pipeline
 from runtime.planner import plan
 
@@ -31,10 +32,14 @@ TRANSFORMER_CONFIGS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# MLP tests
+# ---------------------------------------------------------------------------
+
 @pytest.mark.parametrize("batch,dim", MLP_CONFIGS)
 @pytest.mark.parametrize("backend_name", ["numpy", "c"])
-def test_mlp_per_op_executor(batch, dim, backend_name):
-    """Per-op dispatch path: export → optimize → plan → execute per-node."""
+def test_mlp_interpreted(batch, dim, backend_name):
+    """Interpreted dispatch path: export → optimize → plan → per-node execute."""
     model = SimpleMLP(dim)
     model.eval()
     x = torch.randn(batch, dim)
@@ -47,18 +52,19 @@ def test_mlp_per_op_executor(batch, dim, backend_name):
     ep = plan(graph)
 
     if backend_name == "numpy":
-        executor = Executor(backends=[NumpyBackend()])
+        executor = InterpretedExecutor(backends=[NumpyBackend()])
     else:
-        executor = Executor(backends=[CBackend(), NumpyBackend()])
+        executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
 
-    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
 
     np.testing.assert_allclose(output, expected, atol=1e-4)
 
 
 @pytest.mark.parametrize("batch,dim", MLP_CONFIGS)
-def test_mlp_compiled_executor(batch, dim):
+def test_mlp_compiled(batch, dim):
     """Compiled C executor path: single ctypes call for the whole plan."""
     model = SimpleMLP(dim)
     model.eval()
@@ -71,9 +77,9 @@ def test_mlp_compiled_executor(batch, dim):
     run_pipeline(graph)
     ep = plan(graph)
 
-    executor = Executor(backends=[CBackend(), NumpyBackend()])
-    compiled = executor.compile_plan(ep)
-    result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+    executor = CompiledExecutor()
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
 
     np.testing.assert_allclose(output, expected, atol=1e-4)
@@ -89,15 +95,15 @@ def test_compiled_reuse_across_inputs(batch, dim):
     run_pipeline(graph)
     ep = plan(graph)
 
-    executor = Executor(backends=[CBackend(), NumpyBackend()])
-    compiled = executor.compile_plan(ep)
+    executor = CompiledExecutor()
+    executor.compile(ep)
 
     for _ in range(5):
         x = torch.randn(batch, dim)
         with torch.no_grad():
             expected = model(x).numpy()
 
-        result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+        result = executor.run({graph.inputs[0]: x.numpy().copy()})
         output = result[graph.outputs[0]]
         np.testing.assert_allclose(output, expected, atol=1e-4)
 
@@ -108,8 +114,8 @@ def test_compiled_reuse_across_inputs(batch, dim):
 
 @pytest.mark.parametrize("batch,seq,d_model,n_heads", TRANSFORMER_CONFIGS)
 @pytest.mark.parametrize("backend_name", ["numpy", "c"])
-def test_transformer_per_op_executor(batch, seq, d_model, n_heads, backend_name):
-    """Per-op dispatch: transformer block matches PyTorch."""
+def test_transformer_interpreted(batch, seq, d_model, n_heads, backend_name):
+    """Interpreted dispatch: transformer block matches PyTorch."""
     model = NaiveTransformerBlock(d_model, n_heads)
     model.eval()
     x = torch.randn(batch, seq, d_model)
@@ -122,17 +128,18 @@ def test_transformer_per_op_executor(batch, seq, d_model, n_heads, backend_name)
     ep = plan(graph)
 
     if backend_name == "numpy":
-        executor = Executor(backends=[NumpyBackend()])
+        executor = InterpretedExecutor(backends=[NumpyBackend()])
     else:
-        executor = Executor(backends=[CBackend(), NumpyBackend()])
+        executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
 
-    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
     np.testing.assert_allclose(output, expected, atol=1e-4)
 
 
 @pytest.mark.parametrize("batch,seq,d_model,n_heads", TRANSFORMER_CONFIGS)
-def test_transformer_compiled_executor(batch, seq, d_model, n_heads):
+def test_transformer_compiled(batch, seq, d_model, n_heads):
     """Compiled C executor: transformer block matches PyTorch."""
     model = NaiveTransformerBlock(d_model, n_heads)
     model.eval()
@@ -145,9 +152,9 @@ def test_transformer_compiled_executor(batch, seq, d_model, n_heads):
     run_pipeline(graph)
     ep = plan(graph)
 
-    executor = Executor(backends=[CBackend(), NumpyBackend()])
-    compiled = executor.compile_plan(ep)
-    result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+    executor = CompiledExecutor()
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
     np.testing.assert_allclose(output, expected, atol=1e-4)
 
@@ -162,14 +169,14 @@ def test_transformer_compiled_reuse(batch, seq, d_model, n_heads):
     run_pipeline(graph)
     ep = plan(graph)
 
-    executor = Executor(backends=[CBackend(), NumpyBackend()])
-    compiled = executor.compile_plan(ep)
+    executor = CompiledExecutor()
+    executor.compile(ep)
 
     for _ in range(5):
         x = torch.randn(batch, seq, d_model)
         with torch.no_grad():
             expected = model(x).numpy()
-        result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+        result = executor.run({graph.inputs[0]: x.numpy().copy()})
         output = result[graph.outputs[0]]
         np.testing.assert_allclose(output, expected, atol=1e-4)
 
@@ -180,8 +187,8 @@ def test_transformer_compiled_reuse(batch, seq, d_model, n_heads):
 
 @pytest.mark.parametrize("batch,seq,d_model,n_heads", TRANSFORMER_CONFIGS)
 @pytest.mark.parametrize("backend_name", ["numpy", "c"])
-def test_sdpa_transformer_per_op_executor(batch, seq, d_model, n_heads, backend_name):
-    """Per-op dispatch: SDPA transformer block matches PyTorch."""
+def test_sdpa_transformer_interpreted(batch, seq, d_model, n_heads, backend_name):
+    """Interpreted dispatch: SDPA transformer block matches PyTorch."""
     model = SDPATransformerBlock(d_model, n_heads)
     model.eval()
     x = torch.randn(batch, seq, d_model)
@@ -194,17 +201,18 @@ def test_sdpa_transformer_per_op_executor(batch, seq, d_model, n_heads, backend_
     ep = plan(graph)
 
     if backend_name == "numpy":
-        executor = Executor(backends=[NumpyBackend()])
+        executor = InterpretedExecutor(backends=[NumpyBackend()])
     else:
-        executor = Executor(backends=[CBackend(), NumpyBackend()])
+        executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
 
-    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
     np.testing.assert_allclose(output, expected, atol=1e-4)
 
 
 @pytest.mark.parametrize("batch,seq,d_model,n_heads", TRANSFORMER_CONFIGS)
-def test_sdpa_transformer_compiled_executor(batch, seq, d_model, n_heads):
+def test_sdpa_transformer_compiled(batch, seq, d_model, n_heads):
     """Compiled C executor: SDPA transformer block matches PyTorch."""
     model = SDPATransformerBlock(d_model, n_heads)
     model.eval()
@@ -217,9 +225,9 @@ def test_sdpa_transformer_compiled_executor(batch, seq, d_model, n_heads):
     run_pipeline(graph)
     ep = plan(graph)
 
-    executor = Executor(backends=[CBackend(), NumpyBackend()])
-    compiled = executor.compile_plan(ep)
-    result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+    executor = CompiledExecutor()
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
     np.testing.assert_allclose(output, expected, atol=1e-4)
 
@@ -234,14 +242,14 @@ def test_sdpa_transformer_compiled_reuse(batch, seq, d_model, n_heads):
     run_pipeline(graph)
     ep = plan(graph)
 
-    executor = Executor(backends=[CBackend(), NumpyBackend()])
-    compiled = executor.compile_plan(ep)
+    executor = CompiledExecutor()
+    executor.compile(ep)
 
     for _ in range(5):
         x = torch.randn(batch, seq, d_model)
         with torch.no_grad():
             expected = model(x).numpy()
-        result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+        result = executor.run({graph.inputs[0]: x.numpy().copy()})
         output = result[graph.outputs[0]]
         np.testing.assert_allclose(output, expected, atol=1e-4)
 
@@ -259,7 +267,33 @@ CAUSAL_CONFIGS = [
 
 
 @pytest.mark.parametrize("batch,seq,d_model,n_heads", CAUSAL_CONFIGS)
-def test_causal_transformer_compiled_executor(batch, seq, d_model, n_heads):
+@pytest.mark.parametrize("backend_name", ["numpy", "c"])
+def test_causal_transformer_interpreted(batch, seq, d_model, n_heads, backend_name):
+    """Interpreted dispatch: causal naive transformer matches PyTorch."""
+    model = CausalNaiveTransformerBlock(d_model, n_heads, seq_len=seq)
+    model.eval()
+    x = torch.randn(batch, seq, d_model)
+
+    with torch.no_grad():
+        expected = model(x).numpy()
+
+    graph = export_model(model, (x,))
+    run_pipeline(graph)
+    ep = plan(graph)
+
+    if backend_name == "numpy":
+        executor = InterpretedExecutor(backends=[NumpyBackend()])
+    else:
+        executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
+
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
+    output = result[graph.outputs[0]]
+    np.testing.assert_allclose(output, expected, atol=1e-4)
+
+
+@pytest.mark.parametrize("batch,seq,d_model,n_heads", CAUSAL_CONFIGS)
+def test_causal_transformer_compiled(batch, seq, d_model, n_heads):
     """Compiled C executor: causal naive transformer matches PyTorch.
 
     The model uses explicit mask addition (not SDPA), which exercises
@@ -276,18 +310,73 @@ def test_causal_transformer_compiled_executor(batch, seq, d_model, n_heads):
     run_pipeline(graph)
     ep = plan(graph)
 
-    executor = Executor(backends=[CBackend(), NumpyBackend()])
-    compiled = executor.compile_plan(ep)
-    result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+    executor = CompiledExecutor()
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
     np.testing.assert_allclose(output, expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Interpreted vs compiled agreement
+# ---------------------------------------------------------------------------
+
+def test_interpreted_vs_compiled_mlp():
+    """Both execution paths should produce identical results for an MLP."""
+    model = SimpleMLP(128)
+    model.eval()
+    x = torch.randn(4, 128)
+
+    graph = export_model(model, (x,))
+    run_pipeline(graph)
+    ep = plan(graph)
+    inp = {graph.inputs[0]: x.numpy().copy()}
+
+    interp = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
+    interp.compile(ep)
+    result_interp = interp.run(inp)
+
+    compiled = CompiledExecutor()
+    compiled.compile(ep)
+    result_compiled = compiled.run(inp)
+
+    for name in graph.outputs:
+        np.testing.assert_allclose(
+            result_interp[name], result_compiled[name], atol=1e-6,
+            err_msg=f"Interpreted vs compiled mismatch for output '{name}'"
+        )
+
+
+def test_interpreted_vs_compiled_transformer():
+    """Both execution paths should produce identical results for a transformer."""
+    model = NaiveTransformerBlock(64, 4)
+    model.eval()
+    x = torch.randn(2, 16, 64)
+
+    graph = export_model(model, (x,))
+    run_pipeline(graph)
+    ep = plan(graph)
+    inp = {graph.inputs[0]: x.numpy().copy()}
+
+    interp = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
+    interp.compile(ep)
+    result_interp = interp.run(inp)
+
+    compiled = CompiledExecutor()
+    compiled.compile(ep)
+    result_compiled = compiled.run(inp)
+
+    for name in graph.outputs:
+        np.testing.assert_allclose(
+            result_interp[name], result_compiled[name], atol=1e-5,
+            err_msg=f"Interpreted vs compiled mismatch for output '{name}'"
+        )
 
 
 # ---------------------------------------------------------------------------
 # GPT-2 body end-to-end tests
 # ---------------------------------------------------------------------------
 
-import torch.nn as nn
 from transformers import GPT2LMHeadModel, GPT2Config
 
 
@@ -324,8 +413,8 @@ GPT2_SEQ_LENGTHS = [1, 16, 64]
 
 @pytest.mark.parametrize("seq_len", GPT2_SEQ_LENGTHS)
 @pytest.mark.parametrize("backend_name", ["numpy", "c"])
-def test_gpt2_body_per_op(seq_len, backend_name):
-    """Per-op dispatch: GPT-2 body matches PyTorch across sequence lengths."""
+def test_gpt2_body_interpreted(seq_len, backend_name):
+    """Interpreted dispatch: GPT-2 body matches PyTorch across sequence lengths."""
     model = _make_gpt2_body()
     x = torch.randn(1, seq_len, 768)
 
@@ -337,23 +426,19 @@ def test_gpt2_body_per_op(seq_len, backend_name):
     ep = plan(graph)
 
     if backend_name == "numpy":
-        executor = Executor(backends=[NumpyBackend()])
+        executor = InterpretedExecutor(backends=[NumpyBackend()])
     else:
-        executor = Executor(backends=[CBackend(), NumpyBackend()])
+        executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
 
-    result = executor.execute(ep, {graph.inputs[0]: x.numpy().copy()})
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
     np.testing.assert_allclose(output, expected, atol=1e-4)
 
 
 @pytest.mark.parametrize("seq_len", GPT2_SEQ_LENGTHS)
 def test_gpt2_body_compiled(seq_len):
-    """Compiled C executor: GPT-2 body matches PyTorch.
-
-    For seq_len=1, the causal mask is trivial so SLICE produces
-    correct results even in compiled mode. For seq_len>1, the compiled
-    path uses segmented execution for non-contiguous SLICE ops.
-    """
+    """Compiled C executor: GPT-2 body matches PyTorch."""
     model = _make_gpt2_body()
     x = torch.randn(1, seq_len, 768)
 
@@ -364,8 +449,8 @@ def test_gpt2_body_compiled(seq_len):
     run_pipeline(graph)
     ep = plan(graph)
 
-    executor = Executor(backends=[CBackend(), NumpyBackend()])
-    compiled = executor.compile_plan(ep)
-    result = executor.execute_compiled(compiled, {graph.inputs[0]: x.numpy().copy()})
+    executor = CompiledExecutor()
+    executor.compile(ep)
+    result = executor.run({graph.inputs[0]: x.numpy().copy()})
     output = result[graph.outputs[0]]
     np.testing.assert_allclose(output, expected, atol=1e-4)

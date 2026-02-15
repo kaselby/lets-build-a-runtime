@@ -136,6 +136,14 @@ def _gelu(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -
     np.multiply(0.5 * x, 1.0 + np.tanh(inner), out=output)
 
 
+def _slice(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    x = inputs[0]
+    dim = attrs["dim"]
+    start, end = attrs["start"], attrs["end"]
+    slices = tuple(slice(start, end) if d == dim else slice(None) for d in range(x.ndim))
+    np.copyto(output, x[slices])
+
+
 def _embedding(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
     ids, table = inputs[0], inputs[1]
     output[:] = table[ids.astype(np.intp)]
@@ -163,6 +171,7 @@ _KERNELS: dict[OpType, KernelFn] = {
     OpType.TANH: _tanh,
     OpType.GELU: _gelu,
     OpType.EMBEDDING: _embedding,
+    OpType.SLICE: _slice,
 }
 
 

@@ -23,7 +23,7 @@ INT_PTR = ctypes.POINTER(ctypes.c_int)
 
 def _load_library() -> ctypes.CDLL | None:
     """Try to load the compiled C library."""
-    csrc_dir = Path(__file__).parent.parent.parent / "csrc_edited"
+    csrc_dir = Path(__file__).parent.parent.parent / "csrc"
 
     if sys.platform == "darwin":
         lib_path = csrc_dir / "libruntime.dylib"

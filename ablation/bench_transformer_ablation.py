@@ -37,7 +37,9 @@ import torch.nn.functional as F
 from runtime.backends.c_backend import CBackend
 from runtime.backends.numpy_backend import NumpyBackend
 from runtime.exporter import export_model
-from runtime.executor import COpNode, Executor, MAX_DIMS, MAX_INPUTS
+from runtime.executor import (
+    COpNode, CompiledExecutor, InterpretedExecutor, MAX_DIMS, MAX_INPUTS,
+)
 from runtime.ir import OpType
 from runtime.passes import (
     FUSION_PATTERNS,
@@ -53,6 +55,12 @@ try:
     HAS_ORT = True
 except ImportError:
     HAS_ORT = False
+
+try:
+    from transformers import GPT2LMHeadModel, GPT2Config
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
 
 
 # =====================================================================
@@ -117,6 +125,40 @@ class SDPATransformerBlock(nn.Module):
         return x
 
 
+class GPT2Body(nn.Module):
+    """GPT-2 transformer body: blocks + final layernorm. No embeddings or LM head.
+
+    Uses HuggingFace GPT-2 blocks which include causal attention. Requires
+    the `transformers` package.
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.h = model.transformer.h
+        self.ln_f = model.transformer.ln_f
+
+    def forward(self, hidden_states):
+        for block in self.h:
+            hidden_states = block(hidden_states)[0]
+        return self.ln_f(hidden_states)
+
+
+def _make_gpt2_body(n_layer=2, n_head=12, n_embd=768):
+    """Create a GPT-2 body model. Returns None if transformers unavailable."""
+    if not HAS_TRANSFORMERS:
+        return None
+    config = GPT2Config(
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        vocab_size=50257,
+    )
+    full_model = GPT2LMHeadModel(config)
+    full_model.eval()
+    body = GPT2Body(full_model)
+    body.eval()
+    return body
+
+
 # =====================================================================
 # Configs
 # =====================================================================
@@ -130,6 +172,7 @@ class Config:
     batch: int = 1
     warmup: int = 20
     iters: int = 100
+    model: str = "naive"  # "naive" for custom transformer, "gpt2" for HF GPT-2 body
 
 ALL_CONFIGS = [
     Config("Toy",     64,   4,   32,   warmup=5, iters=10),
@@ -141,6 +184,10 @@ ALL_CONFIGS = [
     Config("7B",      4096, 32,  1024, warmup=5, iters=10),
     Config("7B-4K",   4096, 32,  4096, warmup=3, iters=10),
     Config("1B-8K",   2048, 16,  8192, warmup=3, iters=10),
+    # GPT-2 body (HuggingFace, 2-layer, causal attention)
+    Config("gpt2-s16",  768, 12,  16,  warmup=5, iters=10, model="gpt2"),
+    Config("gpt2-s64",  768, 12,  64,  warmup=5, iters=10, model="gpt2"),
+    Config("gpt2-s256", 768, 12, 256,  warmup=5, iters=10, model="gpt2"),
 ]
 
 # Configs with d_model >= 2048 use the reduced variant set
@@ -256,34 +303,35 @@ def classify_op_indices(graph, exec_order):
 # Timing helpers
 # =====================================================================
 
-def _patch_inputs(compiled_plan, inputs):
-    """Patch graph input pointers into the compiled plan's COpNode array."""
-    for name, slots in compiled_plan.input_slots.items():
+def _patch_inputs(executor, inputs):
+    """Patch graph input pointers into the compiled executor's COpNode array."""
+    for name, slots in executor._input_slots.items():
         ptr = inputs[name].ctypes.data
         for node_idx, slot_idx in slots:
-            compiled_plan.nodes[node_idx].inputs[slot_idx] = ptr
+            executor._nodes[node_idx].inputs[slot_idx] = ptr
 
 
-def bench_compiled_timed(lib, compiled_plan, inputs, n_nodes,
+def bench_compiled_timed(lib, executor, inputs, n_nodes,
                          attn_indices, ln_indices,
                          softmax_mode, attn_mode, layernorm_mode,
                          warmup, iters):
-    """Benchmark a compiled plan with per-op timing via the ablation library.
+    """Benchmark a compiled executor with per-op timing via the ablation library.
 
     Returns (total_us, attn_us, ln_us, other_us) — median across iterations.
     """
-    _patch_inputs(compiled_plan, inputs)
+    _patch_inputs(executor, inputs)
+    nodes = executor._nodes
     times_buf = (ctypes.c_double * n_nodes)()
 
     # Warmup (no timing)
     for _ in range(warmup):
-        lib.execute_ablation(compiled_plan.nodes, n_nodes,
+        lib.execute_ablation(nodes, n_nodes,
                              softmax_mode, attn_mode, layernorm_mode)
 
     # Timed iterations — collect per-iteration aggregates
     totals, attns, lns, others = [], [], [], []
     for _ in range(iters):
-        lib.timed_execute_ablation(compiled_plan.nodes, n_nodes, times_buf,
+        lib.timed_execute_ablation(nodes, n_nodes, times_buf,
                                    softmax_mode, attn_mode, layernorm_mode)
         attn_ns = sum(times_buf[i] for i in attn_indices)
         ln_ns = sum(times_buf[i] for i in ln_indices)
@@ -410,12 +458,16 @@ def bench_python_executor(executor, ep, graph, warmup, iters):
         elif node.op == OpType.LAYERNORM:
             ln_ids.add(node.id)
 
-    # Warmup
+    # Compile and warmup via the standard API
+    executor.compile(ep)
     for _ in range(warmup):
-        executor.execute(ep, {inp_name: x_np})
+        executor.run({inp_name: x_np})
 
     # Timed — manually dispatch with per-op timing
+    # (reach into internals for fine-grained measurement)
+    from runtime.ops import OP_REGISTRY
     arena = executor._get_arena(ep.arena_size)
+    external = set(graph.inputs) | set(graph.constants)
     totals, attns, lns, others = [], [], [], []
 
     for _ in range(iters):
@@ -426,16 +478,14 @@ def bench_python_executor(executor, ep, graph, warmup, iters):
         ln_ns = 0
         other_ns = 0
         for node in ep.order:
-            if node.op == OpType.RESHAPE:
-                inp_buf = graph.tensors[node.inputs[0]].buffer
-                graph.tensors[node.output].buffer = inp_buf.reshape(
-                    graph.tensors[node.output].shape)
+            op_def = OP_REGISTRY.get(node.op)
+            if op_def is not None and op_def.is_alias(node) and node.inputs[0] not in external:
                 continue
             kernel = executor._resolve_kernel(node.op)
             input_buffers = [graph.tensors[inp].buffer for inp in node.inputs]
             if node.id in ep.scratch:
                 offset, size_bytes = ep.scratch[node.id]
-                input_buffers.append(arena[offset:offset + size_bytes].view(np.float32))
+                input_buffers.append(arena[offset:offset + size_bytes])
             output_buffer = graph.tensors[node.output].buffer
 
             t0 = time.perf_counter_ns()
@@ -659,11 +709,21 @@ def run_config(cfg: Config, lib):
     print(f"{'='*100}")
 
     # Build models
-    naive_model = NaiveTransformerBlock(cfg.d_model, cfg.n_heads)
-    naive_model.eval()
-    sdpa_model = SDPATransformerBlock(cfg.d_model, cfg.n_heads)
-    sdpa_model.load_state_dict(naive_model.state_dict())
-    sdpa_model.eval()
+    is_gpt2 = cfg.model == "gpt2"
+    if is_gpt2:
+        gpt2_model = _make_gpt2_body(n_head=cfg.n_heads, n_embd=cfg.d_model)
+        if gpt2_model is None:
+            print(f"  SKIPPED: transformers package required for GPT-2 configs")
+            return {}
+        # GPT-2 uses its own architecture; naive/sdpa baselines don't apply
+        naive_model = gpt2_model
+        sdpa_model = None
+    else:
+        naive_model = NaiveTransformerBlock(cfg.d_model, cfg.n_heads)
+        naive_model.eval()
+        sdpa_model = SDPATransformerBlock(cfg.d_model, cfg.n_heads)
+        sdpa_model.load_state_dict(naive_model.state_dict())
+        sdpa_model.eval()
 
     x_torch = torch.randn(cfg.batch, cfg.seq_len, cfg.d_model)
     x_np = x_torch.numpy().copy()
@@ -689,9 +749,26 @@ def run_config(cfg: Config, lib):
             prev_group = v.group
 
         try:
+            # Skip PyTorch SDPA baseline for GPT-2 configs (no matching model)
+            if is_gpt2 and v.mode == "pytorch_sdpa":
+                continue
+
             if v.mode == "pytorch_naive":
-                total, attn, ln, other = bench_pytorch_naive(
-                    naive_model, x_torch, cfg.warmup, cfg.iters)
+                if is_gpt2:
+                    # For GPT-2, just time the model directly (no manual breakdown)
+                    with torch.no_grad():
+                        for _ in range(cfg.warmup):
+                            naive_model(x_torch)
+                        times = []
+                        for _ in range(cfg.iters):
+                            t0 = time.perf_counter_ns()
+                            naive_model(x_torch)
+                            times.append((time.perf_counter_ns() - t0) / 1000)
+                    total = _median(times)
+                    attn, ln, other = 0.0, 0.0, total
+                else:
+                    total, attn, ln, other = bench_pytorch_naive(
+                        naive_model, x_torch, cfg.warmup, cfg.iters)
 
             elif v.mode == "pytorch_sdpa":
                 total, attn, ln, other = bench_pytorch_sdpa(
@@ -704,9 +781,9 @@ def run_config(cfg: Config, lib):
                     v.pipeline(graph)
                 ep = plan(graph)
                 if backend_name == "numpy":
-                    executor = Executor(backends=[NumpyBackend()])
+                    executor = InterpretedExecutor(backends=[NumpyBackend()])
                 else:
-                    executor = Executor(backends=[CBackend(), NumpyBackend()])
+                    executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
                 graph.tensors[graph.inputs[0]].buffer = x_np
                 total, attn, ln, other = bench_python_executor(
                     executor, ep, graph, cfg.warmup, cfg.iters)
@@ -721,15 +798,15 @@ def run_config(cfg: Config, lib):
                         if node.op == OpType.ATTENTION:
                             node.attrs["flash"] = True
                 ep = plan(graph)
-                executor = Executor(backends=[CBackend(), NumpyBackend()])
-                compiled = executor.compile_plan(ep)
+                executor = CompiledExecutor()
+                executor.compile(ep)
 
                 exec_order = list(ep.order)
                 attn_indices, ln_indices = classify_op_indices(graph, exec_order)
-                n_nodes = compiled.n_nodes
+                n_nodes = executor._n_nodes
 
                 total, attn, ln, other = bench_compiled_timed(
-                    lib, compiled, {graph.inputs[0]: x_np}, n_nodes,
+                    lib, executor, {graph.inputs[0]: x_np}, n_nodes,
                     attn_indices, ln_indices,
                     v.softmax_mode, v.attn_mode, v.layernorm_mode,
                     cfg.warmup, cfg.iters)
@@ -785,9 +862,17 @@ def main():
         print("No configs selected. Available:", ", ".join(c.name for c in ALL_CONFIGS))
         return
 
+    # Filter out GPT-2 configs if transformers is unavailable
+    gpt2_configs = [c for c in configs if c.model == "gpt2"]
+    if gpt2_configs and not HAS_TRANSFORMERS:
+        print(f"Warning: skipping {len(gpt2_configs)} GPT-2 configs "
+              f"(transformers package not installed)")
+        configs = [c for c in configs if c.model != "gpt2"]
+
     lib = _load_ablation_lib()
     print(f"Loaded ablation library")
     print(f"ONNX Runtime: {'v' + ort.__version__ if HAS_ORT else 'not available'}")
+    print(f"Transformers (GPT-2): {'available' if HAS_TRANSFORMERS else 'not available'}")
     print(f"Running {len(configs)} configs x {len(VARIANTS)} variants")
 
     all_results = {}

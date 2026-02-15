@@ -10,7 +10,7 @@ from typing import Callable
 import numpy as np
 import torch
 
-from ..ir import Graph, OpType
+from ...ir import Graph, OpType
 
 # Handler signature: (fx_node, graph, node_map) -> None
 OpHandler = Callable[[object, Graph, dict[str, str]], None]
@@ -492,6 +492,7 @@ ATEN_HANDLERS: dict[object, OpHandler] = {
     torch.ops.aten.relu.default:        _make_simple_handler(OpType.RELU),
     torch.ops.aten.exp.default:         _make_simple_handler(OpType.EXP),
     torch.ops.aten.tanh.default:        _make_simple_handler(OpType.TANH),
+    torch.ops.aten.gelu.default:        _make_simple_handler(OpType.GELU),
 
     # Simple multi-input ops (all args are tensors, no attrs)
     torch.ops.aten.mm.default:          _make_simple_handler(OpType.MATMUL),

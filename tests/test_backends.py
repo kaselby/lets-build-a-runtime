@@ -237,31 +237,29 @@ SLICE_CASES = [
 @pytest.mark.parametrize("desc,input_shape,chunk_idx,chunk_size",
                          SLICE_CASES, ids=[c[0] for c in SLICE_CASES])
 def test_slice(np_backend, desc, input_shape, chunk_idx, chunk_size):
-    """SLICE is a zero-copy view, so test via the executor per-op path
-    rather than run_kernel (SLICE has no kernel, it's handled by executor).
+    """SLICE correctness via the executor per-op path.
 
-    SLICE works on flat memory with a byte_offset — only valid for splits
-    where chunks are contiguous (leading dim or last dim of inner-most axis).
+    Alias/in-place sharing only applies to arena intermediates, not graph
+    inputs — so SLICE on a graph input always gets arena space and a copy.
+    We just check that the output values are correct.
     """
     from runtime.ir import Graph, OpType
     from runtime.planner import plan
-    from runtime.executor import Executor
+    from runtime.executor import InterpretedExecutor
     from runtime.backends.numpy_backend import NumpyBackend
 
     x = np.random.randn(*input_shape).astype(np.float32)
 
     ndim = len(input_shape)
     if ndim == 2:
-        # Split along dim 0 — chunks are contiguous rows
         dim = 0
         trailing = input_shape[1]
         byte_offset = chunk_idx * chunk_size * trailing * 4
         expected = x[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size, :]
         out_shape = (chunk_size, input_shape[1])
     else:
-        # Split along last dim
         dim = ndim - 1
-        trailing = 1  # nothing after last dim
+        trailing = 1
         byte_offset = chunk_idx * chunk_size * trailing * 4
         expected = x[..., chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
         out_shape = input_shape[:-1] + (chunk_size,)
@@ -270,24 +268,64 @@ def test_slice(np_backend, desc, input_shape, chunk_idx, chunk_size):
     end = start + chunk_size
     attrs = {"byte_offset": byte_offset, "dim": dim, "start": start, "end": end}
 
-    # Build graph: input -> SLICE -> output
     g = Graph()
     g.add_tensor("x", input_shape)
     g.inputs.append("x")
     g.add_tensor("sliced", out_shape)
     g.add_node(OpType.SLICE, ["x"], "sliced", attrs)
-    # Need a consumer so sliced isn't dead — add an identity ADD(sliced, 0)
     g.add_tensor("out", out_shape)
     g.add_node(OpType.ADD, ["sliced"], "out", {"scalar": 0.0})
     g.outputs.append("out")
 
     ep = plan(g)
 
-    # For dim=0 splits, SLICE output is an alias (no arena allocation).
-    # For non-leading dims, SLICE output needs arena space (it's a copy).
-    if dim == 0:
-        assert "sliced" not in ep.offsets, "dim=0 SLICE output should be an alias"
+    executor = InterpretedExecutor(backends=[NumpyBackend()])
+    executor.compile(ep)
+    result = executor.run({"x": x})
+    np.testing.assert_allclose(result["out"], expected, atol=1e-6)
 
-    executor = Executor(backends=[NumpyBackend()])
-    result = executor.execute(ep, {"x": x})
+
+def test_slice_alias_on_intermediate():
+    """dim=0 SLICE on an arena intermediate should alias (no extra allocation).
+
+    Graph: input → RELU → intermediate → SLICE → sliced → ADD(0) → out
+
+    The SLICE's input is an intermediate (RELU output), so the planner can
+    alias it. The sliced tensor should share the intermediate's arena offset
+    (shifted by byte_offset), not get its own allocation.
+    """
+    from runtime.ir import Graph, OpType
+    from runtime.planner import plan
+    from runtime.executor import InterpretedExecutor
+    from runtime.backends.numpy_backend import NumpyBackend
+
+    x = np.random.randn(12, 8).astype(np.float32)
+    chunk_size, chunk_idx = 4, 1
+    byte_offset = chunk_idx * chunk_size * 8 * 4  # rows × cols × float32
+
+    g = Graph()
+    g.add_tensor("x", (12, 8))
+    g.inputs.append("x")
+    g.add_tensor("relu_out", (12, 8))
+    g.add_node(OpType.RELU, ["x"], "relu_out")
+    g.add_tensor("sliced", (chunk_size, 8))
+    g.add_node(OpType.SLICE, ["relu_out"], "sliced",
+               {"byte_offset": byte_offset, "dim": 0, "start": 4, "end": 8})
+    g.add_tensor("out", (chunk_size, 8))
+    g.add_node(OpType.ADD, ["sliced"], "out", {"scalar": 0.0})
+    g.outputs.append("out")
+
+    ep = plan(g)
+
+    # sliced should alias relu_out at byte_offset, no extra allocation
+    assert ep.offsets["sliced"] == ep.offsets["relu_out"] + byte_offset, \
+        "dim=0 SLICE should point into its input's arena region"
+    # Arena should only hold relu_out (384B) + out (128B) = 512, not 640
+    assert ep.arena_size == 12 * 8 * 4 + chunk_size * 8 * 4
+
+    # Correctness
+    expected = np.maximum(x, 0)[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size, :]
+    executor = InterpretedExecutor(backends=[NumpyBackend()])
+    executor.compile(ep)
+    result = executor.run({"x": x})
     np.testing.assert_allclose(result["out"], expected, atol=1e-6)

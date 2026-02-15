@@ -24,39 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* ----------------------------------------------------------------
- * Op constants (must match Python OpType enum auto() values)
- * ---------------------------------------------------------------- */
-#define OP_MATMUL          1
-#define OP_ADD             2
-#define OP_RELU            3
-#define OP_TRANSPOSE       4
-#define OP_PERMUTE         5
-#define OP_DIV             6
-#define OP_SUB             7
-#define OP_MUL             8
-#define OP_EXP             9
-#define OP_MAX             10
-#define OP_SUM             11
-#define OP_SOFTMAX         12
-#define OP_RESHAPE         13
-#define OP_LAYERNORM       14
-#define OP_MATMUL_ADD      15
-#define OP_FUSED_BIAS_RELU 16
-#define OP_ATTENTION       17
-
-#define MAX_INPUTS 8
-#define MAX_DIMS   16
-
-typedef struct {
-    int op;
-    int n_inputs;
-    float* inputs[MAX_INPUTS];
-    float* output;
-    int out_shape[MAX_DIMS];
-    int n_dims;
-    int extra[MAX_DIMS];
-} OpNode;
+#include "runtime.h"
 
 /* ----------------------------------------------------------------
  * Forward declarations for ops.c kernels
@@ -86,10 +54,19 @@ void kernel_layernorm(const float* x, const float* gamma, const float* beta,
 void kernel_bias_relu(const float* a, const float* bias, float* out, int M, int N);
 void kernel_attention(const float* Q, const float* K, const float* V,
                       float* output, float* scratch,
-                      int batch_heads, int seq_len, int head_dim);
+                      int batch_heads, int seq_len, int head_dim,
+                      int causal);
 void kernel_attention_flash(const float* Q, const float* K, const float* V,
                             float* output, float* scratch,
                             int batch_heads, int seq_len, int head_dim);
+void kernel_tanh(const float* x, float* out, int n);
+void kernel_pow_scalar(const float* x, float scalar, float* out, int n);
+void kernel_gelu_tanh(const float* x, float* out, int n);
+void kernel_embedding(const long* ids, const float* table, float* out,
+                      int seq_len, int embed_dim);
+void kernel_slice(const float* x, float* out,
+                  int outer, int orig_dim_size, int start,
+                  int slice_len, int inner);
 
 
 /* ================================================================
@@ -276,6 +253,25 @@ void kernel_layernorm_simd(const float* x, const float* gamma, const float* beta
  * layernorm_mode: 0 = scalar, 1 = SIMD, 2 = SIMD+GCD (kernel_layernorm)
  * ================================================================ */
 
+/* Helpers matching executor.c */
+static inline int total_elements(const OpNode* node) {
+    int n = 1;
+    for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
+    return n;
+}
+
+static inline float extra_float(const OpNode* node, int idx) {
+    union { int i; float f; } u;
+    u.i = node->extra[idx];
+    return u.f;
+}
+
+static inline int leading_dims(const OpNode* node) {
+    int rows = 1;
+    for (int i = 0; i < node->n_dims - 1; i++) rows *= node->out_shape[i];
+    return rows;
+}
+
 static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
                               int layernorm_mode) {
     switch (node->op) {
@@ -285,52 +281,55 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
         int K = node->extra[0];
         int trans_b = node->extra[1];
         int b_is_2d = node->extra[2];
-        union { int i; float f; } alpha_u;
-        alpha_u.i = node->extra[3];
-        float alpha = alpha_u.i ? alpha_u.f : 1.0f;
+        float alpha = node->extra[3] ? extra_float(node, 3) : 1.0f;
         if (b_is_2d) {
-            int M_total = 1;
-            for (int i = 0; i < node->n_dims - 1; i++)
-                M_total *= node->out_shape[i];
-            kernel_matmul_ab(node->inputs[0], node->inputs[1], node->output,
+            int M_total = leading_dims(node);
+            kernel_matmul_ab((const float*)node->inputs[0],
+                             (const float*)node->inputs[1],
+                             (float*)node->output,
                              M_total, N, K, 1, trans_b, alpha, 0.0f);
         } else {
             int M = node->out_shape[node->n_dims - 2];
             int batches = 1;
             for (int i = 0; i < node->n_dims - 2; i++)
                 batches *= node->out_shape[i];
-            kernel_matmul_ab(node->inputs[0], node->inputs[1], node->output,
+            kernel_matmul_ab((const float*)node->inputs[0],
+                             (const float*)node->inputs[1],
+                             (float*)node->output,
                              M, N, K, batches, trans_b, alpha, 0.0f);
         }
         break;
     }
 
     case OP_ADD: {
-        int n = 1;
-        for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
+        int n = total_elements(node);
         if (node->extra[0] == 2) {
-            union { int i; float f; } s;
-            s.i = node->extra[1];
-            kernel_add_scalar(node->inputs[0], s.f, node->output, n);
+            kernel_add_scalar((const float*)node->inputs[0],
+                              extra_float(node, 1),
+                              (float*)node->output, n);
         } else if (node->extra[0] == 1) {
-            kernel_add(node->inputs[0], node->inputs[1], node->output, 1, n);
+            kernel_add((const float*)node->inputs[0],
+                       (const float*)node->inputs[1],
+                       (float*)node->output, 1, n);
         } else {
             int N = node->out_shape[node->n_dims - 1];
-            kernel_add(node->inputs[0], node->inputs[1], node->output, n / N, N);
+            kernel_add((const float*)node->inputs[0],
+                       (const float*)node->inputs[1],
+                       (float*)node->output, n / N, N);
         }
         break;
     }
 
     case OP_RELU: {
-        int n = 1;
-        for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
-        kernel_relu(node->inputs[0], node->output, n);
+        kernel_relu((const float*)node->inputs[0],
+                    (float*)node->output, total_elements(node));
         break;
     }
 
     case OP_TRANSPOSE: {
         if (node->n_dims == 2) {
-            kernel_transpose(node->inputs[0], node->output,
+            kernel_transpose((const float*)node->inputs[0],
+                             (float*)node->output,
                              node->extra[0], node->extra[1]);
         } else {
             int outer  = node->extra[0];
@@ -338,8 +337,8 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
             int middle = node->extra[2];
             int B      = node->extra[3];
             int inner  = node->extra[4];
-            const float* x = node->inputs[0];
-            float* out = node->output;
+            const float* x = (const float*)node->inputs[0];
+            float* out = (float*)node->output;
             for (int o = 0; o < outer; o++)
               for (int b = 0; b < B; b++)
                 for (int m = 0; m < middle; m++)
@@ -353,48 +352,69 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
     }
 
     case OP_DIV: {
-        int n = 1;
-        for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
+        int n = total_elements(node);
         if (node->extra[0]) {
-            union { int i; float f; } s;
-            s.i = node->extra[1];
-            kernel_div_scalar(node->inputs[0], s.f, node->output, n);
+            kernel_div_scalar((const float*)node->inputs[0],
+                              extra_float(node, 1),
+                              (float*)node->output, n);
         } else {
-            kernel_div(node->inputs[0], node->inputs[1], node->output, n);
+            kernel_div((const float*)node->inputs[0],
+                       (const float*)node->inputs[1],
+                       (float*)node->output, n);
         }
         break;
     }
 
     case OP_SUB: {
-        int n = 1;
-        for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
+        int n = total_elements(node);
         if (node->extra[0]) {
-            union { int i; float f; } s;
-            s.i = node->extra[1];
-            kernel_sub_scalar(node->inputs[0], s.f, node->output, n);
+            kernel_sub_scalar((const float*)node->inputs[0],
+                              extra_float(node, 1),
+                              (float*)node->output, n);
         } else {
-            kernel_sub(node->inputs[0], node->inputs[1], node->output, n);
+            kernel_sub((const float*)node->inputs[0],
+                       (const float*)node->inputs[1],
+                       (float*)node->output, n);
         }
         break;
     }
 
     case OP_MUL: {
-        int n = 1;
-        for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
+        int n = total_elements(node);
         if (node->extra[0]) {
-            union { int i; float f; } s;
-            s.i = node->extra[1];
-            kernel_mul_scalar(node->inputs[0], s.f, node->output, n);
+            kernel_mul_scalar((const float*)node->inputs[0],
+                              extra_float(node, 1),
+                              (float*)node->output, n);
         } else {
-            kernel_mul(node->inputs[0], node->inputs[1], node->output, n);
+            kernel_mul((const float*)node->inputs[0],
+                       (const float*)node->inputs[1],
+                       (float*)node->output, n);
         }
         break;
     }
 
     case OP_EXP: {
-        int n = 1;
-        for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
-        kernel_exp(node->inputs[0], node->output, n);
+        kernel_exp((const float*)node->inputs[0],
+                   (float*)node->output, total_elements(node));
+        break;
+    }
+
+    case OP_TANH: {
+        kernel_tanh((const float*)node->inputs[0],
+                    (float*)node->output, total_elements(node));
+        break;
+    }
+
+    case OP_POW: {
+        kernel_pow_scalar((const float*)node->inputs[0],
+                          extra_float(node, 0),
+                          (float*)node->output, total_elements(node));
+        break;
+    }
+
+    case OP_GELU: {
+        kernel_gelu_tanh((const float*)node->inputs[0],
+                         (float*)node->output, total_elements(node));
         break;
     }
 
@@ -404,7 +424,8 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
         int outer = 1, inner = 1;
         for (int i = 0; i < axis; i++) outer *= node->out_shape[i];
         for (int i = axis; i < node->n_dims; i++) inner *= node->out_shape[i];
-        kernel_max(node->inputs[0], node->output, outer, axis_size, inner);
+        kernel_max((const float*)node->inputs[0],
+                   (float*)node->output, outer, axis_size, inner);
         break;
     }
 
@@ -414,46 +435,78 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
         int outer = 1, inner = 1;
         for (int i = 0; i < axis; i++) outer *= node->out_shape[i];
         for (int i = axis; i < node->n_dims; i++) inner *= node->out_shape[i];
-        kernel_sum(node->inputs[0], node->output, outer, axis_size, inner);
+        kernel_sum((const float*)node->inputs[0],
+                   (float*)node->output, outer, axis_size, inner);
         break;
     }
 
     case OP_SOFTMAX: {
         int cols = node->out_shape[node->n_dims - 1];
-        int rows = 1;
-        for (int i = 0; i < node->n_dims - 1; i++) rows *= node->out_shape[i];
+        int rows = leading_dims(node);
         if (softmax_mode == 1)
-            softmax_scalar(node->inputs[0], node->output, rows, cols);
+            softmax_scalar((const float*)node->inputs[0],
+                           (float*)node->output, rows, cols);
         else
-            kernel_softmax(node->inputs[0], node->output, rows, cols);
+            kernel_softmax((const float*)node->inputs[0],
+                           (float*)node->output, rows, cols);
         break;
     }
 
-    case OP_RESHAPE:
-        /* Zero-copy: handled by Python alias binding */
+    case OP_RESHAPE: {
+        /* Usually zero-copy alias, but handle copy case */
+        if (node->inputs[0] != node->output) {
+            memcpy(node->output, node->inputs[0],
+                   total_elements(node) * sizeof(float));
+        }
         break;
+    }
+
+    case OP_SLICE: {
+        /* extra = [outer, orig_dim_size, start, slice_len, inner] */
+        if (node->extra[0] == 0) break;
+        kernel_slice((const float*)node->inputs[0],
+                     (float*)node->output,
+                     node->extra[0], node->extra[1], node->extra[2],
+                     node->extra[3], node->extra[4]);
+        break;
+    }
+
+    case OP_EMBEDDING: {
+        /* inputs: [ids (int64), table (float)], extra[0] = embed_dim */
+        int embed_dim = node->extra[0];
+        int seq_len = leading_dims(node);
+        kernel_embedding((const long*)node->inputs[0],
+                         (const float*)node->inputs[1],
+                         (float*)node->output,
+                         seq_len, embed_dim);
+        break;
+    }
 
     case OP_LAYERNORM: {
         int cols = node->out_shape[node->n_dims - 1];
-        int rows = 1;
-        for (int i = 0; i < node->n_dims - 1; i++) rows *= node->out_shape[i];
-        union { int i; float f; } eps_u;
-        eps_u.i = node->extra[0];
+        int rows = leading_dims(node);
+        float eps = extra_float(node, 0);
         switch (layernorm_mode) {
         case 0:
             kernel_layernorm_scalar(
-                node->inputs[0], node->inputs[1], node->inputs[2],
-                node->output, rows, cols, eps_u.f);
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output, rows, cols, eps);
             break;
         case 1:
             kernel_layernorm_simd(
-                node->inputs[0], node->inputs[1], node->inputs[2],
-                node->output, rows, cols, eps_u.f);
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output, rows, cols, eps);
             break;
         default:
             kernel_layernorm(
-                node->inputs[0], node->inputs[1], node->inputs[2],
-                node->output, rows, cols, eps_u.f);
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output, rows, cols, eps);
             break;
         }
         break;
@@ -464,25 +517,25 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
         int K = node->extra[0];
         int trans_b = node->extra[1];
         int b_is_2d = node->extra[2];
-        float* bias = node->inputs[2];
-        int rows = 1;
-        for (int i = 0; i < node->n_dims - 1; i++)
-            rows *= node->out_shape[i];
+        const float* bias = (const float*)node->inputs[2];
+        float* out = (float*)node->output;
+        int rows = leading_dims(node);
         for (int r = 0; r < rows; r++)
             for (int c = 0; c < N; c++)
-                node->output[r * N + c] = bias[c];
+                out[r * N + c] = bias[c];
         if (b_is_2d) {
-            int M_total = 1;
-            for (int i = 0; i < node->n_dims - 1; i++)
-                M_total *= node->out_shape[i];
-            kernel_matmul_beta(node->inputs[0], node->inputs[1], node->output,
-                               M_total, N, K, 1, trans_b, 1.0f);
+            kernel_matmul_beta((const float*)node->inputs[0],
+                               (const float*)node->inputs[1],
+                               (float*)node->output,
+                               rows, N, K, 1, trans_b, 1.0f);
         } else {
             int M = node->out_shape[node->n_dims - 2];
             int batches = 1;
             for (int i = 0; i < node->n_dims - 2; i++)
                 batches *= node->out_shape[i];
-            kernel_matmul_beta(node->inputs[0], node->inputs[1], node->output,
+            kernel_matmul_beta((const float*)node->inputs[0],
+                               (const float*)node->inputs[1],
+                               (float*)node->output,
                                M, N, K, batches, trans_b, 1.0f);
         }
         break;
@@ -490,9 +543,10 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
 
     case OP_FUSED_BIAS_RELU: {
         int N = node->out_shape[node->n_dims - 1];
-        int M = 1;
-        for (int i = 0; i < node->n_dims - 1; i++) M *= node->out_shape[i];
-        kernel_bias_relu(node->inputs[0], node->inputs[1], node->output, M, N);
+        int M = leading_dims(node);
+        kernel_bias_relu((const float*)node->inputs[0],
+                         (const float*)node->inputs[1],
+                         (float*)node->output, M, N);
         break;
     }
 
@@ -505,27 +559,39 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
         switch (attn_mode) {
         case 0:
             kernel_attention_scalar(
-                node->inputs[0], node->inputs[1], node->inputs[2],
-                node->output, node->inputs[3],
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output,
+                (float*)node->inputs[3],
                 batch_heads, seq_len, head_dim);
             break;
         case 1:
             kernel_attention_simd(
-                node->inputs[0], node->inputs[1], node->inputs[2],
-                node->output, node->inputs[3],
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output,
+                (float*)node->inputs[3],
                 batch_heads, seq_len, head_dim);
             break;
         case 3:
             kernel_attention_flash(
-                node->inputs[0], node->inputs[1], node->inputs[2],
-                node->output, node->inputs[3],
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output,
+                (float*)node->inputs[3],
                 batch_heads, seq_len, head_dim);
             break;
         default:
             kernel_attention(
-                node->inputs[0], node->inputs[1], node->inputs[2],
-                node->output, node->inputs[3],
-                batch_heads, seq_len, head_dim);
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output,
+                (float*)node->inputs[3],
+                batch_heads, seq_len, head_dim, 0);
             break;
         }
         break;

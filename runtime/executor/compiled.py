@@ -36,7 +36,7 @@ class CompiledExecutor(Executor):
         After this, only graph input pointers need patching per call.
         """
         if _c_executor_lib is None:
-            raise RuntimeError("C executor library not found — build csrc_edited/ first")
+            raise RuntimeError("C executor library not found — build csrc/ first")
 
         graph = plan.graph
         self._graph = graph
@@ -44,11 +44,12 @@ class CompiledExecutor(Executor):
 
         # Bind all non-input buffers so we can grab their pointers
         self._bind_intermediates(graph, plan.offsets, arena)
+        external = set(graph.inputs) | set(graph.constants)
 
-        # Filter to nodes that need C dispatch (skip aliases)
+        # Filter to nodes that need C dispatch (skip aliases, but not aliases of externals)
         exec_order = []
         for node in plan.order:
-            if self._is_alias(node):
+            if self._is_alias(node) and node.inputs[0] not in external:
                 continue
             if node.op.value >= 100:
                 raise RuntimeError(
