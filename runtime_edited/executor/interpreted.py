@@ -56,8 +56,11 @@ class InterpretedExecutor(Executor):
             op_def = OP_REGISTRY.get(node.op)
             if op_def is not None and op_def.is_alias(node):
                 continue
-
-            # TODO: SLICE handling (deferred)
+            if node.op.value >= 100:
+                raise RuntimeError(
+                    f"Fold-only op {node.op.name} reached interpreted executor — "
+                    f"should have been eliminated by constant folding"
+                )
 
             kernel = self._resolve_kernel(node.op)
             input_buffers = [graph.tensors[inp].buffer for inp in node.inputs]

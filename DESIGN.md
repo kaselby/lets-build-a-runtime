@@ -22,6 +22,8 @@ Two execution modes: per-op dispatch (Python loop calling backend kernels — us
 
 **Node-centric, implicit edges.** Each node has an op type, a list of input tensor names, and a single output tensor name. Edges are implicit in these references. Tensor metadata (shape, dtype, buffer pointer) lives in `TensorInfo` objects in the graph's tensor registry.
 
+**Single-output nodes.** Each node produces exactly one output tensor. Ops that conceptually produce multiple results (e.g., `torch.split`) are decomposed into individual SLICE nodes, each producing one output that aliases or copies a chunk of the source. This keeps lifetime analysis, memory planning, and graph traversal simple — no need for output indices, multi-producer tracking, or nodes with partially-dead outputs. ONNX supports multi-output ops; we chose the other direction because our op set is small enough that decomposition covers the only case (split) and avoids adding complexity everywhere else. See DESIGN_LOG_FULL.md for the full tradeoff analysis.
+
 **Inputs and constants are tensors, not nodes.** Graph inputs and weights are entries in the tensor registry with no producer node. Every node in the graph is a real compute operation. This follows the ONNX convention and simplifies passes — no need to special-case "virtual" input nodes.
 
 **Named tensors as connective tissue.** Tensor name strings are how everything connects: nodes reference inputs/outputs by name, the planner maps names to offsets, the executor binds names to buffers. Names are preserved from `torch.export` for debuggability.

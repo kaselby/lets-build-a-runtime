@@ -36,7 +36,7 @@ class CompiledExecutor(Executor):
         After this, only graph input pointers need patching per call.
         """
         if _c_executor_lib is None:
-            raise RuntimeError("C executor library not found — build csrc/ first")
+            raise RuntimeError("C executor library not found — build csrc_edited/ first")
 
         graph = plan.graph
         self._graph = graph
@@ -46,11 +46,16 @@ class CompiledExecutor(Executor):
         self._bind_intermediates(graph, plan.offsets, arena)
 
         # Filter to nodes that need C dispatch (skip aliases)
-        exec_order = [
-            node for node in plan.order
-            if not self._is_alias(node)
-            # TODO: SLICE handling (deferred)
-        ]
+        exec_order = []
+        for node in plan.order:
+            if self._is_alias(node):
+                continue
+            if node.op.value >= 100:
+                raise RuntimeError(
+                    f"Fold-only op {node.op.name} reached compiled executor — "
+                    f"should have been eliminated by constant folding"
+                )
+            exec_order.append(node)
 
         # Build struct array
         n = len(exec_order)

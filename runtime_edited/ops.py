@@ -250,6 +250,38 @@ def _attention_scratch(input_shapes, output_shape, attrs) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Fold-only evaluators (too complex for inline lambdas)
+# ---------------------------------------------------------------------------
+
+def _eval_slice_tensor(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
+    x, dim = ins[0], attrs["dim"]
+    start = attrs.get("start", 0)
+    end = attrs.get("end", x.shape[dim])
+    slices = tuple(slice(start, end) if d == dim else slice(None) for d in range(x.ndim))
+    return x[slices]
+
+
+def _eval_diff(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
+    prepend = ins[1] if len(ins) > 1 else None
+    return np.diff(ins[0], n=attrs.get("n", 1), axis=attrs.get("dim", -1), prepend=prepend)
+
+
+def _eval_index(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
+    tensor = ins[0]
+    n_indices = attrs.get("n_indices", len(ins) - 1)
+    none_positions = set(attrs.get("none_positions", []))
+    indices = []
+    tensor_idx = 1
+    for i in range(n_indices):
+        if i in none_positions:
+            indices.append(slice(None))
+        else:
+            indices.append(ins[tensor_idx])
+            tensor_idx += 1
+    return tensor[tuple(indices)]
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -302,4 +334,19 @@ OP_REGISTRY: dict[OpType, OpDef] = {
     OpType.FUSED_BIAS_RELU: OpDef(evaluator=lambda ins, a: np.maximum(ins[0] + ins[1], 0)),
     OpType.ATTENTION:       OpDef(extras=_attention_extras, scratch=_attention_scratch,
                                   evaluator=_eval_attention),
+
+    # --- Fold-only ops (100+) ---
+    # Infrastructure ops for mask generation, type conversion, etc.
+    # Must be eliminated by constant folding before execution — neither
+    # executor supports them. Evaluators here are used by constant_fold().
+    OpType.CAST:         OpDef(evaluator=lambda ins, a: ins[0].astype(a["target_dtype"])),
+    OpType.EXPAND:       OpDef(evaluator=lambda ins, a: np.broadcast_to(ins[0], a["shape"])),
+    OpType.SLICE_TENSOR: OpDef(evaluator=_eval_slice_tensor),
+    OpType.DIFF:         OpDef(evaluator=_eval_diff),
+    OpType.CMP_NE:       OpDef(evaluator=lambda ins, a: ins[0] != (a["scalar"] if "scalar" in a else ins[1])),
+    OpType.CMP_LE:       OpDef(evaluator=lambda ins, a: ins[0] <= ins[1]),
+    OpType.CMP_EQ:       OpDef(evaluator=lambda ins, a: ins[0] == ins[1]),
+    OpType.CUMSUM:       OpDef(evaluator=lambda ins, a: np.cumsum(ins[0], axis=a["dim"])),
+    OpType.BITWISE_AND:  OpDef(evaluator=lambda ins, a: ins[0] & ins[1]),
+    OpType.INDEX:        OpDef(evaluator=_eval_index),
 }

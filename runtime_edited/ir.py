@@ -19,57 +19,65 @@ import numpy as np
 class OpType(Enum):
     """Operator types supported by the runtime.
 
-    Values are auto-assigned starting at 1. C code (executor.c) must use
-    matching #define values — see the comment block there.
+    Values use range-based numbering so related ops cluster together:
+      10–19  Element-wise unary
+      20–29  Element-wise binary
+      30–39  Reductions
+      40–49  MatMul / BLAS
+      50–59  Shape / data movement
+      60–69  Normalization / compound
+      70–79  Fused ops
+      100+   Fold-only (constant-folded, never dispatched to C)
+
+    C code (executor.c) uses a matching enum — values must stay in sync.
     """
-    # --- Existing ops (values 1-5) ---
-    MATMUL = auto()      # Matrix multiply (supports batched via batch dims)
-    ADD = auto()         # Element-wise add
-    RELU = auto()        # Element-wise ReLU
-    TRANSPOSE = auto()   # 2D matrix transpose (swap rows/cols)
-    PERMUTE = auto()     # General N-dimensional axis reordering; attrs["axes"]
+    # --- Element-wise unary (10–19) ---
+    RELU = 10
+    EXP  = 11
+    TANH = 12
+    POW  = 13            # attrs["scalar"]
+    GELU = 14            # tanh approximation
 
-    # --- New element-wise ops (values 6-9) ---
-    DIV = auto()         # Element-wise divide
-    SUB = auto()         # Element-wise subtract
-    MUL = auto()         # Element-wise multiply
-    EXP = auto()         # Element-wise exp
+    # --- Element-wise binary (20–29) ---
+    ADD = 20
+    SUB = 21
+    MUL = 22
+    DIV = 23
 
-    # --- Reduction ops (values 10-11) ---
-    MAX = auto()         # Reduce along axis; attrs["axis"], attrs["keepdim"]
-    SUM = auto()         # Reduce along axis; attrs["axis"], attrs["keepdim"]
+    # --- Reductions (30–39) ---
+    MAX     = 30         # attrs["axis", "keepdim"]
+    SUM     = 31         # attrs["axis", "keepdim"]
+    SOFTMAX = 32         # attrs["axis"]
 
-    # --- Compound ops (values 12, 14) ---
-    SOFTMAX = auto()     # Softmax along axis; attrs["axis"]
+    # --- MatMul / BLAS (40–49) ---
+    MATMUL = 40
 
-    # --- Shape ops (value 13) ---
-    RESHAPE = auto()     # Reshape (view); attrs["shape"]
+    # --- Shape / data movement (50–59) ---
+    RESHAPE   = 50       # attrs["shape"]
+    TRANSPOSE = 51       # 2D swap or N-dim swapaxes
+    PERMUTE   = 52       # attrs["axes"]
+    SLICE     = 53       # attrs["byte_offset"]
+    EMBEDDING = 54       # inputs: [indices, weight_table]
 
-    LAYERNORM = auto()   # LayerNorm; attrs["eps"], inputs: [x, weight, bias]
+    # --- Normalization / compound (60–69) ---
+    LAYERNORM = 60       # attrs["eps"], inputs: [x, weight, bias]
 
-    # --- Fused ops (values 15+) ---
-    MATMUL_ADD = auto()         # Fused matmul + bias add; inputs: [A, B, bias]
-    FUSED_BIAS_RELU = auto()    # Fused bias add + relu; inputs: [x, bias]
-    ATTENTION = auto()          # Fused multi-head attention; inputs: [Q, K, V], scratch: [BH × S × S]
+    # --- Fused ops (70–79) ---
+    MATMUL_ADD      = 70 # inputs: [A, B, bias]
+    FUSED_BIAS_RELU = 71 # inputs: [x, bias]
+    ATTENTION       = 72 # inputs: [Q, K, V], scratch: [BH × S × S]
 
-    # --- GPT-2 ops (values 18-22) ---
-    SLICE = auto()           # Zero-copy slice; attrs["byte_offset"]
-    POW = auto()             # Element-wise power; attrs["scalar"]
-    TANH = auto()            # Element-wise tanh
-    GELU = auto()            # GELU activation (tanh approximation)
-    EMBEDDING = auto()       # Table lookup; inputs: [indices, weight_table]
-
-    # --- Mask/infrastructure ops (values 23+, constant-folded away) ---
-    CAST = auto()           # Type cast; attrs["target_dtype"]
-    EXPAND = auto()         # Broadcast expand; attrs["shape"]
-    SLICE_TENSOR = auto()   # Direct tensor slice; attrs["dim", "start", "end"]
-    DIFF = auto()           # torch.diff; attrs["n", "dim"], optional prepend input
-    CMP_NE = auto()         # Not-equal comparison; attrs["scalar"] or 2-input
-    CMP_LE = auto()         # Less-than-or-equal; 2-input
-    CMP_EQ = auto()         # Equality comparison; 2-input
-    CUMSUM = auto()         # Cumulative sum; attrs["dim"]
-    BITWISE_AND = auto()    # Bitwise AND; 2-input
-    INDEX = auto()          # Advanced indexing; inputs: [tensor, idx1, idx2, ...]
+    # --- Fold-only (100+, constant-folded away, never dispatched to C) ---
+    CAST         = 100
+    EXPAND       = 101
+    SLICE_TENSOR = 102   # attrs["dim", "start", "end"]
+    DIFF         = 103   # attrs["n", "dim"]
+    CMP_NE       = 104
+    CMP_LE       = 105
+    CMP_EQ       = 106
+    CUMSUM       = 107   # attrs["dim"]
+    BITWISE_AND  = 108
+    INDEX        = 109
 
 
 @dataclass

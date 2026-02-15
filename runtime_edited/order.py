@@ -1,6 +1,22 @@
 
 
 
+"""Memory-aware topological ordering variants for comparison.
+
+Three implementations exist for evaluation:
+  v1: compute-once-at-push (simple, stale scores)
+  v2: lazy re-score (recommended)
+  v3: event-driven (most complex)
+"""
+
+from collections import defaultdict
+import heapq
+
+from .ir import Graph, Node
+from .ops import OP_REGISTRY
+from .planner import _tensor_size, _resolve_alias
+
+
 def _memory_aware_order(graph: Graph) -> list[Node]:
     """Topological sort that prefers scheduling nodes which free the most memory.
 

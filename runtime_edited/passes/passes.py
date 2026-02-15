@@ -333,12 +333,13 @@ def eliminate_dead_code(graph: Graph) -> bool:
 # Default pipeline
 # ---------------------------------------------------------------------------
 
-from .fusion import fuse
+from .fusion import fuse, fuse_dags
 
 DEFAULT_PIPELINE.extend([
     absorb_into_matmul,
     constant_fold,
     absorb_mask_into_attention,
+    fuse_dags,
     fuse,
     eliminate_dead_code,
 ])

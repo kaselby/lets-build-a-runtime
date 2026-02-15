@@ -96,7 +96,7 @@ class COpNode(ctypes.Structure):
 
 def _load_c_executor() -> ctypes.CDLL | None:
     """Try to load the compiled C executor library."""
-    csrc_dir = Path(__file__).parent.parent.parent / "csrc"
+    csrc_dir = Path(__file__).parent.parent.parent / "csrc_edited"
     if sys.platform == "darwin":
         lib_path = csrc_dir / "libexecutor.dylib"
     else:
