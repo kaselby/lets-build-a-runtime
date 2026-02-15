@@ -2,7 +2,7 @@
 
 Uses numpy's `out=` parameter to write directly into pre-allocated
 arena buffers — no temporary allocations, no copies. These are
-separate from the constant folding evaluators in passes.py, which
+separate from the constant folding evaluators in ops.py, which
 need the return-a-new-array contract.
 """
 

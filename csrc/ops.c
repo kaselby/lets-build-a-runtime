@@ -723,3 +723,26 @@ void kernel_embedding(const long* ids, const float* table, float* out,
     }
 }
 
+/* ----------------------------------------------------------------
+ * SLICE: strided copy along a non-contiguous dimension
+ *   x: logically [outer x orig_dim_size x inner]
+ *   out: [outer x slice_len x inner]
+ *
+ *   For each outer slice, copies slice_len contiguous chunks of
+ *   `inner` floats starting at offset `start` in the sliced dim.
+ *   Contiguous slices (dim=0) are zero-copy aliases handled by
+ *   Python — this kernel only runs for dim>0.
+ * ---------------------------------------------------------------- */
+void kernel_slice(const float* x, float* out,
+                  int outer, int orig_dim_size, int start,
+                  int slice_len, int inner) {
+    int src_stride = orig_dim_size * inner;
+    int dst_stride = slice_len * inner;
+    int copy_bytes = slice_len * inner * (int)sizeof(float);
+    for (int o = 0; o < outer; o++) {
+        memcpy(out + o * dst_stride,
+               x + o * src_stride + start * inner,
+               copy_bytes);
+    }
+}
+

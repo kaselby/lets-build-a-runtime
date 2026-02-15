@@ -23,7 +23,7 @@ INT_PTR = ctypes.POINTER(ctypes.c_int)
 
 def _load_library() -> ctypes.CDLL | None:
     """Try to load the compiled C library."""
-    csrc_dir = Path(__file__).parent.parent.parent / "csrc"
+    csrc_dir = Path(__file__).parent.parent.parent / "csrc_edited"
 
     if sys.platform == "darwin":
         lib_path = csrc_dir / "libruntime.dylib"
@@ -134,6 +134,12 @@ def _load_library() -> ctypes.CDLL | None:
     lib.kernel_embedding.argtypes = [LONG_PTR, FLOAT_PTR, FLOAT_PTR,
                                      ctypes.c_int, ctypes.c_int]
     lib.kernel_embedding.restype = None
+
+    # Slice: (x, out, outer, orig_dim_size, start, slice_len, inner)
+    lib.kernel_slice.argtypes = [FLOAT_PTR, FLOAT_PTR,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int]
+    lib.kernel_slice.restype = None
 
     return lib
 
@@ -573,6 +579,29 @@ def _wrap_embedding(lib: ctypes.CDLL) -> KernelFn:
     return kernel
 
 
+def _wrap_slice(lib: ctypes.CDLL) -> KernelFn:
+    """Wrap kernel_slice: strided copy for non-contiguous slices.
+
+    attrs must contain dim, start, end. Contiguous (dim=0) slices are
+    handled as aliases — this kernel only runs for dim>0.
+    """
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        x = inputs[0]
+        dim = attrs["dim"]
+        start = attrs["start"]
+        end = attrs["end"]
+        outer = 1
+        for d in x.shape[:dim]:
+            outer *= d
+        inner = 1
+        for d in x.shape[dim + 1:]:
+            inner *= d
+        lib.kernel_slice(_as_ptr(x), _as_ptr(output),
+                         outer, x.shape[dim], start, end - start, inner)
+    return kernel
+
+
 class CBackend:
     """Backend that dispatches to compiled C kernels."""
     name = "c_cpu"
@@ -602,6 +631,7 @@ class CBackend:
                 OpType.TANH: _wrap_tanh(self._lib),
                 OpType.GELU: _wrap_gelu(self._lib),
                 OpType.EMBEDDING: _wrap_embedding(self._lib),
+                OpType.SLICE: _wrap_slice(self._lib),
             }
 
     @property

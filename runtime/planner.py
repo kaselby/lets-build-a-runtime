@@ -12,12 +12,14 @@ arena allocations for them. The executor passes scratch as an extra
 kernel input, transparent to the graph IR.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Callable
+import heapq
 
 import numpy as np
 
 from .ir import Graph, Node, OpType
+from .ops import OP_REGISTRY
 
 
 @dataclass
@@ -45,110 +47,316 @@ class Lifetime:
     dies: int       # index in execution order where last consumer runs
 
 
+
 # ---------------------------------------------------------------------------
-# Scratch buffer registry
+# Memory-aware topological ordering
 # ---------------------------------------------------------------------------
 
-# Calculator signature: (input_shapes, output_shape, attrs) -> bytes needed.
-# Return 0 for no scratch. The planner calls this for every node whose
-# op type has a registered calculator.
-ScratchCalculator = Callable[[list[tuple[int, ...]], tuple[int, ...], dict], int]
-SCRATCH_CALCULATORS: dict[OpType, ScratchCalculator] = {}
+def _tensor_size(graph: Graph, name: str) -> int:
+    """Compute the size in bytes of a tensor."""
+    tensor = graph.tensors[name]
+    return int(np.prod(tensor.shape)) * np.dtype(tensor.dtype).itemsize
 
 
-def register_scratch(op: OpType, calc: ScratchCalculator) -> None:
-    """Register a scratch size calculator for an op type."""
-    SCRATCH_CALCULATORS[op] = calc
+def _memory_aware_order(graph: Graph) -> list[Node]:
+    """Topological sort that prefers scheduling nodes which free the most memory.
 
+    Standard Kahn's algorithm, but when multiple nodes are ready (in-degree 0),
+    we pick the one whose scheduling frees the most input memory. "Frees" means
+    this node is the last remaining consumer of an input tensor — once scheduled,
+    that tensor's memory can be reused.
 
-FLASH_BR = 32
-FLASH_BC = 32
-
-
-def _attention_scratch(input_shapes: list[tuple[int, ...]], output_shape: tuple[int, ...],
-                       attrs: dict) -> int:
-    """Scratch for fused attention: one score matrix per batch×head slice.
-
-    Inputs are [Q, K, V] each shaped [..., seq_len, head_dim] where leading
-    dims are batch (e.g. [BH, S, D] or [B, H, S, D] — memory layout is identical).
-    Each GCD thread gets its own scratch region so they can run in parallel
-    without synchronization.
-
-    Standard kernel needs S×S per slice (full attention matrix).
-    Flash kernel needs B_r×B_c per slice (one tile).
+    This tends to complete one computation chain before starting another,
+    reducing peak memory compared to arbitrary topological orders.
     """
-    q_shape = input_shapes[0]
-    batch_heads = 1
-    for d in q_shape[:-2]:
-        batch_heads *= d
-    seq_len = q_shape[-2]
-    if attrs.get("flash"):
-        scratch_per_slice = FLASH_BR * FLASH_BC
-    else:
-        scratch_per_slice = seq_len * seq_len
-    return batch_heads * scratch_per_slice * 4  # float32
+    # Compute in-degrees (only count edges from other nodes, not external tensors)
+    in_degree: dict[int, int] = {}
+    for node in graph.nodes.values():
+        in_degree[node.id] = sum(1 for t in node.inputs if t in graph._producer)
 
-register_scratch(OpType.ATTENTION, _attention_scratch)
+    # Track remaining consumers for each tensor (how many nodes still need to read it)
+    remaining_consumers: dict[str, int] = defaultdict(int)
+    for node in graph.nodes.values():
+        for inp in node.inputs:
+            remaining_consumers[inp] += 1
+
+    external = set(graph.inputs) | set(graph.constants)
+
+    def _freed_bytes(node: Node) -> int:
+        """Estimate bytes freed by scheduling this node."""
+        freed = 0
+        for inp in node.inputs:
+            if inp not in external and remaining_consumers[inp] == 1:
+                freed += _tensor_size(graph, inp)
+        return freed
+
+    # Seed the heap with zero-in-degree nodes
+    # Heap entries: (-freed_bytes, node_id) — negate for max-heap behavior
+    ready = []
+    for nid, deg in in_degree.items():
+        if deg == 0:
+            node = graph.nodes[nid]
+            heapq.heappush(ready, (-_freed_bytes(node), nid))
+
+    order: list[Node] = []
+    while ready:
+        _, nid = heapq.heappop(ready)
+        node = graph.nodes[nid]
+        order.append(node)
+
+        # Update remaining consumer counts for this node's inputs
+        for inp in node.inputs:
+            remaining_consumers[inp] -= 1
+
+        # Decrement in-degree for consumers of this node's output
+        for consumer_id in graph._consumers.get(node.output, []):
+            in_degree[consumer_id] -= 1
+            if in_degree[consumer_id] == 0:
+                consumer = graph.nodes[consumer_id]
+                heapq.heappush(ready, (-_freed_bytes(consumer), consumer_id))
+
+    return order
 
 
-def _compute_scratch(order: list[Node], graph: Graph) -> tuple[list[Lifetime], dict[int, tuple[str, int]]]:
-    """Compute scratch buffer requirements for nodes that need workspace.
+# ---------------------------------------------------------------------------
+# Alias resolution (graph-level only — follows alias ops in producer chain)
+# ---------------------------------------------------------------------------
+
+def _resolve_alias(name: str, graph: Graph) -> str:
+    """Walk alias chain in the graph to the non-alias producer.
+
+    Only follows graph-level aliases (RESHAPE, contiguous SLICE) — not
+    planner-level in-place decisions. Used for consumer counting, where
+    we need graph-structural relationships regardless of in-place choices.
+    """
+    while True:
+        producer = graph.producer(name)
+        if producer is None:
+            break
+        op_def = OP_REGISTRY.get(producer.op)
+        if op_def is None or not op_def.is_alias(producer):
+            break
+        name = producer.inputs[0]
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Lifetime analysis (unified alias + in-place sharing)
+# ---------------------------------------------------------------------------
+
+def _compute_lifetimes(
+    graph: Graph, order: list[Node]
+) -> tuple[dict[str, Lifetime], dict[str, str]]:
+    """Compute lifetimes with unified alias and in-place memory sharing.
+
+    A single pass over the execution order handles both:
+      - Alias ops (RESHAPE): unconditionally share input's memory
+      - In-place ops (elementwise): share if input is dying and same byte size
+
+    Both result in the same thing: the output doesn't get its own arena space,
+    and the root tensor's lifetime extends to cover the output's consumers.
 
     Returns:
-        scratch_lifetimes: Lifetime entries (single-step) for first-fit allocation.
+        lifetimes: tensor name -> Lifetime for arena-owning tensors only.
+        memory_root: tensor name -> arena-owning root for shared tensors.
+    """
+    external = set(graph.inputs) | set(graph.constants)
+
+    # memory_root[name] = the tensor that owns this name's arena memory.
+    # Absent = owns its own memory.
+    memory_root: dict[str, str] = {}
+
+    def get_root(name: str) -> str:
+        """Follow the full sharing chain (alias + in-place) to the arena owner."""
+        while name in memory_root:
+            name = memory_root[name]
+        return name
+
+    # Precompute total consumers per graph-level tensor (alias-resolved only).
+    # In-place decisions depend on knowing when a tensor's last graph consumer
+    # runs, so this must be computed before the main pass.
+    total_consumers: dict[str, int] = defaultdict(int)
+    for node in order:
+        for inp in node.inputs:
+            total_consumers[_resolve_alias(inp, graph)] += 1
+
+    consumed: dict[str, int] = defaultdict(int)
+    born_at: dict[str, int] = {}
+    dies_at: dict[str, int] = {}
+
+    for step, node in enumerate(order):
+        # Update graph-level consumed counts (alias-resolved, not in-place-resolved)
+        for inp in node.inputs:
+            consumed[_resolve_alias(inp, graph)] += 1
+
+        # Extend memory root's death to this step for all inputs
+        for inp in node.inputs:
+            root = get_root(_resolve_alias(inp, graph))
+            if root not in external:
+                dies_at[root] = step
+
+        if node.output in external:
+            continue
+
+        op_def = OP_REGISTRY.get(node.op)
+
+        # Alias: unconditionally share input's memory
+        if op_def is not None and op_def.is_alias(node):
+            alias_input = _resolve_alias(node.inputs[0], graph)
+            memory_root[node.output] = get_root(alias_input)
+            continue
+
+        # In-place: share if input is dying and same byte size
+        if op_def is not None and op_def.inplace and node.inputs:
+            alias_input = _resolve_alias(node.inputs[0], graph)
+            if (alias_input not in external
+                    and consumed[alias_input] == total_consumers[alias_input]
+                    and _tensor_size(graph, alias_input) == _tensor_size(graph, node.output)):
+                memory_root[node.output] = get_root(alias_input)
+                continue
+
+        # This output gets its own arena allocation
+        born_at[node.output] = step
+
+    # Build Lifetime objects for arena-owning tensors
+    lifetimes: dict[str, Lifetime] = {}
+    for name in born_at:
+        lifetimes[name] = Lifetime(
+            tensor_name=name,
+            size_bytes=_tensor_size(graph, name),
+            born=born_at[name],
+            dies=dies_at.get(name, born_at[name]),
+        )
+
+    return lifetimes, memory_root
+
+
+# ---------------------------------------------------------------------------
+# Scratch buffers
+# ---------------------------------------------------------------------------
+
+def _compute_scratch(order: list[Node], graph: Graph) -> tuple[dict[str, Lifetime], dict[int, tuple[str, int]]]:
+    """Compute scratch buffer requirements for nodes that need workspace.
+
+    Scratch buffers are single-step lifetimes (born and die at the same step)
+    so they participate in the same first-fit allocation as regular tensors.
+
+    Returns:
+        scratch_lifetimes: Lifetime dict for first-fit allocation.
         scratch_info: node_id -> (scratch_name, size_bytes) for the executor.
     """
-    scratch_lifetimes: list[Lifetime] = []
+    scratch_lifetimes: dict[str, Lifetime] = {}
     scratch_info: dict[int, tuple[str, int]] = {}
 
     for step, node in enumerate(order):
-        calc = SCRATCH_CALCULATORS.get(node.op)
-        if calc is None:
+        op_def = OP_REGISTRY.get(node.op)
+        if op_def is None or op_def.scratch is None:
             continue
 
         input_shapes = [graph.tensors[inp].shape for inp in node.inputs]
         output_shape = graph.tensors[node.output].shape
-        size_bytes = calc(input_shapes, output_shape, node.attrs)
+        size_bytes = op_def.scratch(input_shapes, output_shape, node.attrs)
 
         if size_bytes <= 0:
             continue
 
         scratch_name = f"__scratch_{node.id}"
-        scratch_lifetimes.append(Lifetime(
+        scratch_lifetimes[scratch_name] = Lifetime(
             tensor_name=scratch_name,
             size_bytes=size_bytes,
             born=step,
             dies=step,
-        ))
+        )
         scratch_info[node.id] = (scratch_name, size_bytes)
 
     return scratch_lifetimes, scratch_info
 
 
+# ---------------------------------------------------------------------------
+# Arena offset assignment
+# ---------------------------------------------------------------------------
+
+def _assign_offsets(lifetimes: dict[str, Lifetime], n_steps: int) -> tuple[dict[str, int], int]:
+    """Assign arena offsets using greedy first-fit with an active set.
+
+    Walks execution steps in order, maintaining only the currently-alive
+    allocations. Tensors are added to the active set at birth and evicted
+    after their last consumer runs.
+
+    Returns (offsets dict, total arena size in bytes).
+    """
+    # Group by birth step
+    born_at: dict[int, list[str]] = defaultdict(list)
+    for name, lt in lifetimes.items():
+        born_at[lt.born].append(name)
+
+    # Group by eviction step (one past death — alive through dies, freed after)
+    evict_at: dict[int, list[str]] = defaultdict(list)
+    for name, lt in lifetimes.items():
+        evict_at[lt.dies + 1].append(name)
+
+    active: dict[str, tuple[int, int]] = {}  # name -> (offset, size)
+    offsets: dict[str, int] = {}
+    arena_size = 0
+
+    for step in range(n_steps):
+        # Evict tensors whose lifetime ended before this step
+        for name in evict_at.get(step, []):
+            active.pop(name, None)
+
+        # Allocate tensors born at this step
+        for name in born_at.get(step, []):
+            lt = lifetimes[name]
+            regions = sorted(active.values())
+            offset = _first_fit(regions, lt.size_bytes)
+            offsets[name] = offset
+            active[name] = (offset, lt.size_bytes)
+            arena_size = max(arena_size, offset + lt.size_bytes)
+
+    return offsets, arena_size
+
+
+def _first_fit(alive_regions: list[tuple[int, int]], size: int) -> int:
+    """Find the lowest offset where `size` bytes fit without overlapping alive regions."""
+    candidate = 0
+    for region_offset, region_size in alive_regions:
+        if candidate + size <= region_offset:
+            return candidate
+        candidate = max(candidate, region_offset + region_size)
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Plan
+# ---------------------------------------------------------------------------
+
 def plan(graph: Graph) -> ExecutionPlan:
     """Analyze a graph and produce an execution plan with memory layout.
 
     Computes tensor lifetimes from the topological order, then assigns
-    arena offsets using a greedy first-fit algorithm. RESHAPE nodes are
-    treated as zero-copy aliases — their outputs share the input's arena
-    region and RESHAPE is stripped from the execution order.
+    arena offsets using a greedy first-fit algorithm. Alias ops (RESHAPE)
+    and in-place ops (elementwise) share their input's arena memory.
     """
     errors = graph.validate()
     if errors:
         raise ValueError(f"Cannot plan invalid graph: {errors}")
 
-    order = list(graph)  # topological order (uses cached order from validate)
+    order = _memory_aware_order(graph)
 
-    # Identify RESHAPE aliases — outputs share their input's arena memory
-    aliases = _find_reshape_aliases(order)
+    lifetimes, memory_root = _compute_lifetimes(graph, order)
 
-    lifetimes = _compute_lifetimes(graph, order, aliases)
-
-    # Compute scratch requirements and add to lifetimes for unified first-fit
     scratch_lifetimes, scratch_info = _compute_scratch(order, graph)
-    all_lifetimes = lifetimes + scratch_lifetimes
+    all_lifetimes = {**lifetimes, **scratch_lifetimes}
 
-    all_offsets, arena_size = _assign_offsets(all_lifetimes)
+    all_offsets, arena_size = _assign_offsets(all_lifetimes, n_steps=len(order))
+
+    # Copy offsets for shared tensors (alias + in-place)
+    for name, root in memory_root.items():
+        # Follow chain to the arena-owning root
+        while root in memory_root:
+            root = memory_root[root]
+        if root in all_offsets:
+            all_offsets[name] = all_offsets[root]
 
     # Separate scratch offsets from regular tensor offsets
     scratch_names = {name for name, _ in scratch_info.values()}
@@ -165,124 +373,3 @@ def plan(graph: Graph) -> ExecutionPlan:
         offsets=offsets,
         scratch=scratch,
     )
-
-
-def _find_reshape_aliases(order: list[Node]) -> dict[str, tuple[str, int]]:
-    """Build a map of RESHAPE/SLICE output tensors to their root input and byte offset.
-
-    RESHAPE aliases have offset 0 (same start as input).
-    SLICE aliases are only created for contiguous splits (no dim attr or
-    dim=0), where the byte_offset flat-view approach works. Non-contiguous
-    SLICE outputs (splits along non-leading dims) need their own arena space
-    and are handled as copies by the executor.
-    Follows chains: if A → RESHAPE → B → RESHAPE → C, both B and C
-    map to (A, 0). This ensures all aliases point to the tensor that
-    actually needs arena space.
-    """
-    aliases: dict[str, tuple[str, int]] = {}
-    for node in order:
-        if node.op == OpType.RESHAPE:
-            input_name = node.inputs[0]
-            root, base_offset = aliases.get(input_name, (input_name, 0))
-            aliases[node.output] = (root, base_offset)
-        elif node.op == OpType.SLICE:
-            # Only alias if the split produces a contiguous view (no dim attr
-            # means legacy byte_offset-only, or dim=0 where chunks are contiguous)
-            dim = node.attrs.get("dim")
-            if dim is None or dim == 0:
-                input_name = node.inputs[0]
-                root, base_offset = aliases.get(input_name, (input_name, 0))
-                byte_offset = node.attrs.get("byte_offset", 0)
-                aliases[node.output] = (root, base_offset + byte_offset)
-    return aliases
-
-
-def _compute_lifetimes(graph: Graph, order: list[Node],
-                       aliases: dict[str, tuple[str, int]] | None = None) -> list[Lifetime]:
-    """Compute the lifetime of each intermediate tensor.
-
-    Inputs and constants are excluded — they live outside the arena.
-    Aliases (from RESHAPE/SLICE) are resolved to their root tensor,
-    extending the root's lifetime to cover the alias's consumers.
-    """
-    aliases = aliases or {}
-    external = set(graph.inputs) | set(graph.constants)
-
-    # Map tensor name -> index in execution order where it's produced
-    born_at: dict[str, int] = {}
-    # Map tensor name -> index of last consumer
-    dies_at: dict[str, int] = {}
-
-    alias_set = set(aliases.keys())
-
-    for step, node in enumerate(order):
-        # RESHAPE/SLICE outputs don't get arena space — skip them.
-        # Non-alias outputs are born at this step.
-        if node.output not in external and node.output not in alias_set:
-            born_at[node.output] = step
-
-        # Each input tensor's death is extended to at least this step.
-        # Resolve aliases so consuming a reshaped/sliced tensor extends
-        # the root tensor's lifetime.
-        for inp in node.inputs:
-            root, _offset = aliases.get(inp, (inp, 0))
-            if root not in external:
-                dies_at[root] = step
-
-    # Build Lifetime objects for all intermediate tensors
-    lifetimes = []
-    for name in born_at:
-        tensor = graph.tensors[name]
-        dtype = np.dtype(tensor.dtype)
-        size_bytes = int(np.prod(tensor.shape)) * dtype.itemsize
-        lifetimes.append(Lifetime(
-            tensor_name=name,
-            size_bytes=size_bytes,
-            born=born_at[name],
-            dies=dies_at.get(name, born_at[name]),  # if never consumed, dies at birth
-        ))
-
-    return lifetimes
-
-
-def _assign_offsets(lifetimes: list[Lifetime]) -> tuple[dict[str, int], int]:
-    """Assign arena offsets using greedy first-fit.
-
-    Process tensors in birth order. For each new tensor, filter existing
-    allocations to only those whose lifetimes overlap (i.e., are alive at
-    the same time). Then find the lowest offset where the new tensor fits
-    in the gaps between those live allocations.
-
-    Returns (offsets dict, total arena size in bytes).
-    """
-    lifetimes.sort(key=lambda lt: lt.born)
-
-    allocations: list[tuple[int, int, Lifetime]] = []  # (offset, size, lifetime)
-    offsets: dict[str, int] = {}
-    arena_size = 0
-
-    for lt in lifetimes:
-        # Only consider allocations whose lifetimes overlap with this tensor
-        alive = [
-            (offset, size) for offset, size, alt in allocations
-            if lt.born <= alt.dies and alt.born <= lt.dies
-        ]
-        alive.sort()  # sort by offset
-
-        offset = _first_fit(alive, lt.size_bytes)
-
-        offsets[lt.tensor_name] = offset
-        allocations.append((offset, lt.size_bytes, lt))
-        arena_size = max(arena_size, offset + lt.size_bytes)
-
-    return offsets, arena_size
-
-
-def _first_fit(alive_regions: list[tuple[int, int]], size: int) -> int:
-    """Find the lowest offset where `size` bytes fit without overlapping alive regions."""
-    candidate = 0
-    for region_offset, region_size in alive_regions:
-        if candidate + size <= region_offset:
-            return candidate  # fits in the gap before this region
-        candidate = max(candidate, region_offset + region_size)
-    return candidate  # fits at the end
