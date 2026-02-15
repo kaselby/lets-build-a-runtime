@@ -7,20 +7,21 @@ one C function call. No Python-level dispatch, no kernel resolution.
 
 import ctypes
 import struct
+import time
 
 import numpy as np
 
 from ..ir import Graph, Node, OpType
 from ..ops import OP_REGISTRY
 from ..planner import ExecutionPlan
-from .common import COpNode, Executor, MAX_INPUTS, MAX_DIMS, _c_executor_lib
+from .common import COpNode, Executor, RunProfile, MAX_INPUTS, MAX_DIMS, _c_executor_lib
 
 
 class CompiledExecutor(Executor):
     """Compiles an execution plan into a C struct array for fast dispatch."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, profile: bool = False) -> None:
+        super().__init__(profile=profile)
         # Set during compile()
         self._nodes: ctypes.Array | None = None
         self._n_nodes: int = 0
@@ -81,7 +82,13 @@ class CompiledExecutor(Executor):
                 self._nodes[node_idx].inputs[slot_idx] = ptr
 
         # One call
-        _c_executor_lib.execute(self._nodes, self._n_nodes)
+        if self._profile:
+            t0 = time.perf_counter_ns()
+            _c_executor_lib.execute(self._nodes, self._n_nodes)
+            total_ns = time.perf_counter_ns() - t0
+            self._last_profile = RunProfile(total_ns=total_ns)
+        else:
+            _c_executor_lib.execute(self._nodes, self._n_nodes)
 
         # Copy outputs (caller shouldn't hold arena views)
         return {

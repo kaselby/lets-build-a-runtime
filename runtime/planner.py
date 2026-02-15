@@ -53,6 +53,49 @@ class PlannerConfig:
     enable_aliases: bool = True
 
 
+def _fmt_bytes(n: int) -> str:
+    """Format a byte count as a human-readable string."""
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+
+@dataclass
+class PlanStats:
+    """Summary statistics from the memory planner."""
+    arena_bytes: int          # total arena allocation
+    naive_bytes: int          # sum of all intermediate sizes (no reuse)
+    n_intermediates: int      # total intermediate tensors
+    n_allocated: int          # tensors with own arena slot
+    n_shared: int             # tensors sharing memory (alias + in-place)
+    scratch_bytes: int        # total scratch workspace
+    weight_bytes: int         # total constant/weight data
+
+    @property
+    def reuse_savings_bytes(self) -> int:
+        return self.naive_bytes - self.arena_bytes
+
+    @property
+    def reuse_savings_pct(self) -> float:
+        if self.naive_bytes == 0:
+            return 0.0
+        return self.reuse_savings_bytes / self.naive_bytes * 100
+
+    def __str__(self) -> str:
+        lines = [
+            "Memory Plan:",
+            f"  Arena:          {_fmt_bytes(self.arena_bytes)}",
+            f"  Naive (no reuse): {_fmt_bytes(self.naive_bytes)}",
+            f"  Savings:        {_fmt_bytes(self.reuse_savings_bytes)} ({self.reuse_savings_pct:.1f}%)",
+            f"  Intermediates:  {self.n_intermediates} tensors ({self.n_allocated} allocated, {self.n_shared} shared)",
+            f"  Scratch:        {_fmt_bytes(self.scratch_bytes)}",
+            f"  Weights:        {_fmt_bytes(self.weight_bytes)}",
+        ]
+        return "\n".join(lines)
+
+
 @dataclass
 class ExecutionPlan:
     """Everything needed to execute a graph: execution order + memory layout."""
@@ -63,6 +106,7 @@ class ExecutionPlan:
     # Scratch workspace: node ID -> (arena byte offset, size in bytes)
     # Allocated by the planner for ops that need temporary workspace.
     scratch: dict[int, tuple[int, int]] = field(default_factory=dict)
+    stats: PlanStats | None = None
 
     def allocate_arena(self) -> np.ndarray:
         """Allocate the arena buffer."""
@@ -472,10 +516,30 @@ def plan(graph: Graph, config: PlannerConfig | None = None) -> ExecutionPlan:
         for node_id, (scratch_name, size_bytes) in scratch_info.items()
     }
 
+    # Compute stats while we still have access to lifetimes and memory_root
+    external = set(graph.inputs) | set(graph.constants)
+    intermediate_names = [
+        name for name in graph.tensors if name not in external
+    ]
+    naive_bytes = sum(_tensor_size(graph, n) for n in intermediate_names)
+    scratch_bytes = sum(size for _, size in scratch_info.values())
+    weight_bytes = sum(_tensor_size(graph, n) for n in graph.constants)
+
+    stats = PlanStats(
+        arena_bytes=arena_size,
+        naive_bytes=naive_bytes,
+        n_intermediates=len(intermediate_names),
+        n_allocated=len(lifetimes),
+        n_shared=len(memory_root),
+        scratch_bytes=scratch_bytes,
+        weight_bytes=weight_bytes,
+    )
+
     return ExecutionPlan(
         graph=graph,
         order=order,
         arena_size=arena_size,
         offsets=offsets,
         scratch=scratch,
+        stats=stats,
     )

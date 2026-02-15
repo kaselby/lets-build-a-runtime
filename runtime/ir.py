@@ -8,9 +8,11 @@ Inputs and constants (weights) are tensors without producer nodes, not
 virtual nodes. Every node in the graph is a real compute operation.
 """
 
-from collections import deque
+import json
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
@@ -241,6 +243,191 @@ class Graph:
             if len(order) != len(self.nodes):
                 raise ValueError("Graph has a cycle")
             yield from order
+
+    # --- Summary ---
+
+    def summary(self) -> str:
+        """Human-readable summary of the graph structure."""
+        n_nodes = len(self.nodes)
+        n_tensors = len(self.tensors)
+        header = (f"Graph: {n_nodes} nodes, {n_tensors} tensors "
+                  f"({len(self.inputs)} inputs, {len(self.constants)} constants, "
+                  f"{len(self.outputs)} outputs)")
+
+        op_counts = Counter(node.op.name for node in self.nodes.values())
+        ops_str = ", ".join(f"{name}: {cnt}" for name, cnt in op_counts.most_common())
+
+        def _tensor_desc(name: str) -> str:
+            t = self.tensors[name]
+            shape_str = "x".join(str(d) for d in t.shape)
+            return f"{name} [{shape_str}] {t.dtype}"
+
+        inputs_str = ", ".join(_tensor_desc(n) for n in self.inputs)
+        outputs_str = ", ".join(_tensor_desc(n) for n in self.outputs)
+
+        lines = [header, f"  Ops:     {ops_str}"]
+        if self.inputs:
+            lines.append(f"  Inputs:  {inputs_str}")
+        if self.outputs:
+            lines.append(f"  Outputs: {outputs_str}")
+        return "\n".join(lines)
+
+    def dump(self) -> str:
+        """Full node-by-node graph listing in topological order."""
+        lines = [self.summary(), ""]
+        for node in self._toposort():
+            shape = self.tensors[node.output].shape
+            shape_str = "x".join(str(d) for d in shape)
+            inputs_str = ", ".join(node.inputs)
+            attrs_str = ""
+            if node.attrs:
+                parts = [f"{k}={v}" for k, v in node.attrs.items()]
+                attrs_str = "  " + ", ".join(parts)
+            lines.append(
+                f"  [{node.id:>3}] {node.op.name:<20} "
+                f"{inputs_str} -> {node.output} ({shape_str}){attrs_str}"
+            )
+        return "\n".join(lines)
+
+    # --- Serialization ---
+
+    def to_dict(self) -> dict:
+        """Serialize graph structure to a plain dict (no weight data).
+
+        Nodes are emitted in topological order for determinism.
+        """
+        nodes = []
+        for node in self._toposort():
+            nodes.append({
+                "id": node.id,
+                "op": node.op.name,
+                "inputs": node.inputs,
+                "output": node.output,
+                "attrs": node.attrs,
+            })
+
+        tensors = {}
+        for name, info in self.tensors.items():
+            tensors[name] = {
+                "shape": list(info.shape),
+                "dtype": info.dtype,
+            }
+
+        return {
+            "nodes": nodes,
+            "tensors": tensors,
+            "inputs": self.inputs,
+            "constants": self.constants,
+            "outputs": self.outputs,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Graph":
+        """Reconstruct a Graph from a dict (no weight data).
+
+        Constants will have shape/dtype metadata but buffer=None.
+        """
+        graph = cls()
+
+        for name, info in d["tensors"].items():
+            graph.add_tensor(name, tuple(info["shape"]), info["dtype"])
+
+        graph.inputs = d["inputs"]
+        graph.constants = d["constants"]
+        graph.outputs = d["outputs"]
+
+        for node_d in d["nodes"]:
+            op = OpType[node_d["op"]]
+            graph.add_node(op, node_d["inputs"], node_d["output"],
+                           node_d.get("attrs"))
+
+        return graph
+
+    def save(self, path: str | Path) -> None:
+        """Save graph to disk: {path}.json (topology) + {path}.weights (data).
+
+        The JSON file contains the full graph structure (nodes, tensors,
+        connectivity, attrs) and a weight manifest with byte offsets into
+        the binary weights file. Human-readable for inspection and diffing.
+
+        The weights file is only written if constants have buffers loaded.
+        On load, if the weights file is missing, constants get buffer=None.
+
+        Args:
+            path: Stem/prefix — writes {path}.json and {path}.weights.
+        """
+        path = Path(path)
+
+        def _default(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            if isinstance(obj, np.floating):
+                return float(obj)
+            if isinstance(obj, tuple):
+                return list(obj)
+            raise TypeError(f"Not JSON serializable: {type(obj)}")
+
+        d = self.to_dict()
+
+        # Pack weight buffers into a flat binary blob
+        weight_manifest: dict[str, dict] = {}
+        weight_blobs: list[bytes] = []
+        offset = 0
+        for name in self.constants:
+            info = self.tensors[name]
+            if info.buffer is not None:
+                buf = np.ascontiguousarray(info.buffer)
+                raw = buf.tobytes()
+                weight_manifest[name] = {"offset": offset, "size": len(raw)}
+                weight_blobs.append(raw)
+                offset += len(raw)
+
+        d["weights"] = weight_manifest
+
+        with open(path.with_suffix(".json"), "w") as f:
+            json.dump(d, f, indent=2, default=_default)
+
+        if weight_blobs:
+            with open(path.with_suffix(".weights"), "wb") as f:
+                for blob in weight_blobs:
+                    f.write(blob)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Graph":
+        """Load graph from disk: {path}.json + optional {path}.weights.
+
+        If the weights file exists, constant buffers are populated.
+        Otherwise constants have buffer=None (graph is inspectable but
+        not executable).
+
+        Args:
+            path: Stem/prefix — reads {path}.json and {path}.weights.
+        """
+        path = Path(path)
+
+        with open(path.with_suffix(".json")) as f:
+            d = json.load(f)
+
+        graph = cls.from_dict(d)
+
+        # Load weight buffers if the weights file exists
+        weights_path = path.with_suffix(".weights")
+        weight_manifest = d.get("weights", {})
+        if weights_path.exists() and weight_manifest:
+            raw = weights_path.read_bytes()
+            for name, entry in weight_manifest.items():
+                info = graph.tensors.get(name)
+                if info is None:
+                    continue
+                start = entry["offset"]
+                end = start + entry["size"]
+                dtype = np.dtype(info.dtype)
+                info.buffer = np.frombuffer(raw, dtype=dtype,
+                                            offset=start,
+                                            count=int(np.prod(info.shape))
+                                            ).reshape(info.shape).copy()
+
+        return graph
 
     # --- Validation ---
 

@@ -9,6 +9,7 @@ be reordered, repeated, or swapped out. A convenience function runs
 passes until no pass reports changes (fixed-point iteration).
 """
 
+from dataclasses import dataclass
 from typing import Callable
 import numpy as np
 
@@ -23,14 +24,44 @@ Pass = Callable[[Graph], bool]
 DEFAULT_PIPELINE: list[Pass] = []  # Populated after passes are defined
 
 
-def run_pipeline(graph: Graph, pipeline: list[Pass] | None = None) -> None:
-    """Run a list of passes on the graph, once each in order."""
+@dataclass
+class PassResult:
+    """Record of a single optimization pass execution."""
+    name: str
+    changed: bool
+    nodes_before: int
+    nodes_after: int
+
+    def __str__(self) -> str:
+        if self.changed:
+            delta = self.nodes_after - self.nodes_before
+            sign = "+" if delta >= 0 else ""
+            return (f"[pass] {self.name}: {self.nodes_before} -> "
+                    f"{self.nodes_after} nodes ({sign}{delta})")
+        return f"[pass] {self.name}: no changes"
+
+
+def run_pipeline(graph: Graph, pipeline: list[Pass] | None = None,
+                 log: list[PassResult] | None = None) -> None:
+    """Run a list of passes on the graph, once each in order.
+
+    If log is provided, appends a PassResult for each pass.
+    """
     for p in (pipeline or DEFAULT_PIPELINE):
-        p(graph)
+        n_before = len(graph.nodes)
+        changed = p(graph)
+        if log is not None:
+            log.append(PassResult(
+                name=getattr(p, '__name__', str(p)),
+                changed=changed,
+                nodes_before=n_before,
+                nodes_after=len(graph.nodes),
+            ))
 
 
 def run_until_stable(graph: Graph, pipeline: list[Pass] | None = None,
-                     max_iterations: int = 10) -> int:
+                     max_iterations: int = 10,
+                     log: list[PassResult] | None = None) -> int:
     """Run passes repeatedly until none of them make changes.
 
     Returns the number of iterations performed. Useful when passes
@@ -41,7 +72,16 @@ def run_until_stable(graph: Graph, pipeline: list[Pass] | None = None,
     for i in range(max_iterations):
         changed = False
         for p in passes:
-            changed |= p(graph)
+            n_before = len(graph.nodes)
+            result = p(graph)
+            changed |= result
+            if log is not None:
+                log.append(PassResult(
+                    name=getattr(p, '__name__', str(p)),
+                    changed=result,
+                    nodes_before=n_before,
+                    nodes_after=len(graph.nodes),
+                ))
         if not changed:
             return i + 1
     return max_iterations

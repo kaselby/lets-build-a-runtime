@@ -7,6 +7,7 @@ benchmarks, and as a reference implementation.
 Not the primary execution path — see compiled.py for production use.
 """
 
+import time
 from typing import Any, Callable, Protocol
 
 import numpy as np
@@ -14,7 +15,7 @@ import numpy as np
 from ..ir import OpType
 from ..ops import OP_REGISTRY
 from ..planner import ExecutionPlan
-from .common import Executor
+from .common import Executor, OpTiming, RunProfile
 
 
 # Kernel contract: given input buffers and a pre-allocated output buffer,
@@ -34,8 +35,8 @@ class Backend(Protocol):
 class InterpretedExecutor(Executor):
     """Dispatches plan nodes to backend kernels one at a time."""
 
-    def __init__(self, backends: list[Backend]) -> None:
-        super().__init__()
+    def __init__(self, backends: list[Backend], profile: bool = False) -> None:
+        super().__init__(profile=profile)
         self.backends = backends
         self._plan: ExecutionPlan | None = None
 
@@ -52,6 +53,9 @@ class InterpretedExecutor(Executor):
         self._bind_inputs(graph, inputs)
         self._bind_intermediates(graph, plan.offsets, arena)
         external = set(graph.inputs) | set(graph.constants)
+
+        timings: list[OpTiming] = [] if self._profile else None
+        t_total_start = time.perf_counter_ns() if self._profile else 0
 
         for node in plan.order:
             op_def = OP_REGISTRY.get(node.op)
@@ -70,7 +74,23 @@ class InterpretedExecutor(Executor):
                 offset, size_bytes = plan.scratch[node.id]
                 input_buffers.append(arena[offset:offset + size_bytes])
 
-            kernel(input_buffers, graph.tensors[node.output].buffer, node.attrs)
+            if self._profile:
+                t0 = time.perf_counter_ns()
+                kernel(input_buffers, graph.tensors[node.output].buffer, node.attrs)
+                dt = time.perf_counter_ns() - t0
+                timings.append(OpTiming(
+                    node_id=node.id,
+                    op=node.op.name,
+                    time_ns=dt,
+                    output_name=node.output,
+                    output_shape=graph.tensors[node.output].shape,
+                ))
+            else:
+                kernel(input_buffers, graph.tensors[node.output].buffer, node.attrs)
+
+        if self._profile:
+            total_ns = time.perf_counter_ns() - t_total_start
+            self._last_profile = RunProfile(op_timings=timings, total_ns=total_ns)
 
         return {
             name: graph.tensors[name].buffer.copy()
