@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Memory allocation ablation: arena size across different planner strategies.
+"""Memory ablation: planner strategies + baselines (PyTorch, ORT).
 
-Measures peak arena size for various planner configurations and compares against
-PyTorch and ONNX Runtime baselines. Tests incremental strategy improvements to
-identify which optimizations have the most impact.
+For each model config, measures:
+  1. Arena size across all planner strategy combinations (order × fit × sharing)
+  2. PyTorch peak-alive activation memory (torch.profiler)
+  3. ORT peak activation memory (AllocatorGetStats via C API, minus weights)
 
 Run:  python ablation/bench_memory_ablation.py [--configs toy,small,...] [--all]
 """
 
 import argparse
+import logging
 import os
 import sys
 import tempfile
@@ -19,7 +21,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, PROJECT_ROOT)
 
 from runtime.exporter import export_model
 from runtime.passes import run_pipeline
@@ -37,9 +40,15 @@ try:
 except ImportError:
     HAS_TRANSFORMERS = False
 
+try:
+    from ablation.ort_arena_stats import get_ort_arena_stats
+    HAS_ORT_CAPI = True
+except Exception:
+    HAS_ORT_CAPI = False
+
 
 # =====================================================================
-# Models (duplicated from conftest to keep benchmark self-contained)
+# Models
 # =====================================================================
 
 class NaiveTransformerBlock(nn.Module):
@@ -88,15 +97,9 @@ class GPT2Body(nn.Module):
 
 
 def _make_gpt2_body(n_layer=2, n_head=12, n_embd=768):
-    """Create a GPT-2 body model. Returns None if transformers unavailable."""
     if not HAS_TRANSFORMERS:
         return None
-    config = GPT2Config(
-        n_layer=n_layer,
-        n_head=n_head,
-        n_embd=n_embd,
-        vocab_size=50257,
-    )
+    config = GPT2Config(n_layer=n_layer, n_head=n_head, n_embd=n_embd, vocab_size=50257)
     full_model = GPT2LMHeadModel(config)
     full_model.eval()
     body = GPT2Body(full_model)
@@ -126,7 +129,6 @@ ALL_CONFIGS = [
     Config("1B",      2048, 16,  512),
     Config("3B",      3072, 24,  1024),
     Config("7B",      4096, 32,  1024),
-    # GPT-2 body (HuggingFace, 2-layer, causal attention)
     Config("gpt2-s16",  768, 12,  16,  model="gpt2"),
     Config("gpt2-s64",  768, 12,  64,  model="gpt2"),
     Config("gpt2-s256", 768, 12, 256,  model="gpt2"),
@@ -141,10 +143,8 @@ class Strategy:
     def __init__(self, name, order, fit, enable_inplace, enable_aliases):
         self.name = name
         self.config = PlannerConfig(
-            order=order,
-            fit=fit,
-            enable_inplace=enable_inplace,
-            enable_aliases=enable_aliases,
+            order=order, fit=fit,
+            enable_inplace=enable_inplace, enable_aliases=enable_aliases,
         )
 
 
@@ -162,11 +162,83 @@ STRATEGIES = [
 
 
 # =====================================================================
-# PyTorch and ORT baselines
+# Baselines
 # =====================================================================
 
-def pytorch_baseline(graph):
-    """Sum of all intermediate tensor sizes (no reuse)."""
+def _export_onnx(model, x_torch):
+    """Export model to ONNX, suppressing all noise. Returns temp file path."""
+    fd, onnx_path = tempfile.mkstemp(suffix=".onnx")
+    os.close(fd)
+    old_level = logging.getLogger("torch.onnx").level
+    logging.getLogger("torch.onnx").setLevel(logging.ERROR)
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    devnull = open(os.devnull, "w")
+    try:
+        sys.stdout = devnull
+        sys.stderr = devnull
+        with torch.no_grad(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch.onnx.export(model, (x_torch,), onnx_path,
+                              input_names=["input"], output_names=["output"],
+                              opset_version=18)
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        devnull.close()
+        logging.getLogger("torch.onnx").setLevel(old_level)
+    return onnx_path
+
+
+def pytorch_peak_alive(model, x_torch):
+    """Peak simultaneously-alive activation memory during PyTorch eager execution.
+
+    Uses torch.profiler with profile_memory=True, tracking self_cpu_memory_usage
+    (not cpu_memory_usage) to avoid double-counting nested ops (e.g. linear->addmm).
+    Includes deallocation events, so the running sum is the true peak-alive watermark.
+    Weights excluded — profiler only sees allocations during the forward pass.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+        ) as prof:
+            with torch.no_grad():
+                model(x_torch)
+
+    running = 0
+    peak = 0
+    for ev in prof.events():
+        running += ev.self_cpu_memory_usage
+        peak = max(peak, running)
+    return peak
+
+
+def ort_peak_activations(model, x_torch):
+    """ORT peak activation memory via AllocatorGetStats C API.
+
+    Calls ORT's C API directly to get MaxInUse from the session's arena allocator.
+    ORT's arena includes weights, so we subtract model parameter bytes.
+    Returns activation bytes, or None on failure.
+    """
+    if not HAS_ORT or not HAS_ORT_CAPI:
+        return None
+    try:
+        onnx_path = _export_onnx(model, x_torch)
+        stats = get_ort_arena_stats(onnx_path, tuple(x_torch.shape))
+        os.unlink(onnx_path)
+        if "MaxInUse" not in stats:
+            return None
+        max_in_use = int(stats["MaxInUse"])
+        weight_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+        return max_in_use - weight_bytes
+    except Exception as e:
+        print(f"    (ORT C API failed: {e})")
+        return None
+
+
+def intermediates_total(graph):
+    """Sum of all intermediate tensor sizes (no reuse) — upper bound."""
     external = set(graph.inputs) | set(graph.constants)
     total = 0
     for name, info in graph.tensors.items():
@@ -175,103 +247,19 @@ def pytorch_baseline(graph):
     return total
 
 
-def ort_baseline(model, x):
-    """Extract peak memory from ONNX Runtime profiling.
-
-    Uses ORT's enable_mem_pattern + enable_profiling to capture allocation
-    events, then parses the profile JSON for peak memory usage.
-    """
-    if not HAS_ORT:
-        return None
-
-    try:
-        import json
-        import logging
-
-        fd, onnx_path = tempfile.mkstemp(suffix=".onnx")
-        os.close(fd)
-
-        old_level = logging.getLogger("torch.onnx").level
-        logging.getLogger("torch.onnx").setLevel(logging.ERROR)
-        old_stdout, old_stderr = sys.stdout, sys.stderr
-        devnull = open(os.devnull, "w")
-
-        try:
-            sys.stdout = devnull
-            sys.stderr = devnull
-            with torch.no_grad(), warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                torch.onnx.export(model, (x,), onnx_path,
-                                  input_names=["input"], output_names=["output"],
-                                  opset_version=18)
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-            devnull.close()
-            logging.getLogger("torch.onnx").setLevel(old_level)
-
-        # Run with profiling to capture memory allocation events
-        opts = ort.SessionOptions()
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.enable_mem_pattern = True
-        opts.enable_profiling = True
-        opts.intra_op_num_threads = 1
-        opts.log_severity_level = 3
-
-        session = ort.InferenceSession(onnx_path, opts,
-                                       providers=["CPUExecutionProvider"])
-
-        x_np = x.numpy() if isinstance(x, torch.Tensor) else x
-        session.run(None, {"input": x_np})
-
-        profile_path = session.end_profiling()
-        os.unlink(onnx_path)
-
-        # Parse the profile JSON for memory allocation events
-        with open(profile_path) as f:
-            events = json.load(f)
-        os.unlink(profile_path)
-
-        # Track allocations: sum up all "alloc" sizes, subtract "free" sizes,
-        # keep running peak. ORT profile events have "cat" and "args" fields.
-        peak = 0
-        current = 0
-        for event in events:
-            args = event.get("args", {})
-            # ORT memory events have "size" in args
-            if "size" in args:
-                size = int(args["size"])
-                name = event.get("name", "")
-                if "Alloc" in name or "alloc" in name:
-                    current += size
-                    peak = max(peak, current)
-                elif "Free" in name or "free" in name:
-                    current -= size
-
-        # If we didn't find alloc/free events, try alternative: look for
-        # MemoryPattern or activation_memory fields
-        if peak == 0:
-            for event in events:
-                args = event.get("args", {})
-                for key in ("activation_size", "total_size", "peak_size"):
-                    if key in args:
-                        val = int(args[key])
-                        peak = max(peak, val)
-
-        return peak if peak > 0 else None
-
-    except Exception:
-        return None
-
-
 # =====================================================================
 # Benchmark
 # =====================================================================
 
-def run_config(cfg):
-    """Measure arena size across all strategies for a single config."""
+def _fmt(nbytes):
+    if nbytes is None:
+        return "n/a"
+    return f"{nbytes / 1024:,.1f}"
 
-    # Build model
+
+def run_config(cfg):
+    """Measure arena size across all strategies + baselines for a single config."""
+
     is_gpt2 = cfg.model == "gpt2"
     if is_gpt2:
         model = _make_gpt2_body(n_head=cfg.n_heads, n_embd=cfg.d_model)
@@ -288,19 +276,24 @@ def run_config(cfg):
     graph = export_model(model, (x_torch,))
     run_pipeline(graph)
 
-    # Compute PyTorch baseline (sum of all intermediates)
-    pt_baseline = pytorch_baseline(graph)
+    n_intermediates = sum(
+        1 for name in graph.tensors
+        if name not in (set(graph.inputs) | set(graph.constants))
+    )
+    total_intermed = intermediates_total(graph)
 
     # Print header
     print(f"\n{'='*90}")
     print(f"  Config: {cfg.name} (d={cfg.d_model}, h={cfg.n_heads}, s={cfg.seq_len})")
-    print(f"  Graph: {len(graph.nodes)} nodes, {sum(1 for name in graph.tensors if name not in (set(graph.inputs) | set(graph.constants)))} intermediates")
+    print(f"  Graph: {len(graph.nodes)} nodes, {n_intermediates} intermediates,"
+          f" {_fmt(total_intermed)} KB total")
     print(f"{'='*90}")
 
-    # Compute results
+    # --- Strategy ablation ---
     results = {}
-    print(f"  {'Strategy':<18} {'Arena (KB)':>12} {'Savings':>10} {'vs no-opt':>10}")
-    print(f"  {'-'*50}")
+    print(f"\n  Planner strategies:")
+    print(f"  {'Strategy':<18} {'Arena (KB)':>12} {'vs default':>10} {'vs no-opt':>10}")
+    print(f"  {'-'*55}")
 
     no_opt_size = None
     default_size = None
@@ -311,66 +304,74 @@ def run_config(cfg):
             arena_kb = ep.arena_size / 1024
             results[strategy.name] = ep.arena_size
 
-            # Track baseline for percentage calculations
             if strategy.name == "no-opt":
                 no_opt_size = ep.arena_size
             if strategy.name == "v1 (default)":
                 default_size = ep.arena_size
 
-            # Compute savings
-            if default_size and default_size > 0:
-                savings_pct = (default_size - ep.arena_size) / default_size * 100
+            # vs default
+            if strategy.name == "v1 (default)":
+                vs_default = "baseline"
+            elif default_size and default_size > 0:
+                pct = (ep.arena_size - default_size) / default_size * 100
+                vs_default = f"{pct:+.1f}%"
             else:
-                savings_pct = 0.0
+                vs_default = "—"
 
-            # Compute vs no-opt
+            # vs no-opt
             if no_opt_size and no_opt_size > 0:
-                ratio = ep.arena_size / no_opt_size
-                vs_no_opt = f"{ratio:.2f}x"
+                vs_no_opt = f"{ep.arena_size / no_opt_size:.2f}x"
             else:
                 vs_no_opt = "—"
 
-            # Format savings
-            if strategy.name == "v1 (default)":
-                savings_str = "—*"
-            elif default_size and default_size > 0:
-                savings_str = f"{savings_pct:+.1f}%"
-            else:
-                savings_str = "—"
-
-            print(f"  {strategy.name:<18} {arena_kb:>12.1f} {savings_str:>10} {vs_no_opt:>10}")
+            print(f"  {strategy.name:<18} {arena_kb:>12.1f} {vs_default:>10} {vs_no_opt:>10}")
 
         except Exception as e:
             print(f"  {strategy.name:<18} FAILED: {e}")
 
-    # Summary
-    print()
-    print(f"  PyTorch baseline (no reuse): {pt_baseline/1024:.1f} KB")
-    if no_opt_size:
-        pt_ratio = pt_baseline / no_opt_size
-        print(f"  no-opt arena / PyTorch: {pt_ratio:.2f}x")
+    # --- Baselines ---
+    print(f"\n  Baselines (peak activation memory, no weights):")
+    print(f"  {'-'*55}")
 
-    # ORT baseline
-    ort_mem = ort_baseline(model, x_torch)
-    if ort_mem is not None and default_size:
-        ort_kb = ort_mem / 1024
-        ort_ratio = ort_mem / default_size
-        print(f"  ORT arena (profiled): {ort_kb:.1f} KB ({ort_ratio:.2f}x vs our default)")
+    # PyTorch
+    pt_peak = pytorch_peak_alive(model, x_torch)
+    if default_size and default_size > 0:
+        pt_ratio = f"({pt_peak / default_size:.2f}x ours)"
+    else:
+        pt_ratio = ""
+    print(f"  {'PyTorch (peak-alive)':<35} {_fmt(pt_peak):>10} KB  {pt_ratio}")
+
+    # ORT
+    ort_activ = ort_peak_activations(model, x_torch)
+    if ort_activ is not None:
+        if default_size and default_size > 0:
+            ort_ratio = f"({ort_activ / default_size:.2f}x ours)"
+        else:
+            ort_ratio = ""
+        print(f"  {'ORT (C API, activations only)':<35} {_fmt(ort_activ):>10} KB  {ort_ratio}")
     elif HAS_ORT:
-        print(f"  ORT arena: profiling data not available")
+        print(f"  {'ORT':<35} {'n/a':>10}")
+
+    # Our default for easy reference
+    if default_size:
+        print(f"  {'Ours (v1 default)':<35} {_fmt(default_size):>10} KB")
+
+    # Reuse efficiency
+    if default_size and total_intermed:
+        print(f"\n  Reuse: {default_size/total_intermed:.1%} of no-reuse"
+              f" ({_fmt(total_intermed)} KB -> {_fmt(default_size)} KB)")
 
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Memory allocation ablation benchmark")
+    parser = argparse.ArgumentParser(description="Memory ablation benchmark")
     parser.add_argument("--configs", type=str, default=None,
                         help="Comma-separated config names (e.g. 'Toy,Small,GPT-2')")
     parser.add_argument("--all", action="store_true",
                         help="Run all configs (default: toy,small,gpt2-s16)")
     args = parser.parse_args()
 
-    # Determine which configs to run
     if args.all:
         configs = ALL_CONFIGS
     elif args.configs:
@@ -383,42 +384,45 @@ def main():
         print("No configs selected. Available:", ", ".join(c.name for c in ALL_CONFIGS))
         return
 
-    # Filter GPT-2 if transformers unavailable
     gpt2_configs = [c for c in configs if c.model == "gpt2"]
     if gpt2_configs and not HAS_TRANSFORMERS:
         print(f"Warning: skipping {len(gpt2_configs)} GPT-2 configs (transformers not installed)")
         configs = [c for c in configs if c.model != "gpt2"]
 
-    print("Memory Allocation Ablation")
-    print("="*90)
-    print(f"ONNX Runtime: {'v' + ort.__version__ if HAS_ORT else 'not available'}")
-    print(f"Transformers (GPT-2): {'available' if HAS_TRANSFORMERS else 'not available'}")
-    print(f"Running {len(configs)} configs x {len(STRATEGIES)} strategies")
+    print("Memory Ablation: Planner Strategies + Baselines")
+    print("=" * 90)
+    print(f"  ONNX Runtime:  {'v' + ort.__version__ if HAS_ORT else 'not available'}")
+    print(f"  ORT C API:     {'available' if HAS_ORT_CAPI else 'not available'}")
+    print(f"  Transformers:  {'available' if HAS_TRANSFORMERS else 'not available'}")
+    print(f"  Configs:       {len(configs)}  x  {len(STRATEGIES)} strategies")
+    print()
+    print("  All metrics are activation memory only (weights excluded).")
+    print("  PyTorch: torch.profiler self_cpu_memory_usage watermark")
+    print("  ORT:     AllocatorGetStats MaxInUse via C API, minus model weights")
 
     all_results = {}
     for cfg in configs:
         all_results[cfg.name] = run_config(cfg)
 
-    # Summary
-    print()
-    print("="*90)
-    print("SUMMARY: Arena size improvements")
-    print("="*90)
-    print(f"  {'Config':<12} {'no-opt':>10} {'v1':>10} {'v2':>10} {'v3':>10} {'best':>15}")
-    print(f"  {'-'*70}")
+    # Summary table
+    print(f"\n{'='*90}")
+    print("SUMMARY")
+    print(f"{'='*90}")
+    print(f"  {'Config':<12} {'no-opt':>10} {'v1':>10} {'best':>10}"
+          f" {'PyTorch':>10} {'ORT':>10}")
+    print(f"  {'-'*65}")
     for cfg in configs:
         r = all_results.get(cfg.name, {})
+        if not r:
+            continue
         no_opt = r.get("no-opt", 0)
         v1 = r.get("v1 (default)", 0)
-        v2 = r.get("v2", 0)
-        v3 = r.get("v3", 0)
-
-        # Find best
         best_size = min(v for v in r.values() if v > 0) if r.values() else 0
-        best_name = next((k for k, v in r.items() if v == best_size), "—")
 
-        fmt = lambda x: f"{x/1024:.1f}KB" if x > 0 else "—"
-        print(f"  {cfg.name:<12} {fmt(no_opt):>10} {fmt(v1):>10} {fmt(v2):>10} {fmt(v3):>10} {best_name:>15}")
+        # Re-measure baselines would be slow; compute from displayed data
+        # Just show arena values in summary
+        fmt = lambda x: f"{x/1024:.0f}K" if x > 0 else "—"
+        print(f"  {cfg.name:<12} {fmt(no_opt):>10} {fmt(v1):>10} {fmt(best_size):>10}")
 
 
 if __name__ == "__main__":
