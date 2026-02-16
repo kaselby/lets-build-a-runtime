@@ -762,3 +762,35 @@ Eliminate trivial reshapes as a graph optimization (Option A), and also implemen
 Not committing to an approach yet. The immediate question is: **does any real model produce a non-trivial RESHAPE of a graph input?** If the answer is "no, it's always same-shape from torch.export resolving dynamic shapes to concrete ones," then Option A alone is sufficient and cleanest. If there are real cases, Option D is the robust choice.
 
 For now, the 2-layer HF GPT-2 works with per-op dispatch (which handles this correctly) and with compiled dispatch at all tested sequence lengths via the manual `GPT2Inference` wrapper. The full HF model compiled path is blocked only on this issue.
+
+### Resolution (2026-02-15): Two bugs, not one
+
+Running `GPT2LMHeadModel` directly (no wrapper, `use_cache=False`) exposed two bugs. Neither was the RESHAPE dispatch issue we anticipated — the planner's external-alias rejection (line 320-325) correctly gives the RESHAPE output its own arena slot. The bugs were:
+
+**Bug 1: `dispatch_reshape` hardcodes `sizeof(float)`.** The RESHAPE of `input_ids` copies int64 data (8 bytes/element) but `dispatch_reshape` used `total_elements(node) * sizeof(float)` — copying only half the bytes. The EMBEDDING op then read truncated indices and segfaulted on out-of-bounds table lookups.
+
+Fix: added `int elem_size` field to the `OpNode` struct (`runtime.h`). Set from the output tensor's dtype during compilation (`compiled.py:_build_node`). Used in `dispatch_reshape`, the N-dim branch of `dispatch_transpose`, and `kernel_slice`. Compute ops (matmul, add, etc.) continue using float — they're inherently typed. When quantized ops are added (INT8 matmul), they'll be separate op codes with their own dispatch functions, not dtype branches inside existing kernels. Data movement ops are dtype-agnostic and use `elem_size`.
+
+**Bug 2: Planner lifetime tracking for rejected aliases.** This was the actual segfault after fixing bug 1. The RESHAPE output `view` (int64, 64 bytes) and the EMBEDDING output `embedding` (float32, 24KB) were both allocated at arena offset 0 — overlapping. The EMBEDDING kernel read `ids[0]`, wrote 3KB of float output starting at offset 0, and destroyed the remaining indices.
+
+Root cause in `_compute_lifetimes` (planner.py, line ~310):
+
+```python
+# OLD (buggy):
+root = get_root(_resolve_alias(inp, graph))
+
+# NEW (fixed):
+root = get_root(inp)
+```
+
+`_resolve_alias` follows the **graph-level** alias chain: `view` → `input_ids`. Then `get_root('input_ids')` = `input_ids` (external). Since externals aren't tracked, `dies_at['view']` was never set, defaulting to `born_at['view']` = step 0. The planner thought `view` was dead immediately, freed offset 0, and allocated the EMBEDDING output there.
+
+The fix uses `get_root(inp)` which follows the **planner's actual sharing decisions**. Since the planner rejected the alias (external input), `view` is not in `memory_root`, so `get_root('view')` = `view` — correctly extending `view`'s own lifetime to the step where EMBEDDING consumes it.
+
+This is correct for both cases:
+- **Alias shared** (intermediate input): `memory_root['view'] = root_A`, so `get_root('view')` = `root_A`. Extends root_A's lifetime. Same as before.
+- **Alias rejected** (external input): `view` not in `memory_root`, so `get_root('view')` = `view`. Extends view's own lifetime. Previously broken.
+
+**Verification:** The `_resolve_alias` call on line 306 (for consumed counting used by in-place decisions) is still correct — it needs graph-structural relationships for the "is this the last consumer?" check. Only the death-tracking on line 310 was wrong, because it needs to extend the lifetime of whichever tensor actually owns the arena memory, which is a planner decision, not a graph-structure fact.
+
+Full GPT-2 (124M, 12 layers) now runs end-to-end through the compiled C executor directly from HuggingFace with no wrapper. Max logit diff vs PyTorch: 0.000092.

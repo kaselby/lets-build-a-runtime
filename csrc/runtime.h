@@ -56,6 +56,7 @@ typedef struct {
     void* output;
     int out_shape[MAX_DIMS];
     int n_dims;
+    int elem_size;        /* bytes per element (4 for float, 8 for int64) */
     int extra[MAX_DIMS];  /* op-specific: axes, flags, etc. */
 } OpNode;
 

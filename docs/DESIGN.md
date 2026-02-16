@@ -213,6 +213,41 @@ Benchmarked on Apple M4 Max.
 
 **We beat both PyTorch baselines at every config.** At small sizes, dispatch overhead elimination gives ~10x over eager PyTorch. At the largest config, fused attention compounds with MLP fusion for 0.54x naive. Beating SDPA validates the project thesis: our compiled executor's overhead savings on the ~20 non-attention ops overcome SDPA's faster attention kernel.
 
+## Observability
+
+The runtime exposes internal data through a `Session` API modeled on ONNX Runtime's `InferenceSession` — but with better memory visibility than ORT's Python bindings actually provide.
+
+### Session API
+
+```python
+session = Session(graph)
+session.create(verbose=True, profile=True)   # log passes, enable profiling
+result = session.run(inputs, profile=True)    # per-call profiling
+print(session.plan_stats)                     # memory plan summary
+print(session.last_profile)                   # execution timing
+```
+
+### Memory stats (`PlanStats`)
+
+Computed during `plan()` where the planner has access to lifetimes, memory roots, and scratch info. Reports arena size, naive size (no reuse), reuse savings (bytes and percentage), intermediate tensor counts (allocated vs shared via alias/in-place), scratch total, and weight total. Available as `session.plan_stats` or `plan.stats`.
+
+ORT's Python API doesn't expose arena stats — getting peak memory requires either parsing profiling JSON (unreliable) or calling the C API directly via ctypes to reach `AllocatorGetStats`. Our planner knows everything statically and surfaces it directly.
+
+### Pass logging (`PassResult`)
+
+`run_pipeline` and `run_until_stable` accept an optional `log` parameter. Each pass appends a `PassResult` with the pass name, whether it changed the graph, and node counts before/after. Session prints these when `verbose=True`.
+
+### Execution profiling (`RunProfile`)
+
+- **Interpreted executor:** Per-op `perf_counter_ns` timing around each kernel dispatch. Groups by op type with time and percentage breakdown.
+- **Compiled executor:** Total-time only (single C call, no per-op instrumentation in production). The ablation library (`libablation`) has per-op C-level timing for benchmarking, but that's a separate build.
+
+### Graph inspection
+
+- **`graph.summary()`** — Compact overview: node/tensor counts, op distribution, input/output shapes.
+- **`graph.dump()`** — Full node-by-node listing in topological order with shapes and attrs.
+- **`graph.save(path)` / `Graph.load(path)`** — Serialization to `{path}.json` (human-readable topology) + `{path}.weights` (binary blob). The JSON contains the full graph structure and a weight manifest. Weights file is optional on load — without it, the graph is inspectable but not executable. Useful for diffing pre-opt vs post-opt graphs.
+
 ## Known Limitations
 
 - **No PERMUTE in compiled C dispatch.** General N-dim permutations are unhandled in `executor.c`. Currently safe because transformer permutations are classified as TRANSPOSE.

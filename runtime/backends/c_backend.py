@@ -104,9 +104,9 @@ def _load_library() -> ctypes.CDLL | None:
                                      ctypes.c_int, ctypes.c_int]
     lib.kernel_bias_relu.restype = None
 
-    # Attention: (Q, K, V, output, scratch, batch_heads, seq_len, head_dim, causal)
+    # Attention: (Q, K, V, output, scratch, mask, batch_heads, seq_len, head_dim, causal)
     lib.kernel_attention.argtypes = [FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
-                                     FLOAT_PTR, FLOAT_PTR,
+                                     FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
                                      ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                      ctypes.c_int]
     lib.kernel_attention.restype = None
@@ -135,10 +135,10 @@ def _load_library() -> ctypes.CDLL | None:
                                      ctypes.c_int, ctypes.c_int]
     lib.kernel_embedding.restype = None
 
-    # Slice: (x, out, outer, orig_dim_size, start, slice_len, inner)
-    lib.kernel_slice.argtypes = [FLOAT_PTR, FLOAT_PTR,
+    # Slice: (x, out, outer, orig_dim_size, start, slice_len, inner, elem_size)
+    lib.kernel_slice.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                  ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                 ctypes.c_int, ctypes.c_int]
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.kernel_slice.restype = None
 
     return lib
@@ -519,18 +519,23 @@ def _wrap_bias_relu(lib: ctypes.CDLL) -> KernelFn:
 def _wrap_attention(lib: ctypes.CDLL) -> KernelFn:
     """Wrap kernel_attention: fused multi-head attention.
 
-    Inputs: [Q, K, V, scratch] — scratch is appended by the executor
-    from the planner's scratch allocation.
+    Inputs: [Q, K, V, scratch] or [Q, K, V, mask, scratch].
+    Scratch is appended by the executor from the planner's scratch allocation.
     Q, K, V: [..., seq_len, head_dim] (leading dims are batch)
     """
     def kernel(inputs: list[np.ndarray], output: np.ndarray,
                attrs: dict[str, Any]) -> None:
-        Q, K, V, scratch = inputs[0], inputs[1], inputs[2], inputs[3]
+        Q, K, V = inputs[0], inputs[1], inputs[2]
+        # Scratch is always last; mask (if present) is between V and scratch
+        has_mask = len(inputs) > 4
+        mask = inputs[3] if has_mask else None
+        scratch = inputs[-1]
         seq_len, head_dim = Q.shape[-2], Q.shape[-1]
         batch_heads = Q.size // (seq_len * head_dim)
         causal = 1 if attrs.get("causal") else 0
+        mask_ptr = _as_ptr(mask) if mask is not None else ctypes.cast(None, FLOAT_PTR)
         lib.kernel_attention(_as_ptr(Q), _as_ptr(K), _as_ptr(V),
-                             _as_ptr(output), _as_ptr(scratch),
+                             _as_ptr(output), _as_ptr(scratch), mask_ptr,
                              batch_heads, seq_len, head_dim, causal)
     return kernel
 
@@ -597,8 +602,10 @@ def _wrap_slice(lib: ctypes.CDLL) -> KernelFn:
         inner = 1
         for d in x.shape[dim + 1:]:
             inner *= d
-        lib.kernel_slice(_as_ptr(x), _as_ptr(output),
-                         outer, x.shape[dim], start, end - start, inner)
+        elem_size = x.dtype.itemsize
+        lib.kernel_slice(x.ctypes.data, output.ctypes.data,
+                         outer, x.shape[dim], start, end - start, inner,
+                         elem_size)
     return kernel
 
 

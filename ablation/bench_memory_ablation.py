@@ -83,28 +83,14 @@ class NaiveTransformerBlock(nn.Module):
         return x
 
 
-class GPT2Body(nn.Module):
-    """GPT-2 transformer body: blocks + final layernorm. No embeddings or LM head."""
-    def __init__(self, model):
-        super().__init__()
-        self.h = model.transformer.h
-        self.ln_f = model.transformer.ln_f
-
-    def forward(self, hidden_states):
-        for block in self.h:
-            hidden_states = block(hidden_states)[0]
-        return self.ln_f(hidden_states)
-
-
-def _make_gpt2_body(n_layer=2, n_head=12, n_embd=768):
+def _make_gpt2(n_layer=2, n_head=12, n_embd=768):
     if not HAS_TRANSFORMERS:
         return None
     config = GPT2Config(n_layer=n_layer, n_head=n_head, n_embd=n_embd, vocab_size=50257)
-    full_model = GPT2LMHeadModel(config)
-    full_model.eval()
-    body = GPT2Body(full_model)
-    body.eval()
-    return body
+    model = GPT2LMHeadModel(config)
+    model.eval()
+    model.config.use_cache = False
+    return model
 
 
 # =====================================================================
@@ -262,15 +248,15 @@ def run_config(cfg):
 
     is_gpt2 = cfg.model == "gpt2"
     if is_gpt2:
-        model = _make_gpt2_body(n_head=cfg.n_heads, n_embd=cfg.d_model)
+        model = _make_gpt2(n_head=cfg.n_heads, n_embd=cfg.d_model)
         if model is None:
             print(f"  SKIPPED: transformers package required for GPT-2 configs")
             return {}
+        x_torch = torch.randint(0, 50257, (cfg.batch, cfg.seq_len))
     else:
         model = NaiveTransformerBlock(cfg.d_model, cfg.n_heads)
         model.eval()
-
-    x_torch = torch.randn(cfg.batch, cfg.seq_len, cfg.d_model)
+        x_torch = torch.randn(cfg.batch, cfg.seq_len, cfg.d_model)
 
     # Export and optimize graph once
     graph = export_model(model, (x_torch,))
@@ -361,6 +347,8 @@ def run_config(cfg):
         print(f"\n  Reuse: {default_size/total_intermed:.1%} of no-reuse"
               f" ({_fmt(total_intermed)} KB -> {_fmt(default_size)} KB)")
 
+    results["__pt_peak"] = pt_peak
+    results["__ort_activ"] = ort_activ
     return results
 
 
@@ -419,10 +407,12 @@ def main():
         v1 = r.get("v1 (default)", 0)
         best_size = min(v for v in r.values() if v > 0) if r.values() else 0
 
-        # Re-measure baselines would be slow; compute from displayed data
-        # Just show arena values in summary
+        pt = r.get("__pt_peak") or 0
+        ort_a = r.get("__ort_activ") or 0
+
         fmt = lambda x: f"{x/1024:.0f}K" if x > 0 else "—"
-        print(f"  {cfg.name:<12} {fmt(no_opt):>10} {fmt(v1):>10} {fmt(best_size):>10}")
+        print(f"  {cfg.name:<12} {fmt(no_opt):>10} {fmt(v1):>10} {fmt(best_size):>10}"
+              f" {fmt(pt):>10} {fmt(ort_a):>10}")
 
 
 if __name__ == "__main__":

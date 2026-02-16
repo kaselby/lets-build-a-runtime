@@ -50,7 +50,7 @@ void kernel_layernorm(const float* x, const float* gamma, const float* beta,
 void kernel_bias_relu(const float* a, const float* bias, float* out,
                       int M, int N);
 void kernel_attention(const float* Q, const float* K, const float* V,
-                      float* output, float* scratch,
+                      float* output, float* scratch, const float* mask,
                       int batch_heads, int seq_len, int head_dim,
                       int causal);
 void kernel_pow_scalar(const float* x, float scalar, float* out, int n);
@@ -58,9 +58,9 @@ void kernel_tanh(const float* x, float* out, int n);
 void kernel_gelu_tanh(const float* x, float* out, int n);
 void kernel_embedding(const long* ids, const float* table, float* out,
                       int seq_len, int embed_dim);
-void kernel_slice(const float* x, float* out,
+void kernel_slice(const void* x, void* out,
                   int outer, int orig_dim_size, int start,
-                  int slice_len, int inner);
+                  int slice_len, int inner, int elem_size);
 
 /* ----------------------------------------------------------------
  * Helpers
@@ -219,7 +219,7 @@ static void dispatch_reshape(OpNode* node) {
      * external buffer (graph input) that the planner can't alias. */
     if (node->inputs[0] != node->output) {
         memcpy(node->output, node->inputs[0],
-               total_elements(node) * sizeof(float));
+               total_elements(node) * node->elem_size);
     }
 }
 
@@ -234,15 +234,17 @@ static void dispatch_transpose(OpNode* node) {
         int middle = node->extra[2];
         int B      = node->extra[3];
         int inner  = node->extra[4];
-        const float* x = node->inputs[0];
-        float* out = node->output;
+        int es     = node->elem_size;
+        const char* x = node->inputs[0];
+        char* out = node->output;
+        int chunk = inner * es;
         for (int o = 0; o < outer; o++)
           for (int b = 0; b < B; b++)
             for (int m = 0; m < middle; m++)
               for (int a = 0; a < A; a++) {
                 int in_off  = (((o*A + a)*middle + m)*B + b)*inner;
                 int out_off = (((o*B + b)*middle + m)*A + a)*inner;
-                memcpy(out + out_off, x + in_off, inner * sizeof(float));
+                memcpy(out + out_off * es, x + in_off * es, chunk);
               }
     }
 }
@@ -254,7 +256,7 @@ static void dispatch_slice(OpNode* node) {
     if (node->extra[0] == 0) return;
     kernel_slice(node->inputs[0], node->output,
                  node->extra[0], node->extra[1], node->extra[2],
-                 node->extra[3], node->extra[4]);
+                 node->extra[3], node->extra[4], node->elem_size);
 }
 
 static void dispatch_embedding(OpNode* node) {
@@ -313,15 +315,20 @@ static void dispatch_fused_bias_relu(OpNode* node) {
 }
 
 static void dispatch_attention(OpNode* node) {
-    /* inputs: [Q, K, V, scratch], extras: [seq_len, head_dim, causal] */
-    int seq_len = node->extra[0];
+    /* extras: [seq_len, head_dim, causal, has_mask]
+     * no mask:   inputs = [Q, K, V, scratch]
+     * with mask: inputs = [Q, K, V, mask, scratch]  */
+    int seq_len  = node->extra[0];
     int head_dim = node->extra[1];
-    int causal = node->extra[2];
+    int causal   = node->extra[2];
+    int has_mask = node->extra[3];
     int batch_heads = 1;
     for (int i = 0; i < node->n_dims - 2; i++)
         batch_heads *= node->out_shape[i];
+    const float* mask = has_mask ? node->inputs[3] : NULL;
+    float* scratch    = has_mask ? node->inputs[4] : node->inputs[3];
     kernel_attention(node->inputs[0], node->inputs[1], node->inputs[2],
-                     node->output, node->inputs[3],
+                     node->output, scratch, mask,
                      batch_heads, seq_len, head_dim, causal);
 }
 

@@ -12,16 +12,35 @@ import torch
 
 from ...ir import Graph, OpType
 
-# Handler signature: (fx_node, graph, node_map) -> None
-OpHandler = Callable[[object, Graph, dict[str, str]], None]
+# Handler signature: (fx_node, graph, node_map, symbol_map) -> None
+OpHandler = Callable[[object, Graph, dict[str, str], dict[str, str]], None]
 
 
 # --- Common utilities ---
 
+def _sym_or_val(d, symbol_map: dict[str, str]):
+    """Convert a dimension value: int stays int, SymInt becomes symbol name."""
+    if isinstance(d, int):
+        return d
+    s = str(d)
+    if symbol_map:
+        return symbol_map.get(s, s)
+    # No symbol map — concretize the SymInt
+    return int(d.node.hint)
+
+
 def _output_meta(fx_node) -> tuple[tuple[int, ...], str]:
-    """Extract output shape and dtype from fx node tracing metadata."""
+    """Extract output shape and dtype from fx node tracing metadata.
+
+    Concretizes SymInts to plain ints using example-value hints.
+    TensorInfo.shape always stays concrete.
+    """
     val = fx_node.meta["val"]
-    return tuple(val.shape), str(val.dtype).replace("torch.", "")
+    shape = tuple(
+        d if isinstance(d, int) else int(d.node.hint)
+        for d in val.shape
+    )
+    return shape, str(val.dtype).replace("torch.", "")
 
 
 def _emit(fx_node, graph: Graph, node_map: dict[str, str],
@@ -67,7 +86,7 @@ def _make_binary_handler(op: OpType) -> OpHandler:
     the first arg. The second arg is either another tensor (fx node) or a
     Python literal (int/float) that was evaluated during tracing.
     """
-    def handler(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    def handler(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
         inputs = [node_map[fx_node.args[0].name]]
         attrs = {}
 
@@ -88,7 +107,7 @@ def _make_simple_handler(op: OpType) -> OpHandler:
     Works for unary ops (exp, tanh, relu) and multi-input ops
     where every arg is a tensor (le, eq, bitwise_and).
     """
-    def handler(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    def handler(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
         inputs = [node_map[arg.name] for arg in fx_node.args if hasattr(arg, "name")]
         _emit(fx_node, graph, node_map, op, inputs)
     return handler
@@ -98,7 +117,7 @@ def _make_simple_handler(op: OpType) -> OpHandler:
 
 def _make_reduction_handler(op: OpType) -> OpHandler:
     """Create a handler for reduction ops with axis and keepdim attrs."""
-    def handler(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+    def handler(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
         inputs = [node_map[fx_node.args[0].name]]
         axis = _get_axis(fx_node)
         keepdim = fx_node.args[2] if len(fx_node.args) > 2 else fx_node.kwargs.get("keepdim", False)
@@ -106,7 +125,7 @@ def _make_reduction_handler(op: OpType) -> OpHandler:
     return handler
 
 
-def _handle_max_dim(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_max_dim(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.max.dim — returns (values, indices) tuple.
 
     Emits a MAX node for the values. The indices are not supported;
@@ -127,14 +146,14 @@ def _handle_max_dim(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
     node_map[fx_node.name] = tensor_name
 
 
-def _handle_softmax(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_softmax(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten._softmax / aten.softmax.int — normalize along axis."""
     inputs = [node_map[fx_node.args[0].name]]
     axis = _get_axis(fx_node)
     _emit(fx_node, graph, node_map, OpType.SOFTMAX, inputs, {"axis": axis})
 
 
-def _handle_mean(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_mean(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.mean.dim — decompose into SUM + DIV by element count."""
     shape, dtype = _output_meta(fx_node)
     inputs = [node_map[fx_node.args[0].name]]
@@ -147,22 +166,26 @@ def _handle_mean(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
     graph.add_node(OpType.SUM, inputs, sum_name, {"axis": axis, "keepdim": keepdim})
 
     # DIV by element count -> final output
-    count = int(fx_node.args[0].meta["val"].shape[axis])
+    # If axis size is symbolic, store the symbol name for later resolution
+    axis_size = fx_node.args[0].meta["val"].shape[axis]
+    count = _sym_or_val(axis_size, symbol_map)
+    if isinstance(count, int):
+        count = float(count)
     tensor_name = fx_node.name
     graph.add_tensor(tensor_name, shape, dtype)
-    graph.add_node(OpType.DIV, [sum_name], tensor_name, {"scalar": float(count)})
+    graph.add_node(OpType.DIV, [sum_name], tensor_name, {"scalar": count})
     node_map[fx_node.name] = tensor_name
 
 
 # --- Shape ops: transpose ---
 
-def _handle_transpose_2d(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_transpose_2d(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.t / aten.numpy_T — always a 2D dim0/dim1 swap."""
     inputs = [node_map[fx_node.args[0].name]]
     _emit(fx_node, graph, node_map, OpType.TRANSPOSE, inputs, {"dim0": 0, "dim1": 1})
 
 
-def _handle_transpose_int(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_transpose_int(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.transpose.int(tensor, dim0, dim1) with negative dim normalization."""
     inputs = [node_map[fx_node.args[0].name]]
     ndim = len(fx_node.args[0].meta["val"].shape)
@@ -173,7 +196,7 @@ def _handle_transpose_int(fx_node, graph: Graph, node_map: dict[str, str]) -> No
 
 # --- Shape ops: permute ---
 
-def _handle_permute(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_permute(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.permute — TRANSPOSE if it's a 2-axis swap, PERMUTE otherwise.
 
     The distinction matters because TRANSPOSE can be absorbed into matmul
@@ -191,20 +214,27 @@ def _handle_permute(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
 
 # --- Shape ops: reshape ---
 
-def _handle_reshape(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_reshape(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.view, aten.reshape, aten.unflatten, aten.unsqueeze, aten.squeeze.
 
-    Target shape is always read from output metadata rather than args,
-    since args may contain unresolved -1 dims while meta is fully concrete.
+    Reads target shape from output metadata (meta["val"].shape). With dynamic
+    shapes, SymInts in the metadata are converted to symbol name strings via
+    symbol_map. This lets resolve_graph substitute concrete values later
+    without re-exporting.
+
+    Note: we read from meta rather than args because args may contain fx node
+    references (from sym_size.int calls) which aren't tensors in our graph.
+    Meta always has resolved SymInt values directly.
     """
     inputs = [node_map[fx_node.args[0].name]]
-    shape, _ = _output_meta(fx_node)
-    _emit(fx_node, graph, node_map, OpType.RESHAPE, inputs, {"shape": shape})
+    val = fx_node.meta["val"]
+    attr_shape = tuple(_sym_or_val(d, symbol_map) for d in val.shape)
+    _emit(fx_node, graph, node_map, OpType.RESHAPE, inputs, {"shape": attr_shape})
 
 
 # --- Multi-node handlers: linear, addmm ---
 
-def _handle_linear(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_linear(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.linear(input, weight, bias?).
 
     Weight is [out_features, in_features]. We emit TRANSPOSE + MATMUL
@@ -237,7 +267,7 @@ def _handle_linear(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
         _emit(fx_node, graph, node_map, OpType.MATMUL, [input_name, weight_t_name])
 
 
-def _handle_addmm(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_addmm(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.addmm(bias, input, weight) — Conv1D layout.
 
     Weight is [K, N] (already the right shape for input @ weight).
@@ -264,7 +294,7 @@ def _handle_addmm(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
 
 # --- Single-node handlers with attrs ---
 
-def _handle_layer_norm(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_layer_norm(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.layer_norm.default(input, normalized_shape, weight, bias, eps?)."""
     inputs = [
         node_map[fx_node.args[0].name],  # x
@@ -275,19 +305,19 @@ def _handle_layer_norm(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
     _emit(fx_node, graph, node_map, OpType.LAYERNORM, inputs, {"eps": eps})
 
 
-def _handle_pow(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_pow(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.pow.Tensor_Scalar — unary with scalar exponent."""
     inputs = [node_map[fx_node.args[0].name]]
     _emit(fx_node, graph, node_map, OpType.POW, inputs, {"scalar": float(fx_node.args[1])})
 
 
-def _handle_ne_scalar(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_ne_scalar(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.ne.Scalar — not-equal comparison with scalar."""
     inputs = [node_map[fx_node.args[0].name]]
     _emit(fx_node, graph, node_map, OpType.CMP_NE, inputs, {"scalar": fx_node.args[1]})
 
 
-def _handle_embedding(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_embedding(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.embedding — table lookup.
 
     ATen order is (weight_table, indices), but our kernel expects
@@ -302,7 +332,7 @@ def _handle_embedding(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
 
 # --- SDPA handler ---
 
-def _handle_sdpa(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_sdpa(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.scaled_dot_product_attention → ATTENTION directly.
 
     Takes Q, K, V as the first three args. Maps straight to our fused
@@ -333,7 +363,7 @@ def _handle_sdpa(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
 
 # --- No-op handlers ---
 
-def _handle_getitem(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_getitem(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle operator.getitem — unpacks tuples from split or max.dim.
 
     For split: reads chunk_size/dim from the source FX node's args and
@@ -374,12 +404,12 @@ def _handle_getitem(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
         node_map[fx_node.name] = node_map[source_fx.name]
 
 
-def _handle_noop(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_noop(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle ops that are identity aliases at inference time (contiguous, dropout, alias)."""
     node_map[fx_node.name] = node_map[fx_node.args[0].name]
 
 
-def _handle_assert_metadata(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_assert_metadata(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten._assert_tensor_metadata — pure no-op, skip entirely."""
     pass
 
@@ -397,21 +427,54 @@ def _materialize_constant(fx_node, graph: Graph, node_map: dict[str, str],
     node_map[fx_node.name] = tensor_name
 
 
-def _handle_arange(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
-    """Handle aten.arange.default(end) — constant index array."""
-    _, dtype = _output_meta(fx_node)
-    _materialize_constant(fx_node, graph, node_map,
-                          np.arange(fx_node.args[0], dtype=np.dtype(dtype)))
+def _resolve_scalar_arg(arg, symbol_map: dict[str, str]):
+    """Extract a scalar value from an FX node arg.
+
+    Plain ints pass through. FX node references (from SymInt computations)
+    are resolved via their metadata — SymInts become symbol name strings,
+    concrete values stay as ints.
+    """
+    if isinstance(arg, (int, float)):
+        return arg
+    # FX node — extract the SymInt value from metadata
+    val = arg.meta.get("val")
+    if val is not None:
+        return _sym_or_val(val, symbol_map)
+    return int(arg)
 
 
-def _handle_arange_start(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
-    """Handle aten.arange.start(start, end) — constant index array."""
-    _, dtype = _output_meta(fx_node)
-    _materialize_constant(fx_node, graph, node_map,
-                          np.arange(fx_node.args[0], fx_node.args[1], dtype=np.dtype(dtype)))
+def _handle_arange(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
+    """Handle aten.arange.default(end) — emit ARANGE node.
+
+    Emitted as a fold-only graph node. Constant folding evaluates it
+    (pre-resolution if end is concrete, post-resolution if symbolic).
+    """
+    end = _resolve_scalar_arg(fx_node.args[0], symbol_map)
+    shape, dtype = _output_meta(fx_node)
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.ARANGE, [], tensor_name,
+                   {"start": 0, "end": end, "dtype": dtype})
+    node_map[fx_node.name] = tensor_name
 
 
-def _handle_new_ones(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_arange_start(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
+    """Handle aten.arange.start(start, end) — emit ARANGE node.
+
+    Emitted as a fold-only graph node. Constant folding evaluates it
+    (pre-resolution if args are concrete, post-resolution if symbolic).
+    """
+    start = _resolve_scalar_arg(fx_node.args[0], symbol_map)
+    end = _resolve_scalar_arg(fx_node.args[1], symbol_map)
+    shape, dtype = _output_meta(fx_node)
+    tensor_name = fx_node.name
+    graph.add_tensor(tensor_name, shape, dtype)
+    graph.add_node(OpType.ARANGE, [], tensor_name,
+                   {"start": start, "end": end, "dtype": dtype})
+    node_map[fx_node.name] = tensor_name
+
+
+def _handle_new_ones(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.new_ones.default — constant ones tensor."""
     shape, dtype = _output_meta(fx_node)
     _materialize_constant(fx_node, graph, node_map,
@@ -420,7 +483,7 @@ def _handle_new_ones(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
 
 # --- Infrastructure op handlers (emit nodes that get constant-folded) ---
 
-def _handle_to_dtype(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_to_dtype(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.to.dtype_layout — alias if same dtype, else CAST node."""
     _, out_dtype = _output_meta(fx_node)
     in_dtype = str(fx_node.args[0].meta["val"].dtype).replace("torch.", "")
@@ -431,27 +494,46 @@ def _handle_to_dtype(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
               [node_map[fx_node.args[0].name]], {"target_dtype": out_dtype})
 
 
-def _handle_expand(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
-    """Handle aten.expand.default — broadcast expansion."""
-    shape, _ = _output_meta(fx_node)
+def _handle_expand(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
+    """Handle aten.expand.default — broadcast expansion.
+
+    Reads shape from output metadata rather than args, because expand
+    args can contain -1 ("keep this dim") which isn't a valid shape.
+    Meta has the actual resolved shape. SymInts are preserved as symbol names.
+    """
+    val = fx_node.meta["val"]
+    attr_shape = tuple(_sym_or_val(d, symbol_map) for d in val.shape)
     _emit(fx_node, graph, node_map, OpType.EXPAND,
-          [node_map[fx_node.args[0].name]], {"shape": shape})
+          [node_map[fx_node.args[0].name]], {"shape": attr_shape})
 
 
-def _handle_slice_tensor(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
-    """Handle aten.slice.Tensor — slice along dim with start/end."""
-    inputs = [node_map[fx_node.args[0].name]]
+def _handle_slice_tensor(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
+    """Handle aten.slice.Tensor — slice along dim with start/end.
+
+    Full-dimension slices (start=0, end=sys.maxsize) are emitted by PyTorch
+    for tensor[:] patterns. These are no-ops — alias to the input.
+    """
+    import sys
     dim = fx_node.args[1] if len(fx_node.args) > 1 else 0
     start = fx_node.args[2] if len(fx_node.args) > 2 else 0
     if len(fx_node.args) > 3:
-        end = fx_node.args[3]
+        raw_end = fx_node.args[3]
+        end = _sym_or_val(raw_end, symbol_map) if not isinstance(raw_end, int) else raw_end
     else:
-        end = tuple(fx_node.args[0].meta["val"].shape)[dim]
-    _emit(fx_node, graph, node_map, OpType.SLICE_TENSOR, inputs,
+        end_val = fx_node.args[0].meta["val"].shape[dim]
+        end = _sym_or_val(end_val, symbol_map)
+
+    # Full-dimension slice is a no-op
+    if isinstance(start, int) and start == 0 and isinstance(end, int) and end >= sys.maxsize:
+        node_map[fx_node.name] = node_map[fx_node.args[0].name]
+        return
+
+    inputs = [node_map[fx_node.args[0].name]]
+    _emit(fx_node, graph, node_map, OpType.SLICE, inputs,
           {"dim": dim, "start": start, "end": end})
 
 
-def _handle_diff(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_diff(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.diff.default — diff with optional prepend tensor."""
     inputs = [node_map[fx_node.args[0].name]]
     n = fx_node.args[1] if len(fx_node.args) > 1 else 1
@@ -463,13 +545,13 @@ def _handle_diff(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
     _emit(fx_node, graph, node_map, OpType.DIFF, inputs, attrs)
 
 
-def _handle_cumsum(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_cumsum(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.cumsum.default — cumulative sum along a dimension."""
     _emit(fx_node, graph, node_map, OpType.CUMSUM,
           [node_map[fx_node.args[0].name]], {"dim": fx_node.args[1]})
 
 
-def _handle_index(fx_node, graph: Graph, node_map: dict[str, str]) -> None:
+def _handle_index(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
     """Handle aten.index.Tensor — advanced/fancy indexing."""
     indices_list = fx_node.args[1]
     inputs = [node_map[fx_node.args[0].name]]

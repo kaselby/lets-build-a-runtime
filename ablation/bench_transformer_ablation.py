@@ -125,25 +125,8 @@ class SDPATransformerBlock(nn.Module):
         return x
 
 
-class GPT2Body(nn.Module):
-    """GPT-2 transformer body: blocks + final layernorm. No embeddings or LM head.
-
-    Uses HuggingFace GPT-2 blocks which include causal attention. Requires
-    the `transformers` package.
-    """
-    def __init__(self, model):
-        super().__init__()
-        self.h = model.transformer.h
-        self.ln_f = model.transformer.ln_f
-
-    def forward(self, hidden_states):
-        for block in self.h:
-            hidden_states = block(hidden_states)[0]
-        return self.ln_f(hidden_states)
-
-
-def _make_gpt2_body(n_layer=2, n_head=12, n_embd=768):
-    """Create a GPT-2 body model. Returns None if transformers unavailable."""
+def _make_gpt2(n_layer=2, n_head=12, n_embd=768):
+    """Create a full GPT-2 model. Returns None if transformers unavailable."""
     if not HAS_TRANSFORMERS:
         return None
     config = GPT2Config(
@@ -152,11 +135,10 @@ def _make_gpt2_body(n_layer=2, n_head=12, n_embd=768):
         n_embd=n_embd,
         vocab_size=50257,
     )
-    full_model = GPT2LMHeadModel(config)
-    full_model.eval()
-    body = GPT2Body(full_model)
-    body.eval()
-    return body
+    model = GPT2LMHeadModel(config)
+    model.eval()
+    model.config.use_cache = False
+    return model
 
 
 # =====================================================================
@@ -711,22 +693,23 @@ def run_config(cfg: Config, lib):
     # Build models
     is_gpt2 = cfg.model == "gpt2"
     if is_gpt2:
-        gpt2_model = _make_gpt2_body(n_head=cfg.n_heads, n_embd=cfg.d_model)
+        gpt2_model = _make_gpt2(n_head=cfg.n_heads, n_embd=cfg.d_model)
         if gpt2_model is None:
             print(f"  SKIPPED: transformers package required for GPT-2 configs")
             return {}
         # GPT-2 uses its own architecture; naive/sdpa baselines don't apply
         naive_model = gpt2_model
         sdpa_model = None
+        x_torch = torch.randint(0, 50257, (cfg.batch, cfg.seq_len))
+        x_np = x_torch.numpy().astype(np.int64).copy()
     else:
         naive_model = NaiveTransformerBlock(cfg.d_model, cfg.n_heads)
         naive_model.eval()
         sdpa_model = SDPATransformerBlock(cfg.d_model, cfg.n_heads)
         sdpa_model.load_state_dict(naive_model.state_dict())
         sdpa_model.eval()
-
-    x_torch = torch.randn(cfg.batch, cfg.seq_len, cfg.d_model)
-    x_np = x_torch.numpy().copy()
+        x_torch = torch.randn(cfg.batch, cfg.seq_len, cfg.d_model)
+        x_np = x_torch.numpy().copy()
 
     # Export ONNX model once for all ORT variants
     onnx_path = None

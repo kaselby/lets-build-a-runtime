@@ -414,10 +414,16 @@ void kernel_broadcast_binop(
  *   buffer is reused by slice 0, others are thread-local allocations.
  * ---------------------------------------------------------------- */
 
-/* Per-slice attention: sgemm → [causal mask] → softmax → sgemm */
+/* Per-slice attention: sgemm → [mask] → softmax → sgemm
+ *
+ * mask_bh: NULL (no mask), or pointer to [seq_len x seq_len] additive mask.
+ *          For causal masking the caller passes NULL and sets causal=1;
+ *          the kernel generates the upper-triangular -inf pattern on the fly.
+ */
 static void attention_slice(const float* Q_bh, const float* K_bh,
                             const float* V_bh, float* O_bh,
-                            float* scratch, int seq_len, int head_dim,
+                            float* scratch, const float* mask_bh,
+                            int seq_len, int head_dim,
                             float scale, int causal) {
     /* S = Q @ K^T * scale */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -428,8 +434,12 @@ static void attention_slice(const float* Q_bh, const float* K_bh,
                 0.0f,
                 scratch, seq_len);
 
-    /* Causal mask: set upper triangle to -inf so softmax zeroes them out */
-    if (causal) {
+    /* Apply mask: either custom additive mask or causal (never both) */
+    if (mask_bh) {
+        int ss = seq_len * seq_len;
+        for (int i = 0; i < ss; i++)
+            scratch[i] += mask_bh[i];
+    } else if (causal) {
         for (int i = 0; i < seq_len; i++)
             for (int j = i + 1; j < seq_len; j++)
                 scratch[i * seq_len + j] = -INFINITY;
@@ -449,7 +459,7 @@ static void attention_slice(const float* Q_bh, const float* K_bh,
 }
 
 void kernel_attention(const float* Q, const float* K, const float* V,
-                      float* output, float* scratch,
+                      float* output, float* scratch, const float* mask,
                       int batch_heads, int seq_len, int head_dim,
                       int causal) {
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -461,9 +471,10 @@ void kernel_attention(const float* Q, const float* K, const float* V,
         dispatch_queue_t queue = dispatch_get_global_queue(
             QOS_CLASS_USER_INITIATED, 0);
         dispatch_apply((size_t)batch_heads, queue, ^(size_t bh) {
+            const float* mask_bh = mask ? mask + bh * scratch_per_slice : NULL;
             attention_slice(Q + bh * slice, K + bh * slice,
                             V + bh * slice, output + bh * slice,
-                            scratch + bh * scratch_per_slice,
+                            scratch + bh * scratch_per_slice, mask_bh,
                             seq_len, head_dim, scale, causal);
         });
         return;
@@ -472,9 +483,10 @@ void kernel_attention(const float* Q, const float* K, const float* V,
 
     /* Single-slice or non-Apple: sequential */
     for (int bh = 0; bh < batch_heads; bh++) {
+        const float* mask_bh = mask ? mask + bh * scratch_per_slice : NULL;
         attention_slice(Q + bh * slice, K + bh * slice,
                         V + bh * slice, output + bh * slice,
-                        scratch + bh * scratch_per_slice,
+                        scratch + bh * scratch_per_slice, mask_bh,
                         seq_len, head_dim, scale, causal);
     }
 }
@@ -729,19 +741,23 @@ void kernel_embedding(const long* ids, const float* table, float* out,
  *   out: [outer x slice_len x inner]
  *
  *   For each outer slice, copies slice_len contiguous chunks of
- *   `inner` floats starting at offset `start` in the sliced dim.
+ *   `inner` elements starting at offset `start` in the sliced dim.
  *   Contiguous slices (dim=0) are zero-copy aliases handled by
  *   Python — this kernel only runs for dim>0.
+ *   elem_size: bytes per element (4 for float, 8 for int64, etc.)
  * ---------------------------------------------------------------- */
-void kernel_slice(const float* x, float* out,
+void kernel_slice(const void* x, void* out,
                   int outer, int orig_dim_size, int start,
-                  int slice_len, int inner) {
-    int src_stride = orig_dim_size * inner;
-    int dst_stride = slice_len * inner;
-    int copy_bytes = slice_len * inner * (int)sizeof(float);
+                  int slice_len, int inner, int elem_size) {
+    int src_stride = orig_dim_size * inner * elem_size;
+    int dst_stride = slice_len * inner * elem_size;
+    int copy_bytes = slice_len * inner * elem_size;
+    const char* src = x;
+    char* dst = out;
+    int start_off = start * inner * elem_size;
     for (int o = 0; o < outer; o++) {
-        memcpy(out + o * dst_stride,
-               x + o * src_stride + start * inner,
+        memcpy(dst + o * dst_stride,
+               src + o * src_stride + start_off,
                copy_bytes);
     }
 }

@@ -72,7 +72,7 @@ class OpType(Enum):
     # --- Fold-only (100+, constant-folded away, never dispatched to C) ---
     CAST         = 100
     EXPAND       = 101
-    SLICE_TENSOR = 102   # attrs["dim", "start", "end"]
+    ARANGE       = 102   # attrs["start", "end", "dtype"]
     DIFF         = 103   # attrs["n", "dim"]
     CMP_NE       = 104
     CMP_LE       = 105
@@ -144,6 +144,10 @@ class Graph:
         # Connectivity indices (maintained by add_node)
         self._producer: dict[str, int] = {}    # tensor name -> node ID that produces it
         self._consumers: dict[str, list[int]] = {}  # tensor name -> node IDs that consume it
+
+        # Dynamic shape info: symbol name -> list of (input_tensor_name, dim_index)
+        # Set by the exporter when dynamic_dims is used. Used by resolve_graph.
+        self.dynamic_dims: dict[str, list[tuple[str, int]]] = {}
 
         self._next_id: int = 0
         self._order: list[Node] | None = None  # Cached topological order

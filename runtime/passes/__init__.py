@@ -1,5 +1,7 @@
 from .passes import (
-    Pass, PassResult, DEFAULT_PIPELINE, run_pipeline, run_until_stable,
+    Pass, PassResult,
+    DEFAULT_PIPELINE, PRE_RESOLUTION_PIPELINE, POST_RESOLUTION_PIPELINE,
+    run_pipeline, run_until_stable,
     absorb_into_matmul, constant_fold, absorb_mask_into_attention,
     eliminate_dead_code,
 )

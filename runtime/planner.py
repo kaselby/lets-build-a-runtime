@@ -305,9 +305,13 @@ def _compute_lifetimes(
         for inp in node.inputs:
             consumed[_resolve_alias(inp, graph)] += 1
 
-        # Extend memory root's death to this step for all inputs
+        # Extend memory root's death to this step for all inputs.
+        # Use get_root(inp) — follows planner sharing decisions, NOT
+        # graph-level alias chains. If an alias was rejected (e.g. input
+        # is external), the output has its own arena slot and get_root
+        # returns it directly.
         for inp in node.inputs:
-            root = get_root(_resolve_alias(inp, graph))
+            root = get_root(inp)
             if root not in external:
                 dies_at[root] = step
 

@@ -136,6 +136,7 @@ class COpNode(ctypes.Structure):
         ("output", ctypes.c_void_p),
         ("out_shape", ctypes.c_int * MAX_DIMS),
         ("n_dims", ctypes.c_int),
+        ("elem_size", ctypes.c_int),
         ("extra", ctypes.c_int * MAX_DIMS),
     ]
 

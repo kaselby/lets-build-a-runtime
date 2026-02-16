@@ -21,7 +21,11 @@ from __future__ import annotations
 import numpy as np
 
 from .ir import Graph
-from .passes.passes import Pass, PassResult, DEFAULT_PIPELINE, run_pipeline, run_until_stable
+from .ops import resolve_graph
+from .passes.passes import (
+    Pass, PassResult,
+    PRE_RESOLUTION_PIPELINE, run_pipeline, run_until_stable,
+)
 from .planner import PlanStats, plan
 from .executor.common import Executor, RunProfile
 
@@ -31,13 +35,23 @@ class Session:
 
     Holds the graph, runs optimization and planning on create(),
     and delegates execution to a pluggable Executor.
+
+    Supports dynamic shapes via bindings: export once with symbolic dims,
+    then rebind to different concrete values without re-exporting or
+    re-optimizing.
     """
 
     def __init__(self, graph: Graph) -> None:
         self._graph = graph
+        self._resolved: Graph | None = None  # concrete copy for planning/execution
         self._executor: Executor | None = None
         self._plan_stats: PlanStats | None = None
         self._pass_log: list[PassResult] | None = None
+        self._optimized: bool = False
+        # Saved execution settings for rebind()
+        self._execution_mode: str = "compiled"
+        self._backend: str = "c"
+        self._profile: bool = False
 
     @property
     def graph(self) -> Graph:
@@ -69,6 +83,7 @@ class Session:
         pipeline: list[Pass] | None = None,
         verbose: bool = False,
         profile: bool = False,
+        bindings: dict[str, int] | None = None,
     ) -> None:
         """Optimize, plan, and compile the graph for execution.
 
@@ -94,30 +109,47 @@ class Session:
             profile: Enable per-op profiling for subsequent run() calls.
                      Interpreted mode: per-op timing breakdown.
                      Compiled mode: total execution time only.
+            bindings: Concrete values for dynamic symbols.
+                e.g., {'L': 50} resolves all "L" symbols to 50.
+                If the graph has dynamic_dims, this triggers shape
+                resolution before planning.
         """
-        # --- Optimize ---
-        if verbose:
-            print(self._graph.summary())
-            print()
+        # Save execution settings for rebind()
+        self._execution_mode = execution_mode
+        self._backend = backend
+        self._profile = profile
 
-        log = [] if verbose else None
+        # --- Optimize (only once, not on rebind) ---
+        if not self._optimized:
+            if verbose:
+                print(self._graph.summary())
+                print()
 
-        if optimization == "default":
-            run_pipeline(self._graph, pipeline, log=log)
-        elif optimization == "aggressive":
-            run_until_stable(self._graph, pipeline, log=log)
+            log = [] if verbose else None
 
-        if verbose and log:
-            for entry in log:
-                print(entry)
-            print()
-            print(self._graph.summary())
-            print()
+            if optimization == "default":
+                run_pipeline(self._graph, pipeline, log=log)
+            elif optimization == "aggressive":
+                run_until_stable(self._graph, pipeline, log=log)
 
-        self._pass_log = log
+            if verbose and log:
+                for entry in log:
+                    print(entry)
+                print()
+                print(self._graph.summary())
+                print()
+
+            self._pass_log = log
+            self._optimized = True
+
+        # --- Resolve dynamic shapes ---
+        if bindings:
+            self._resolved = resolve_graph(self._graph, bindings)
+        else:
+            self._resolved = self._graph
 
         # --- Plan ---
-        execution_plan = plan(self._graph)
+        execution_plan = plan(self._resolved)
         self._plan_stats = execution_plan.stats
 
         if verbose and self._plan_stats:
@@ -126,6 +158,28 @@ class Session:
 
         # --- Build executor ---
         executor = self._make_executor(execution_mode, backend, profile)
+        executor.compile(execution_plan)
+        self._executor = executor
+
+    def rebind(self, bindings: dict[str, int]) -> None:
+        """Re-plan and re-compile the graph with new dynamic shape values.
+
+        Skips optimization passes (they ran once during create()). Creates
+        a fresh concrete copy from the original symbolic graph, then
+        re-plans memory and re-compiles the executor.
+
+        Args:
+            bindings: Concrete values for dynamic symbols.
+                e.g., {'L': 64} resolves all "L" symbols to 64.
+        """
+        self._resolved = resolve_graph(self._graph, bindings)
+
+        execution_plan = plan(self._resolved)
+        self._plan_stats = execution_plan.stats
+
+        executor = self._make_executor(
+            self._execution_mode, self._backend, self._profile
+        )
         executor.compile(execution_plan)
         self._executor = executor
 

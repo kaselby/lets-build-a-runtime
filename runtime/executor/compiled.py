@@ -133,11 +133,13 @@ class CompiledExecutor(Executor):
         # Output pointer
         c_node.output = graph.tensors[node.output].buffer.ctypes.data
 
-        # Output shape
-        shape = graph.tensors[node.output].shape
+        # Output shape and element size
+        out_tensor = graph.tensors[node.output]
+        shape = out_tensor.shape
         c_node.n_dims = len(shape)
         for d in range(len(shape)):
             c_node.out_shape[d] = shape[d]
+        c_node.elem_size = np.dtype(out_tensor.dtype).itemsize
 
         # Op-specific extras
         _fill_extras(c_node, node, graph)

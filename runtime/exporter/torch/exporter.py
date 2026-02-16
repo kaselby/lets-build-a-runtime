@@ -25,7 +25,12 @@ from ...ir import Graph
 from .handlers import ATEN_HANDLERS
 
 
-def export_pytorch(model: nn.Module, example_inputs: tuple) -> Graph:
+def export_pytorch(
+    model: nn.Module,
+    example_inputs: tuple,
+    dynamic_dims: dict[str, list[tuple[str, int]]] | None = None,
+    example_kwargs: dict | None = None,
+) -> Graph:
     """Export a PyTorch model to our Graph IR.
 
     Sets eval mode and disables gradients for clean tracing,
@@ -34,19 +39,60 @@ def export_pytorch(model: nn.Module, example_inputs: tuple) -> Graph:
     Args:
         model: The PyTorch model to export.
         example_inputs: Tuple of example input tensors for tracing.
+        dynamic_dims: Symbol definitions for dynamic dimensions.
+            Maps symbol name to list of (input_name, dim_index) tuples.
+            e.g., {'L': [('input_ids', 1), ('position_ids', 1)]}
+            means dim 1 of both inputs is dynamic, called "L".
+        example_kwargs: Keyword arguments for the model forward pass.
+            e.g., {'position_ids': position_ids_tensor}
 
     Returns:
         A populated Graph ready for optimization passes.
     """
     model.eval()
     with torch.no_grad():
-        return _export_core(model, example_inputs)
+        return _export_core(model, example_inputs, dynamic_dims, example_kwargs)
 
 
-def _export_core(model: nn.Module, example_inputs: tuple) -> Graph:
+def _export_core(
+    model: nn.Module,
+    example_inputs: tuple,
+    dynamic_dims: dict[str, list[tuple[str, int]]] | None = None,
+    example_kwargs: dict | None = None,
+) -> Graph:
     """Core export logic — torch.export + ATen handler dispatch."""
-    # Step 1: torch.export (no decomposition — we handle high-level ops directly)
-    exported = torch.export.export(model, example_inputs)
+    # Step 1: Build torch dynamic_shapes and run torch.export
+    torch_dynamic_shapes = None
+    if dynamic_dims:
+        dims = {}  # symbol name -> Dim object
+        torch_dynamic_shapes = {}
+        for sym_name, specs in dynamic_dims.items():
+            dim_obj = torch.export.Dim(sym_name, min=1)
+            dims[sym_name] = dim_obj
+            for input_name, dim_idx in specs:
+                if input_name not in torch_dynamic_shapes:
+                    torch_dynamic_shapes[input_name] = {}
+                torch_dynamic_shapes[input_name][dim_idx] = dim_obj
+
+    exported = torch.export.export(
+        model, example_inputs,
+        kwargs=example_kwargs or {},
+        dynamic_shapes=torch_dynamic_shapes,
+    )
+
+    # Step 2: Build symbol map (SymInt string repr -> user symbol name)
+    symbol_map: dict[str, str] = {}
+    if dynamic_dims:
+        for fx_node in exported.graph_module.graph.nodes:
+            if fx_node.op != "placeholder":
+                continue
+            val = fx_node.meta["val"]
+            for sym_name, specs in dynamic_dims.items():
+                for input_name, dim_idx in specs:
+                    if fx_node.name == input_name:
+                        d = val.shape[dim_idx]
+                        if not isinstance(d, int):
+                            symbol_map[str(d)] = sym_name
 
     graph = Graph()
 
@@ -54,14 +100,18 @@ def _export_core(model: nn.Module, example_inputs: tuple) -> Graph:
     # inputs by the fx node names that appear in args.
     node_map: dict[str, str] = {}
 
-    # Step 2: Walk placeholders — register tensors, classify as input vs constant
+    # Step 3: Walk placeholders — register tensors, classify as input vs constant
     _process_placeholders(exported, graph, node_map)
 
-    # Step 3: Walk call_function nodes — map ATen ops to our IR
-    _process_compute_nodes(exported, graph, node_map)
+    # Step 4: Walk call_function nodes — map ATen ops to our IR
+    _process_compute_nodes(exported, graph, node_map, symbol_map)
 
-    # Step 4: Walk output node — register graph outputs
+    # Step 5: Walk output node — register graph outputs
     _process_outputs(exported, graph, node_map)
+
+    # Step 6: Store dynamic_dims on graph for downstream resolution
+    if dynamic_dims:
+        graph.dynamic_dims = dynamic_dims
 
     return graph
 
@@ -85,8 +135,12 @@ def _process_placeholders(exported, graph: Graph, node_map: dict[str, str]) -> N
             continue
 
         # Extract shape/dtype from tracing metadata
+        # Concretize SymInts to plain ints (TensorInfo.shape is always concrete)
         val = fx_node.meta["val"]
-        shape = tuple(val.shape)
+        shape = tuple(
+            d if isinstance(d, int) else int(d.node.hint)
+            for d in val.shape
+        )
         dtype = str(val.dtype).replace("torch.", "")  # "torch.float32" -> "float32"
 
         # Use the fx node name as our tensor name (readable, unique)
@@ -111,16 +165,24 @@ def _process_placeholders(exported, graph: Graph, node_map: dict[str, str]) -> N
                 raise ValueError(f"Weight/buffer '{state_key}' not found in state_dict or constants")
 
 
-def _process_compute_nodes(exported, graph: Graph, node_map: dict[str, str]) -> None:
+def _process_compute_nodes(exported, graph: Graph, node_map: dict[str, str],
+                           symbol_map: dict[str, str]) -> None:
     """Map ATen compute ops to our graph nodes via the handler registry."""
     for fx_node in exported.graph_module.graph.nodes:
         if fx_node.op != "call_function":
             continue
 
+        # Skip scalar-producing ops (sym_size, arithmetic on SymInts, etc.)
+        # These appear with dynamic shapes; their values are consumed via metadata.
+        val = fx_node.meta.get("val")
+        if val is not None and not isinstance(val, torch.Tensor):
+            if not (isinstance(val, tuple) and val and isinstance(val[0], torch.Tensor)):
+                continue
+
         handler = ATEN_HANDLERS.get(fx_node.target)
         if handler is None:
             raise ValueError(f"Unsupported ATen op: {fx_node.target}")
-        handler(fx_node, graph, node_map)
+        handler(fx_node, graph, node_map, symbol_map)
 
 
 def _process_outputs(exported, graph: Graph, node_map: dict[str, str]) -> None:

@@ -27,6 +27,9 @@ ScratchCalculator = Callable[[list[tuple[int, ...]], tuple[int, ...], dict], int
 # Extras packer: (node, graph) -> list of ints for COpNode.extra[]
 ExtrasPacker = Callable[[Node, Graph], list[int]]
 
+# Shape inference: (input_shapes, attrs) -> output_shape
+ShapeInfer = Callable[[list[tuple[int, ...]], dict[str, Any]], tuple[int, ...]]
+
 
 def _float_bits(f: float) -> int:
     """Bit-cast a float32 to int32 for packing into COpNode.extra[].
@@ -71,6 +74,10 @@ class OpDef:
         extras: Packs op-specific parameters into COpNode.extra[] for the
             compiled C executor. Returns a list of ints. Floats must be
             bit-cast via _float_bits(). None = no extras needed.
+        shape: Computes output shape from input shapes and attrs. Used by
+            infer_shapes() to propagate shapes through the graph without
+            re-exporting. None = output shape equals first input's shape
+            (correct for element-wise, softmax, layernorm, etc.).
     """
     evaluator: NumpyEvaluator | None = None
     scratch: ScratchCalculator | None = None
@@ -78,6 +85,7 @@ class OpDef:
     alias_offset: AliasOffset | None = None
     inplace: bool = False
     extras: ExtrasPacker | None = None
+    shape: ShapeInfer | None = None
 
     def is_alias(self, node: Node) -> bool:
         """Check whether this node is an alias (zero-copy) op."""
@@ -110,6 +118,8 @@ def _eval_attention(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
     Q, K, V = ins[0], ins[1], ins[2]
     scale = 1.0 / np.sqrt(Q.shape[-1])
     scores = np.matmul(Q, np.swapaxes(K, -2, -1)) * scale
+    if len(ins) > 3:
+        scores = scores + ins[3]
     if attrs.get("causal"):
         seq_len = Q.shape[-2]
         mask = np.triu(np.full((seq_len, seq_len), -np.inf, dtype=np.float32), k=1)
@@ -194,9 +204,10 @@ def _layernorm_extras(node: Node, graph: Graph) -> list[int]:
 
 
 def _attention_extras(node: Node, graph: Graph) -> list[int]:
-    """extra = [seq_len, head_dim, causal]"""
+    """extra = [seq_len, head_dim, causal, has_mask]"""
     q_shape = graph.tensors[node.inputs[0]].shape
-    return [q_shape[-2], q_shape[-1], 1 if node.attrs.get("causal") else 0]
+    has_mask = 1 if len(node.inputs) > 3 else 0
+    return [q_shape[-2], q_shape[-1], 1 if node.attrs.get("causal") else 0, has_mask]
 
 
 def _pow_extras(node: Node, graph: Graph) -> list[int]:
@@ -234,6 +245,88 @@ def _slice_extras(node: Node, graph: Graph) -> list[int]:
         inner *= in_shape[d]
 
     return [outer, in_shape[dim], start, end - start, inner]
+
+
+# ---------------------------------------------------------------------------
+# Shape inference functions
+# ---------------------------------------------------------------------------
+# Only needed for ops whose output shape differs from the first input.
+# Ops that preserve the first input's shape (element-wise, softmax,
+# layernorm, etc.) use the None default.
+
+def _shape_broadcast_binary(in_shapes, attrs):
+    """Binary ops with broadcasting (ADD, SUB, MUL, DIV)."""
+    if "scalar" in attrs:
+        return in_shapes[0]
+    return tuple(np.broadcast_shapes(in_shapes[0], in_shapes[1]))
+
+
+def _shape_matmul(in_shapes, attrs):
+    """MATMUL: (..., M, K) × (..., K, N) -> (..., M, N)."""
+    a = in_shapes[0]
+    b = in_shapes[1]
+    N = b[-2] if attrs.get("transpose_b") else b[-1]
+    return (*a[:-1], N)
+
+
+def _shape_reshape(in_shapes, attrs):
+    target = list(attrs["shape"])
+    # If any dimension is still a string (unresolved symbol), return as-is
+    if any(isinstance(d, str) for d in target):
+        return tuple(target)
+    # Resolve -1 from input element count
+    in_total = 1
+    for d in in_shapes[0]:
+        in_total *= d
+    neg_idx = None
+    known = 1
+    for i, d in enumerate(target):
+        if d == -1:
+            neg_idx = i
+        else:
+            known *= d
+    if neg_idx is not None:
+        target[neg_idx] = in_total // known
+    return tuple(target)
+
+
+def _shape_transpose(in_shapes, attrs):
+    shape = list(in_shapes[0])
+    d0, d1 = attrs["dim0"], attrs["dim1"]
+    shape[d0], shape[d1] = shape[d1], shape[d0]
+    return tuple(shape)
+
+
+def _shape_permute(in_shapes, attrs):
+    shape = in_shapes[0]
+    return tuple(shape[i] for i in attrs["axes"])
+
+
+def _shape_slice(in_shapes, attrs):
+    shape = list(in_shapes[0])
+    dim = attrs["dim"]
+    shape[dim] = attrs["end"] - attrs.get("start", 0)
+    return tuple(shape)
+
+
+def _shape_reduce(in_shapes, attrs):
+    shape = list(in_shapes[0])
+    axis = attrs["axis"]
+    if attrs.get("keepdim", False):
+        shape[axis] = 1
+    else:
+        shape.pop(axis)
+    return tuple(shape)
+
+
+def _shape_attention(in_shapes, attrs):
+    """ATTENTION: Q shape with last dim from V."""
+    return (*in_shapes[0][:-1], in_shapes[2][-1])
+
+
+def _shape_embedding(in_shapes, attrs):
+    """EMBEDDING: (*indices_shape, embed_dim)."""
+    return (*in_shapes[0], in_shapes[1][-1])
 
 
 # ---------------------------------------------------------------------------
@@ -296,13 +389,14 @@ def _eval_index(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
 
 OP_REGISTRY: dict[OpType, OpDef] = {
     # --- Element-wise (all safe for in-place on first input) ---
-    OpType.ADD:     OpDef(inplace=True, extras=_add_extras,
+    # shape=None → output shape equals first input's shape.
+    OpType.ADD:     OpDef(inplace=True, extras=_add_extras, shape=_shape_broadcast_binary,
                           evaluator=lambda ins, a: ins[0] + (a["scalar"] if "scalar" in a else ins[1])),
-    OpType.SUB:     OpDef(inplace=True, extras=_scalar_binop_extras,
+    OpType.SUB:     OpDef(inplace=True, extras=_scalar_binop_extras, shape=_shape_broadcast_binary,
                           evaluator=lambda ins, a: ins[0] - (a["scalar"] if "scalar" in a else ins[1])),
-    OpType.MUL:     OpDef(inplace=True, extras=_scalar_binop_extras,
+    OpType.MUL:     OpDef(inplace=True, extras=_scalar_binop_extras, shape=_shape_broadcast_binary,
                           evaluator=lambda ins, a: ins[0] * (a["scalar"] if "scalar" in a else ins[1])),
-    OpType.DIV:     OpDef(inplace=True, extras=_scalar_binop_extras,
+    OpType.DIV:     OpDef(inplace=True, extras=_scalar_binop_extras, shape=_shape_broadcast_binary,
                           evaluator=lambda ins, a: ins[0] / (a["scalar"] if "scalar" in a else ins[1])),
     OpType.RELU:    OpDef(inplace=True,
                           evaluator=lambda ins, a: np.maximum(ins[0], 0)),
@@ -316,43 +410,46 @@ OP_REGISTRY: dict[OpType, OpDef] = {
                           evaluator=lambda ins, a: 0.5 * ins[0] * (1 + np.tanh(0.7978845608 * (ins[0] + 0.044715 * ins[0]**3)))),
 
     # --- Reductions ---
-    OpType.MAX:     OpDef(extras=_reduction_extras,
+    OpType.MAX:     OpDef(extras=_reduction_extras, shape=_shape_reduce,
                           evaluator=lambda ins, a: np.max(ins[0], axis=a["axis"], keepdims=a.get("keepdim", False))),
-    OpType.SUM:     OpDef(extras=_reduction_extras,
+    OpType.SUM:     OpDef(extras=_reduction_extras, shape=_shape_reduce,
                           evaluator=lambda ins, a: np.sum(ins[0], axis=a["axis"], keepdims=a.get("keepdim", False))),
     OpType.SOFTMAX: OpDef(evaluator=_eval_softmax),
 
     # --- Shape ops ---
-    OpType.RESHAPE:     OpDef(alias=True,
+    OpType.RESHAPE:     OpDef(alias=True, shape=_shape_reshape,
                               evaluator=lambda ins, a: ins[0].reshape(a["shape"])),
-    OpType.TRANSPOSE:   OpDef(extras=_transpose_extras,
+    OpType.TRANSPOSE:   OpDef(extras=_transpose_extras, shape=_shape_transpose,
                               evaluator=lambda ins, a: np.swapaxes(ins[0], a["dim0"], a["dim1"])),
-    OpType.PERMUTE:     OpDef(evaluator=lambda ins, a: np.transpose(ins[0], a["axes"])),
-    OpType.SLICE:       OpDef(alias=_slice_alias,
+    OpType.PERMUTE:     OpDef(evaluator=lambda ins, a: np.transpose(ins[0], a["axes"]),
+                              shape=_shape_permute),
+    OpType.SLICE:       OpDef(alias=_slice_alias, shape=_shape_slice,
                               alias_offset=lambda n: n.attrs.get("byte_offset", 0),
-                              extras=_slice_extras),
+                              extras=_slice_extras,
+                              evaluator=_eval_slice_tensor),
 
     # --- Compound ops ---
     OpType.LAYERNORM:   OpDef(extras=_layernorm_extras, evaluator=_eval_layernorm),
-    OpType.MATMUL:      OpDef(extras=_matmul_extras,
+    OpType.MATMUL:      OpDef(extras=_matmul_extras, shape=_shape_matmul,
                               evaluator=lambda ins, a: ins[0] @ (np.swapaxes(ins[1], -2, -1) if a.get("transpose_b") else ins[1]) * a.get("alpha", 1.0)),
-    OpType.EMBEDDING:   OpDef(extras=_embedding_extras,
+    OpType.EMBEDDING:   OpDef(extras=_embedding_extras, shape=_shape_embedding,
                               evaluator=lambda ins, a: ins[1][ins[0].astype(int)]),
 
     # --- Fused ops ---
-    OpType.MATMUL_ADD:      OpDef(extras=_matmul_extras,
+    OpType.MATMUL_ADD:      OpDef(extras=_matmul_extras, shape=_shape_matmul,
                                   evaluator=lambda ins, a: ins[0] @ (ins[1].T if a.get("transpose_b") else ins[1]) * a.get("alpha", 1.0) + ins[2]),
     OpType.FUSED_BIAS_RELU: OpDef(inplace=True, evaluator=lambda ins, a: np.maximum(ins[0] + ins[1], 0)),
     OpType.ATTENTION:       OpDef(extras=_attention_extras, scratch=_attention_scratch,
-                                  evaluator=_eval_attention),
+                                  shape=_shape_attention, evaluator=_eval_attention),
 
     # --- Fold-only ops (100+) ---
     # Infrastructure ops for mask generation, type conversion, etc.
     # Must be eliminated by constant folding before execution — neither
     # executor supports them. Evaluators here are used by constant_fold().
+    OpType.ARANGE:       OpDef(evaluator=lambda ins, a: np.arange(a["start"], a["end"], dtype=np.dtype(a["dtype"])),
+                              shape=lambda in_shapes, a: (a["end"] - a["start"],)),
     OpType.CAST:         OpDef(evaluator=lambda ins, a: ins[0].astype(a["target_dtype"])),
     OpType.EXPAND:       OpDef(evaluator=lambda ins, a: np.broadcast_to(ins[0], a["shape"])),
-    OpType.SLICE_TENSOR: OpDef(evaluator=_eval_slice_tensor),
     OpType.DIFF:         OpDef(evaluator=_eval_diff),
     OpType.CMP_NE:       OpDef(evaluator=lambda ins, a: ins[0] != (a["scalar"] if "scalar" in a else ins[1])),
     OpType.CMP_LE:       OpDef(evaluator=lambda ins, a: ins[0] <= ins[1]),
@@ -361,3 +458,110 @@ OP_REGISTRY: dict[OpType, OpDef] = {
     OpType.BITWISE_AND:  OpDef(evaluator=lambda ins, a: ins[0] & ins[1]),
     OpType.INDEX:        OpDef(evaluator=_eval_index),
 }
+
+
+# ---------------------------------------------------------------------------
+# Shape propagation
+# ---------------------------------------------------------------------------
+
+def resolve_graph(graph: Graph, bindings: dict[str, int]) -> Graph:
+    """Create a concrete copy of a symbolic graph.
+
+    Returns a new Graph with all symbolic dimensions resolved to concrete
+    values. The original graph is not modified — its attrs keep symbol
+    strings, so it can be re-resolved with different bindings.
+
+    Weight buffers are shared (not copied). Only tensor metadata, node
+    attrs, and connectivity indices are copied and resolved.
+
+    Args:
+        graph: An optimized graph, possibly containing symbolic strings
+            in node attrs (e.g., RESHAPE shape=(1, "L", 768)).
+        bindings: Maps symbol names to concrete values, e.g., {'L': 50}.
+
+    Returns:
+        A new Graph with all symbols resolved, shapes propagated, and
+        ready for planning and compilation.
+    """
+    resolved = Graph()
+
+    # --- Copy tensors (share weight buffers) ---
+    for name, t in graph.tensors.items():
+        info = resolved.add_tensor(name, t.shape, t.dtype)
+        info.buffer = t.buffer  # share, don't copy
+
+    # --- Copy nodes with resolved attrs ---
+    def _resolve(v):
+        if isinstance(v, str) and v in bindings:
+            return bindings[v]
+        if isinstance(v, tuple):
+            return tuple(_resolve(x) for x in v)
+        if isinstance(v, list):
+            return [_resolve(x) for x in v]
+        return v
+
+    for node in graph:
+        resolved_attrs = {k: _resolve(v) for k, v in node.attrs.items()}
+        resolved.add_node(node.op, list(node.inputs), node.output, resolved_attrs)
+
+    # --- Copy graph roles ---
+    resolved.inputs = list(graph.inputs)
+    resolved.outputs = list(graph.outputs)
+    resolved.constants = list(graph.constants)
+    resolved.dynamic_dims = graph.dynamic_dims
+
+    # --- Resolve input shapes from bindings ---
+    input_shapes = {}
+    for name in resolved.inputs:
+        shape = list(resolved.tensors[name].shape)
+        for sym_name, specs in graph.dynamic_dims.items():
+            if sym_name in bindings:
+                for tensor_name, dim_idx in specs:
+                    if tensor_name == name:
+                        shape[dim_idx] = bindings[sym_name]
+        input_shapes[name] = tuple(shape)
+
+    # --- Propagate shapes ---
+    infer_shapes(resolved, input_shapes)
+
+    # --- Fix RESHAPE attrs to match inferred output shapes ---
+    # Resolves -1 in view/reshape args to concrete values
+    for node in resolved:
+        if node.op == OpType.RESHAPE:
+            node.attrs["shape"] = resolved.tensors[node.output].shape
+
+    # --- Post-resolution passes ---
+    # Fold ops that depended on dynamic dims (e.g., ARANGE with end=seq_len)
+    # and clean up any dead subgraphs.
+    from .passes import POST_RESOLUTION_PIPELINE, run_pipeline
+    run_pipeline(resolved, POST_RESOLUTION_PIPELINE)
+
+    return resolved
+
+
+def infer_shapes(graph: Graph, input_shapes: dict[str, tuple[int, ...]]) -> None:
+    """Propagate shapes through the graph given new input dimensions.
+
+    Sets input tensor shapes from input_shapes, then walks the graph in
+    topological order applying per-op shape rules to derive all
+    intermediate shapes. Constants keep their existing shapes.
+
+    This allows re-planning and re-compiling for a new input shape
+    (e.g., different sequence length) without re-exporting.
+
+    Args:
+        graph: An already-optimized graph (passes should be run once before
+            this; shape inference replaces re-export, not re-optimization).
+        input_shapes: Map of graph input names to new concrete shapes.
+    """
+    for name, shape in input_shapes.items():
+        graph.tensors[name].shape = shape
+
+    for node in graph:
+        op_def = OP_REGISTRY.get(node.op)
+        in_shapes = [graph.tensors[inp].shape for inp in node.inputs]
+        if op_def is not None and op_def.shape is not None:
+            graph.tensors[node.output].shape = op_def.shape(in_shapes, node.attrs)
+        else:
+            # Default: preserve first input's shape
+            graph.tensors[node.output].shape = in_shapes[0]

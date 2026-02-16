@@ -28,25 +28,35 @@ This is an interactive learning project and interview prep artifact for the ONNX
 
 ```
 runtime/
-  ir.py          — Graph IR: OpType, TensorInfo, Node, Graph
-  exporter.py    — torch.export → our Graph (handler registry)
-  passes.py      — Optimization passes: BLAS flag absorption, constant folding, fusion, DCE
-  planner.py     — Memory planner: lifetime analysis, arena offset assignment, scratch buffers, ExecutionPlan
-  executor.py    — Executor (per-op dispatch + compiled C dispatch), Backend protocol
+  ir.py              — Graph IR: OpType, TensorInfo, Node, Graph (summary, dump, save/load)
+  ops.py             — Op registry: evaluators, scratch calculators, alias/inplace flags, extras packers
+  planner.py         — Memory planner: lifetime analysis, arena offsets, scratch buffers, PlanStats
+  session.py         — Session API: optimize → plan → compile → run (verbose, profile options)
+  exporter/
+    exporter.py      — torch.export → our Graph (three-phase pipeline)
+    handlers.py      — ATen op handler registry + handler utilities
+  passes/
+    passes.py        — Pass infrastructure + core passes (absorption, folding, DCE)
+    fusion.py        — Pattern-based fusion + DAG fusion (GELU recognition)
+  executor/
+    common.py        — Executor ABC, COpNode struct, profiling types (OpTiming, RunProfile)
+    compiled.py      — CompiledExecutor: single ctypes call for whole graph
+    interpreted.py   — InterpretedExecutor: Python loop with backend chain
   backends/
     numpy_backend.py — In-place numpy kernels (fallback)
     c_backend.py     — ctypes bindings to C shared library
 csrc/
-  ops.c          — C operator kernels (matmul via CBLAS, add, relu, attention, etc.)
-  executor.c     — C dispatch loop (OpNode struct, switch-based dispatch, calls into ops.c)
-  Makefile       — Build system (Accelerate on macOS, OpenBLAS on Linux)
+  ops.c              — C operator kernels (matmul via CBLAS, add, relu, attention, etc.)
+  executor.c         — C dispatch loop (function pointer table, calls into ops.c)
+  Makefile           — Build system (Accelerate on macOS, OpenBLAS on Linux)
 tests/
-  conftest.py      — Shared fixtures (backends, models, helpers)
-  test_backends.py — Op correctness: every op × both backends × various shapes
+  conftest.py        — Shared fixtures (backends, models, helpers)
+  test_backends.py   — Op correctness: every op × both backends × various shapes
   test_end_to_end.py — Full pipeline oracle tests (per-op + compiled vs PyTorch)
-  test_passes.py   — Optimization pass invariants + correctness
-  test_planner.py  — Arena no-overlap, reuse savings, reshape aliasing
-  test_benchmark.py — Performance ablation (pytest -m benchmark -s)
+  test_passes.py     — Optimization pass invariants + correctness
+  test_planner.py    — Arena no-overlap, reuse savings, reshape aliasing
+  test_benchmark.py  — Performance ablation (pytest -m benchmark -s)
+ablation/            — Standalone benchmark scripts (transformer ablation, memory comparison, ORT)
 ```
 
 ## Pipeline Flow

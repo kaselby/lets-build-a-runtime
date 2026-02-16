@@ -291,6 +291,17 @@ def absorb_mask_into_attention(graph: Graph) -> bool:
 # Constant folding
 # ---------------------------------------------------------------------------
 
+def _has_unresolved_symbols(attrs: dict, symbols: set[str]) -> bool:
+    """Check if any attr value contains an unresolved symbol string."""
+    for v in attrs.values():
+        if isinstance(v, str) and v in symbols:
+            return True
+        if isinstance(v, (tuple, list)):
+            if any(isinstance(x, str) and x in symbols for x in v):
+                return True
+    return False
+
+
 def constant_fold(graph: Graph) -> bool:
     """Evaluate nodes whose inputs are all constants.
 
@@ -298,9 +309,14 @@ def constant_fold(graph: Graph) -> bool:
     numpy array) and the node is removed. Uses evaluators from the
     centralized op registry. If input constants become dead after folding,
     DCE will clean them up.
+
+    Nodes whose attrs contain unresolved symbol strings (from dynamic
+    shapes) are skipped — they'll be folded post-resolution when
+    symbols have concrete values.
     """
     changed = False
     constant_set = set(graph.constants)
+    symbols = set(graph.dynamic_dims.keys())
 
     for node in list(graph):  # topological order — ensures inputs are folded first
         if not all(inp in constant_set for inp in node.inputs):
@@ -308,6 +324,9 @@ def constant_fold(graph: Graph) -> bool:
 
         op_def = OP_REGISTRY.get(node.op)
         if op_def is None or op_def.evaluator is None:
+            continue
+
+        if symbols and _has_unresolved_symbols(node.attrs, symbols):
             continue
 
         input_buffers = [graph.tensors[inp].buffer for inp in node.inputs]
@@ -319,7 +338,9 @@ def constant_fold(graph: Graph) -> bool:
         declared_dtype = np.dtype(graph.tensors[node.output].dtype)
         if result.dtype != declared_dtype:
             result = result.astype(declared_dtype)
-        graph.tensors[node.output].buffer = np.ascontiguousarray(result)
+        out_tensor = graph.tensors[node.output]
+        out_tensor.buffer = np.ascontiguousarray(result)
+        out_tensor.shape = result.shape
         graph.constants.append(node.output)
         constant_set.add(node.output)
 
@@ -370,16 +391,31 @@ def eliminate_dead_code(graph: Graph) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Default pipeline
+# Pass pipelines
 # ---------------------------------------------------------------------------
 
 from .fusion import fuse, fuse_dags
 
-DEFAULT_PIPELINE.extend([
+# Pre-resolution: structural passes on the (possibly symbolic) graph.
+# Constant folding folds what it can (weight-only subgraphs); ops with
+# unresolved symbolic attrs are skipped and left for post-resolution.
+PRE_RESOLUTION_PIPELINE: list[Pass] = [
     absorb_into_matmul,
     constant_fold,
     absorb_mask_into_attention,
     fuse_dags,
     fuse,
     eliminate_dead_code,
-])
+]
+
+# Post-resolution: runs on the concrete resolved graph.  Folds ops that
+# depended on dynamic dims (e.g., ARANGE with end=seq_len) and cleans up
+# any dead subgraphs that folding exposes.
+POST_RESOLUTION_PIPELINE: list[Pass] = [
+    constant_fold,
+    absorb_mask_into_attention,
+    eliminate_dead_code,
+]
+
+# Backwards compat — existing tests and scripts use DEFAULT_PIPELINE.
+DEFAULT_PIPELINE.extend(PRE_RESOLUTION_PIPELINE)
