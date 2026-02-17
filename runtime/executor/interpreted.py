@@ -12,7 +12,7 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
-from ..ir import OpType
+from ..ir import FOLD_ONLY_BASE, OpType
 from ..ops import OP_REGISTRY
 from ..planner import MemoryPlan
 from .common import Executor, OpTiming, RunProfile
@@ -61,7 +61,7 @@ class InterpretedExecutor(Executor):
             op_def = OP_REGISTRY.get(node.op)
             if op_def is not None and op_def.is_alias(node) and node.inputs[0] not in external:
                 continue
-            if node.op.value >= 100:
+            if node.op.value >= FOLD_ONLY_BASE:
                 raise RuntimeError(
                     f"Fold-only op {node.op.name} reached interpreted executor — "
                     f"should have been eliminated by constant folding"

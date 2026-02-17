@@ -22,64 +22,77 @@ class OpType(Enum):
     """Operator types supported by the runtime.
 
     Values use range-based numbering so related ops cluster together:
-      10–19  Element-wise unary
-      20–29  Element-wise binary
-      30–39  Reductions
-      40–49  MatMul / BLAS
-      50–59  Shape / data movement
-      60–69  Normalization / compound
-      70–79  Fused ops
-      100+   Fold-only (constant-folded, never dispatched to C)
+      100–199    Element-wise unary
+      200–299    Element-wise binary
+      300–399    Reductions
+      400–499    MatMul / BLAS
+      500–599    Shape / data movement
+      600–699    Normalization / compound
+      1000–1499  Fused ops
+      5000+      Fold-only (constant-folded, never dispatched to C)
 
     C code (executor.c) uses a matching enum — values must stay in sync.
     """
-    # --- Element-wise unary (10–19) ---
-    RELU = 10
-    EXP  = 11
-    TANH = 12
-    POW  = 13            # attrs["scalar"]
-    GELU = 14            # tanh approximation
+    # --- Element-wise unary (100–199) ---
+    RELU  = 100
+    EXP   = 101
+    TANH  = 102
+    POW   = 103          # attrs["scalar"]
+    GELU  = 104          # tanh approximation
+    RSQRT = 105          # 1/sqrt(x)
+    SILU  = 106          # x * sigmoid(x)
+    NEG   = 107          # -x
+    COS   = 108          # cos(x)
+    SIN   = 109          # sin(x)
 
-    # --- Element-wise binary (20–29) ---
-    ADD = 20
-    SUB = 21
-    MUL = 22
-    DIV = 23
+    # --- Element-wise binary (200–299) ---
+    ADD = 200
+    SUB = 201
+    MUL = 202
+    DIV = 203
 
-    # --- Reductions (30–39) ---
-    MAX     = 30         # attrs["axis", "keepdim"]
-    SUM     = 31         # attrs["axis", "keepdim"]
-    SOFTMAX = 32         # attrs["axis"]
+    # --- Reductions (300–399) ---
+    MAX     = 300        # attrs["axis", "keepdim"]
+    SUM     = 301        # attrs["axis", "keepdim"]
+    SOFTMAX = 302        # attrs["axis"]
 
-    # --- MatMul / BLAS (40–49) ---
-    MATMUL = 40
+    # --- MatMul / BLAS (400–499) ---
+    MATMUL = 400
 
-    # --- Shape / data movement (50–59) ---
-    RESHAPE   = 50       # attrs["shape"]
-    TRANSPOSE = 51       # 2D swap or N-dim swapaxes
-    PERMUTE   = 52       # attrs["axes"]
-    SLICE     = 53       # attrs["byte_offset"]
-    EMBEDDING = 54       # inputs: [indices, weight_table]
+    # --- Shape / data movement (500–599) ---
+    RESHAPE   = 500      # attrs["shape"]
+    TRANSPOSE = 501      # 2D swap or N-dim swapaxes
+    PERMUTE   = 502      # attrs["axes"]
+    SLICE     = 503      # attrs["byte_offset"]
+    EMBEDDING = 504      # inputs: [indices, weight_table]
+    CAT       = 505      # attrs["dim"], variable inputs
 
-    # --- Normalization / compound (60–69) ---
-    LAYERNORM = 60       # attrs["eps"], inputs: [x, weight, bias]
+    # --- Normalization / compound (600–699) ---
+    LAYERNORM = 600      # attrs["eps"], inputs: [x, weight, bias]
+    RMSNORM   = 601      # attrs["eps"], inputs: [x, weight]
 
-    # --- Fused ops (70–79) ---
-    MATMUL_ADD      = 70 # inputs: [A, B, bias]
-    FUSED_BIAS_RELU = 71 # inputs: [x, bias]
-    ATTENTION       = 72 # inputs: [Q, K, V], scratch: [BH × S × S]
+    # --- Fused ops (1000–1499) ---
+    MATMUL_ADD      = 1000 # inputs: [A, B, bias]
+    FUSED_BIAS_RELU = 1001 # inputs: [x, bias]
+    ATTENTION       = 1002 # inputs: [Q, K, V], scratch: [BH × S × S]
+    GATED_ACT       = 1003 # inputs: [x, up] or [x, bias, up]; attrs["act", "has_bias"]
 
-    # --- Fold-only (100+, constant-folded away, never dispatched to C) ---
-    CAST         = 100
-    EXPAND       = 101
-    ARANGE       = 102   # attrs["start", "end", "dtype"]
-    DIFF         = 103   # attrs["n", "dim"]
-    CMP_NE       = 104
-    CMP_LE       = 105
-    CMP_EQ       = 106
-    CUMSUM       = 107   # attrs["dim"]
-    BITWISE_AND  = 108
-    INDEX        = 109
+    # --- Fold-only (FOLD_ONLY_BASE+, constant-folded away, never dispatched to C) ---
+    CAST         = 5000
+    EXPAND       = 5001
+    ARANGE       = 5002  # attrs["start", "end", "dtype"]
+    DIFF         = 5003  # attrs["n", "dim"]
+    CMP_NE       = 5004
+    CMP_LE       = 5005
+    CMP_EQ       = 5006
+    CUMSUM       = 5007  # attrs["dim"]
+    BITWISE_AND  = 5008
+    INDEX        = 5009
+
+
+# Ops with value >= this are fold-only: evaluated by constant folding,
+# never dispatched to C kernels or any executor backend.
+FOLD_ONLY_BASE = 5000
 
 
 @dataclass

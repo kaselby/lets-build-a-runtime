@@ -358,6 +358,14 @@ def _handle_sdpa(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: di
     if is_causal:
         attrs["causal"] = True
 
+    # GQA: detect Q/K head count mismatch (e.g. 16 Q heads, 8 KV heads)
+    q_shape = fx_node.args[0].meta["val"].shape
+    k_shape = fx_node.args[1].meta["val"].shape
+    if len(q_shape) >= 3 and len(q_shape) == len(k_shape):
+        n_q, n_kv = q_shape[-3], k_shape[-3]
+        if isinstance(n_q, int) and isinstance(n_kv, int) and n_q > n_kv and n_q % n_kv == 0:
+            attrs["group_size"] = n_q // n_kv
+
     _emit(fx_node, graph, node_map, OpType.ATTENTION, inputs, attrs)
 
 
@@ -567,6 +575,20 @@ def _handle_index(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: d
     _emit(fx_node, graph, node_map, OpType.INDEX, inputs, attrs)
 
 
+def _handle_cat(fx_node, graph: Graph, node_map: dict[str, str], symbol_map: dict[str, str]) -> None:
+    """Handle aten.cat.default — concatenate tensors along a dimension.
+
+    args[0] is a list of tensor nodes, args[1] is the dim (default 0).
+    """
+    tensor_list = fx_node.args[0]
+    inputs = [node_map[t.name] for t in tensor_list]
+    dim = fx_node.args[1] if len(fx_node.args) > 1 else 0
+    ndim = len(tensor_list[0].meta["val"].shape)
+    if isinstance(dim, int) and dim < 0:
+        dim = dim + ndim
+    _emit(fx_node, graph, node_map, OpType.CAT, inputs, {"dim": dim})
+
+
 # --- Handler registry ---
 
 ATEN_HANDLERS: dict[object, OpHandler] = {
@@ -575,6 +597,11 @@ ATEN_HANDLERS: dict[object, OpHandler] = {
     torch.ops.aten.exp.default:         _make_simple_handler(OpType.EXP),
     torch.ops.aten.tanh.default:        _make_simple_handler(OpType.TANH),
     torch.ops.aten.gelu.default:        _make_simple_handler(OpType.GELU),
+    torch.ops.aten.rsqrt.default:       _make_simple_handler(OpType.RSQRT),
+    torch.ops.aten.silu.default:        _make_simple_handler(OpType.SILU),
+    torch.ops.aten.neg.default:         _make_simple_handler(OpType.NEG),
+    torch.ops.aten.cos.default:         _make_simple_handler(OpType.COS),
+    torch.ops.aten.sin.default:         _make_simple_handler(OpType.SIN),
 
     # Simple multi-input ops (all args are tensors, no attrs)
     torch.ops.aten.mm.default:          _make_simple_handler(OpType.MATMUL),
@@ -639,11 +666,13 @@ ATEN_HANDLERS: dict[object, OpHandler] = {
 
     # Infrastructure ops (emitted as nodes, constant-folded away)
     torch.ops.aten.to.dtype_layout:         _handle_to_dtype,
+    torch.ops.aten.to.dtype:                _handle_to_dtype,
     torch.ops.aten.expand.default:          _handle_expand,
     torch.ops.aten.slice.Tensor:            _handle_slice_tensor,
     torch.ops.aten.diff.default:            _handle_diff,
     torch.ops.aten.cumsum.default:          _handle_cumsum,
     torch.ops.aten.index.Tensor:            _handle_index,
+    torch.ops.aten.cat.default:             _handle_cat,
 
     # No-ops (alias or inference-mode identity)
     torch.ops.aten.contiguous.default:                      _handle_noop,

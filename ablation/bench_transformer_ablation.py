@@ -1,5 +1,5 @@
 """
-Transformer ablation benchmark: attention / layernorm / other time breakdown.
+Transformer ablation benchmark: attention / layernorm / linear / element-wise / data movement / other time breakdown.
 
 Measures performance across:
   - PyTorch baselines (naive F.softmax + SDPA)
@@ -9,8 +9,8 @@ Measures performance across:
   - Attention kernel variants (scalar, SIMD, SIMD+GCD)
   - LayerNorm kernel variants (scalar, SIMD, SIMD+GCD)
 
-For each variant, reports total time and three-way breakdown:
-attention, layernorm, and everything else.
+For each variant, reports total time and six-way breakdown:
+attention, layernorm, linear, element-wise, data movement, and everything else.
 
 Run:  python bench_transformer_ablation.py [--configs toy,small,...] [--skip-large]
 """
@@ -48,11 +48,44 @@ from runtime.passes import (
     eliminate_dead_code,
     fuse,
 )
+from runtime.ops import OP_REGISTRY
 from runtime.planner import plan
+
+# ---------------------------------------------------------------------------
+# Scratch override for ablation
+#
+# The main planner allocates flash-sized scratch (BR*BC) for long sequences,
+# but ablation needs to run both standard (S*S) and flash (various tile sizes)
+# from the same plan. We temporarily override the attention scratch calculator
+# to allocate max(S*S, largest_tile) per slice, ensuring every variant fits.
+# ---------------------------------------------------------------------------
+_MAX_ABLATION_TILE = 256 * 512  # largest flash block size in ablation
+
+
+def _ablation_attention_scratch(input_shapes, output_shape, attrs) -> int:
+    q_shape = input_shapes[0]
+    batch_heads = 1
+    for d in q_shape[:-2]:
+        batch_heads *= d
+    seq_len = q_shape[-2]
+    per_slice = max(seq_len * seq_len, _MAX_ABLATION_TILE)
+    return batch_heads * per_slice * 4  # float32
+
+
+def _plan_for_ablation(graph):
+    """Plan with scratch large enough for all attention variants."""
+    attn_def = OP_REGISTRY[OpType.ATTENTION]
+    original_scratch = attn_def.scratch
+    attn_def.scratch = _ablation_attention_scratch
+    try:
+        return plan(graph)
+    finally:
+        attn_def.scratch = original_scratch
+
 
 try:
     import onnxruntime as ort
-    HAS_ORT = True
+    HAS_ORT = False  # XXX: disabled — onnxscript GC segfault when running all configs
 except ImportError:
     HAS_ORT = False
 
@@ -252,15 +285,28 @@ def _load_ablation_lib():
 # =====================================================================
 
 def classify_op_indices(graph, exec_order):
-    """Return (attn_indices, ln_indices) for the RESHAPE-stripped execution order.
+    """Return dict of category name -> set of indices into RESHAPE-stripped execution order.
 
-    Attention ops: fused ATTENTION nodes, or the SOFTMAX + its neighboring
-    MATMULs (Q@K^T and W@V) in unfused graphs.
-    LayerNorm ops: any LAYERNORM node.
+    Categories:
+      "attn"    — fused ATTENTION nodes, or SOFTMAX + neighboring MATMULs in unfused graphs
+      "ln"      — LAYERNORM or RMSNORM
+      "linear"  — MATMUL, MATMUL_ADD that are NOT in the attn set
+      "elemwise" — ADD, SUB, MUL, DIV, RELU, EXP, TANH, POW, GELU, SILU, NEG, COS, SIN,
+                   RSQRT, FUSED_BIAS_RELU, GATED_ACT
+      "move"    — TRANSPOSE, PERMUTE
     """
-    attn_ids = set()
-    ln_ids = set()
+    ELEMWISE_OPS = {
+        OpType.ADD, OpType.SUB, OpType.MUL, OpType.DIV,
+        OpType.RELU, OpType.EXP, OpType.TANH, OpType.POW,
+        OpType.GELU, OpType.SILU, OpType.NEG, OpType.COS, OpType.SIN,
+        OpType.RSQRT, OpType.FUSED_BIAS_RELU, OpType.GATED_ACT,
+    }
+    MOVE_OPS = {OpType.TRANSPOSE, OpType.PERMUTE}
+    LN_OPS = {OpType.LAYERNORM, OpType.RMSNORM}
+    LINEAR_OPS = {OpType.MATMUL, OpType.MATMUL_ADD}
 
+    # First pass: identify attention node IDs (same logic as before)
+    attn_ids = set()
     for node in exec_order:
         if node.op == OpType.ATTENTION:
             attn_ids.add(node.id)
@@ -272,13 +318,26 @@ def classify_op_indices(graph, exec_order):
             for c in graph.consumers(node.output):
                 if c.op == OpType.MATMUL:
                     attn_ids.add(c.id)
-        elif node.op == OpType.LAYERNORM:
-            ln_ids.add(node.id)
 
+    # Second pass: classify each node in RESHAPE-stripped order
     stripped = [n for n in exec_order if n.op != OpType.RESHAPE]
-    attn_set = {i for i, n in enumerate(stripped) if n.id in attn_ids}
-    ln_set = {i for i, n in enumerate(stripped) if n.id in ln_ids}
-    return attn_set, ln_set
+    categories = {"attn": set(), "ln": set(), "linear": set(),
+                  "elemwise": set(), "move": set()}
+
+    for i, n in enumerate(stripped):
+        if n.id in attn_ids:
+            categories["attn"].add(i)
+        elif n.op in LN_OPS:
+            categories["ln"].add(i)
+        elif n.op in LINEAR_OPS:
+            categories["linear"].add(i)
+        elif n.op in ELEMWISE_OPS:
+            categories["elemwise"].add(i)
+        elif n.op in MOVE_OPS:
+            categories["move"].add(i)
+        # else: uncategorized → implicit "other"
+
+    return categories
 
 
 # =====================================================================
@@ -294,16 +353,21 @@ def _patch_inputs(executor, inputs):
 
 
 def bench_compiled_timed(lib, executor, inputs, n_nodes,
-                         attn_indices, ln_indices,
+                         categories,
                          softmax_mode, attn_mode, layernorm_mode,
                          warmup, iters):
     """Benchmark a compiled executor with per-op timing via the ablation library.
 
-    Returns (total_us, attn_us, ln_us, other_us) — median across iterations.
+    Returns a Result with per-category timing — median across iterations.
     """
     _patch_inputs(executor, inputs)
     nodes = executor._nodes
     times_buf = (ctypes.c_double * n_nodes)()
+
+    # Pre-compute the union of all categorized indices for "other" calculation
+    all_categorized = set()
+    for idx_set in categories.values():
+        all_categorized |= idx_set
 
     # Warmup (no timing)
     for _ in range(warmup):
@@ -311,25 +375,37 @@ def bench_compiled_timed(lib, executor, inputs, n_nodes,
                              softmax_mode, attn_mode, layernorm_mode)
 
     # Timed iterations — collect per-iteration aggregates
-    totals, attns, lns, others = [], [], [], []
+    cat_keys = ["attn", "ln", "linear", "elemwise", "move"]
+    per_iter = {k: [] for k in cat_keys + ["other", "total"]}
+
     for _ in range(iters):
         lib.timed_execute_ablation(nodes, n_nodes, times_buf,
                                    softmax_mode, attn_mode, layernorm_mode)
-        attn_ns = sum(times_buf[i] for i in attn_indices)
-        ln_ns = sum(times_buf[i] for i in ln_indices)
+        cat_ns = {}
+        for key in cat_keys:
+            cat_ns[key] = sum(times_buf[i] for i in categories.get(key, set()))
         other_ns = sum(times_buf[i] for i in range(n_nodes)
-                       if i not in attn_indices and i not in ln_indices)
-        total_ns = attn_ns + ln_ns + other_ns
-        totals.append(total_ns / 1000)
-        attns.append(attn_ns / 1000)
-        lns.append(ln_ns / 1000)
-        others.append(other_ns / 1000)
+                       if i not in all_categorized)
+        total_ns = sum(cat_ns.values()) + other_ns
 
-    return _median(totals), _median(attns), _median(lns), _median(others)
+        per_iter["total"].append(total_ns / 1000)
+        for key in cat_keys:
+            per_iter[key].append(cat_ns[key] / 1000)
+        per_iter["other"].append(other_ns / 1000)
+
+    return Result(
+        total_us=_median(per_iter["total"]),
+        attn_us=_median(per_iter["attn"]),
+        ln_us=_median(per_iter["ln"]),
+        linear_us=_median(per_iter["linear"]),
+        elemwise_us=_median(per_iter["elemwise"]),
+        move_us=_median(per_iter["move"]),
+        other_us=_median(per_iter["other"]),
+    )
 
 
 def bench_pytorch_naive(model, x, warmup, iters):
-    """Benchmark NaiveTransformerBlock with attention + layernorm timing."""
+    """Benchmark NaiveTransformerBlock with attention + layernorm + linear timing."""
     B, S, D = x.shape
     m = model
 
@@ -337,7 +413,7 @@ def bench_pytorch_naive(model, x, warmup, iters):
         for _ in range(warmup):
             m(x)
 
-    total_ns_all, attn_ns_all, ln_ns_all = [], [], []
+    total_ns_all, attn_ns_all, ln_ns_all, linear_ns_all = [], [], [], []
     with torch.no_grad():
         for _ in range(iters):
             t_start = time.perf_counter_ns()
@@ -346,9 +422,15 @@ def bench_pytorch_naive(model, x, warmup, iters):
             h = m.ln1(x)
             ln_time = time.perf_counter_ns() - tln
 
-            q = m.wq(h).reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
-            k = m.wk(h).reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
-            v = m.wv(h).reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
+            tl = time.perf_counter_ns()
+            q_raw = m.wq(h)
+            k_raw = m.wk(h)
+            v_raw = m.wv(h)
+            linear_time = time.perf_counter_ns() - tl
+
+            q = q_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
+            k = k_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
+            v = v_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
 
             ta = time.perf_counter_ns()
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(m.d_k)
@@ -357,25 +439,43 @@ def bench_pytorch_naive(model, x, warmup, iters):
             attn_ns_all.append(time.perf_counter_ns() - ta)
 
             attn = attn.permute(0, 2, 1, 3).reshape(B, S, D)
-            x_out = x + m.wo(attn)
+
+            tl2 = time.perf_counter_ns()
+            wo_out = m.wo(attn)
+            linear_time += time.perf_counter_ns() - tl2
+
+            x_out = x + wo_out
 
             tln2 = time.perf_counter_ns()
             ln2_out = m.ln2(x_out)
             ln_time += time.perf_counter_ns() - tln2
 
-            x_out = x_out + m.ffn2(torch.relu(m.ffn1(ln2_out)))
+            tl3 = time.perf_counter_ns()
+            ffn1_out = m.ffn1(ln2_out)
+            linear_time += time.perf_counter_ns() - tl3
+
+            tl4 = time.perf_counter_ns()
+            ffn2_out = m.ffn2(torch.relu(ffn1_out))
+            linear_time += time.perf_counter_ns() - tl4
+
+            x_out = x_out + ffn2_out
             total_ns_all.append(time.perf_counter_ns() - t_start)
             ln_ns_all.append(ln_time)
+            linear_ns_all.append(linear_time)
 
     total_us = [t / 1000 for t in total_ns_all]
     attn_us = [t / 1000 for t in attn_ns_all]
     ln_us = [t / 1000 for t in ln_ns_all]
-    other_us = [t - a - l for t, a, l in zip(total_us, attn_us, ln_us)]
-    return _median(total_us), _median(attn_us), _median(ln_us), _median(other_us)
+    linear_us = [t / 1000 for t in linear_ns_all]
+    other_us = [t - a - l - li for t, a, l, li in zip(total_us, attn_us, ln_us, linear_us)]
+    return Result(
+        _median(total_us), _median(attn_us), _median(ln_us),
+        _median(linear_us), 0.0, 0.0, _median(other_us),
+    )
 
 
 def bench_pytorch_sdpa(model, x, warmup, iters):
-    """Benchmark SDPATransformerBlock with attention + layernorm timing."""
+    """Benchmark SDPATransformerBlock with attention + layernorm + linear timing."""
     B, S, D = x.shape
     m = model
 
@@ -383,7 +483,7 @@ def bench_pytorch_sdpa(model, x, warmup, iters):
         for _ in range(warmup):
             m(x)
 
-    total_ns_all, attn_ns_all, ln_ns_all = [], [], []
+    total_ns_all, attn_ns_all, ln_ns_all, linear_ns_all = [], [], [], []
     with torch.no_grad():
         for _ in range(iters):
             t_start = time.perf_counter_ns()
@@ -392,30 +492,54 @@ def bench_pytorch_sdpa(model, x, warmup, iters):
             h = m.ln1(x)
             ln_time = time.perf_counter_ns() - tln
 
-            q = m.wq(h).reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
-            k = m.wk(h).reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
-            v = m.wv(h).reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
+            tl = time.perf_counter_ns()
+            q_raw = m.wq(h)
+            k_raw = m.wk(h)
+            v_raw = m.wv(h)
+            linear_time = time.perf_counter_ns() - tl
+
+            q = q_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
+            k = k_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
+            v = v_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
 
             ta = time.perf_counter_ns()
             attn = F.scaled_dot_product_attention(q, k, v)
             attn_ns_all.append(time.perf_counter_ns() - ta)
 
             attn = attn.permute(0, 2, 1, 3).reshape(B, S, D)
-            x_out = x + m.wo(attn)
+
+            tl2 = time.perf_counter_ns()
+            wo_out = m.wo(attn)
+            linear_time += time.perf_counter_ns() - tl2
+
+            x_out = x + wo_out
 
             tln2 = time.perf_counter_ns()
             ln2_out = m.ln2(x_out)
             ln_time += time.perf_counter_ns() - tln2
 
-            x_out = x_out + m.ffn2(torch.relu(m.ffn1(ln2_out)))
+            tl3 = time.perf_counter_ns()
+            ffn1_out = m.ffn1(ln2_out)
+            linear_time += time.perf_counter_ns() - tl3
+
+            tl4 = time.perf_counter_ns()
+            ffn2_out = m.ffn2(torch.relu(ffn1_out))
+            linear_time += time.perf_counter_ns() - tl4
+
+            x_out = x_out + ffn2_out
             total_ns_all.append(time.perf_counter_ns() - t_start)
             ln_ns_all.append(ln_time)
+            linear_ns_all.append(linear_time)
 
     total_us = [t / 1000 for t in total_ns_all]
     attn_us = [t / 1000 for t in attn_ns_all]
     ln_us = [t / 1000 for t in ln_ns_all]
-    other_us = [t - a - l for t, a, l in zip(total_us, attn_us, ln_us)]
-    return _median(total_us), _median(attn_us), _median(ln_us), _median(other_us)
+    linear_us = [t / 1000 for t in linear_ns_all]
+    other_us = [t - a - l - li for t, a, l, li in zip(total_us, attn_us, ln_us, linear_us)]
+    return Result(
+        _median(total_us), _median(attn_us), _median(ln_us),
+        _median(linear_us), 0.0, 0.0, _median(other_us),
+    )
 
 
 def bench_python_executor(executor, ep, graph, warmup, iters):
@@ -423,9 +547,18 @@ def bench_python_executor(executor, ep, graph, warmup, iters):
     inp_name = graph.inputs[0]
     x_np = graph.tensors[inp_name].buffer
 
-    # Classify nodes
+    ELEMWISE_OPS = {
+        OpType.ADD, OpType.SUB, OpType.MUL, OpType.DIV,
+        OpType.RELU, OpType.EXP, OpType.TANH, OpType.POW,
+        OpType.GELU, OpType.SILU, OpType.NEG, OpType.COS, OpType.SIN,
+        OpType.RSQRT, OpType.FUSED_BIAS_RELU, OpType.GATED_ACT,
+    }
+    MOVE_OPS = {OpType.TRANSPOSE, OpType.PERMUTE}
+    LN_OPS = {OpType.LAYERNORM, OpType.RMSNORM}
+    LINEAR_OPS = {OpType.MATMUL, OpType.MATMUL_ADD}
+
+    # Classify attention node IDs (same logic as classify_op_indices)
     attn_ids = set()
-    ln_ids = set()
     for node in ep.order:
         if node.op == OpType.ATTENTION:
             attn_ids.add(node.id)
@@ -437,8 +570,6 @@ def bench_python_executor(executor, ep, graph, warmup, iters):
             for c in graph.consumers(node.output):
                 if c.op == OpType.MATMUL:
                     attn_ids.add(c.id)
-        elif node.op == OpType.LAYERNORM:
-            ln_ids.add(node.id)
 
     # Compile and warmup via the standard API
     executor.compile(ep)
@@ -450,15 +581,14 @@ def bench_python_executor(executor, ep, graph, warmup, iters):
     from runtime.ops import OP_REGISTRY
     arena = executor._get_arena(ep.arena_size)
     external = set(graph.inputs) | set(graph.constants)
-    totals, attns, lns, others = [], [], [], []
+    cat_keys = ["attn", "ln", "linear", "elemwise", "move", "other"]
+    per_iter = {k: [] for k in cat_keys + ["total"]}
 
     for _ in range(iters):
         executor._bind_inputs(graph, {inp_name: x_np})
         executor._bind_intermediates(graph, ep.offsets, arena)
 
-        attn_ns = 0
-        ln_ns = 0
-        other_ns = 0
+        cat_ns = {k: 0 for k in cat_keys}
         for node in ep.order:
             op_def = OP_REGISTRY.get(node.op)
             if op_def is not None and op_def.is_alias(node) and node.inputs[0] not in external:
@@ -475,18 +605,32 @@ def bench_python_executor(executor, ep, graph, warmup, iters):
             dt = time.perf_counter_ns() - t0
 
             if node.id in attn_ids:
-                attn_ns += dt
-            elif node.id in ln_ids:
-                ln_ns += dt
+                cat_ns["attn"] += dt
+            elif node.op in LN_OPS:
+                cat_ns["ln"] += dt
+            elif node.op in LINEAR_OPS:
+                cat_ns["linear"] += dt
+            elif node.op in ELEMWISE_OPS:
+                cat_ns["elemwise"] += dt
+            elif node.op in MOVE_OPS:
+                cat_ns["move"] += dt
             else:
-                other_ns += dt
+                cat_ns["other"] += dt
 
-        totals.append((attn_ns + ln_ns + other_ns) / 1000)
-        attns.append(attn_ns / 1000)
-        lns.append(ln_ns / 1000)
-        others.append(other_ns / 1000)
+        total = sum(cat_ns.values())
+        per_iter["total"].append(total / 1000)
+        for k in cat_keys:
+            per_iter[k].append(cat_ns[k] / 1000)
 
-    return _median(totals), _median(attns), _median(lns), _median(others)
+    return Result(
+        total_us=_median(per_iter["total"]),
+        attn_us=_median(per_iter["attn"]),
+        ln_us=_median(per_iter["ln"]),
+        linear_us=_median(per_iter["linear"]),
+        elemwise_us=_median(per_iter["elemwise"]),
+        move_us=_median(per_iter["move"]),
+        other_us=_median(per_iter["other"]),
+    )
 
 
 def _median(values):
@@ -531,7 +675,7 @@ def export_to_onnx(model: nn.Module, x: torch.Tensor) -> str:
 def bench_ort(onnx_path: str, x_np: np.ndarray,
               opt_level, n_threads: int,
               warmup: int, iters: int):
-    """Benchmark an ONNX Runtime session. Returns (total_us, 0, 0, 0).
+    """Benchmark an ONNX Runtime session. Returns Result with only total_us populated.
 
     No per-op breakdown available — only total inference time.
     """
@@ -556,7 +700,7 @@ def bench_ort(onnx_path: str, x_np: np.ndarray,
         times.append((time.perf_counter_ns() - t0) / 1000)
 
     total = _median(times)
-    return total, 0.0, 0.0, total  # no breakdown — all goes in "other"
+    return Result(total, 0.0, 0.0, 0.0, 0.0, 0.0, total)
 
 
 # =====================================================================
@@ -568,6 +712,9 @@ class Result:
     total_us: float
     attn_us: float
     ln_us: float
+    linear_us: float
+    elemwise_us: float
+    move_us: float
     other_us: float
 
 
@@ -638,11 +785,7 @@ VARIANTS += [
             attn_mode=1, layernorm_mode=0, group="Attention variants",
             large=False),
     Variant("Attn: fused GCD",    "compiled", pipeline_full,
-            attn_mode=2, layernorm_mode=0, group="Attention variants"),
-
-    # --- Flash attention (all fusions active, SIMD+GCD) ---
-    Variant("Attn: flash GCD",    "compiled", pipeline_full,
-            attn_mode=3, layernorm_mode=0, group="Attention variants"),
+            attn_mode=4, layernorm_mode=0, group="Attention variants"),
 
     # --- LayerNorm kernel variants (all fusions active, attention at full) ---
     Variant("LN: scalar",         "compiled", pipeline_full,
@@ -654,9 +797,19 @@ VARIANTS += [
     Variant("LN: SIMD+GCD",      "compiled", pipeline_full,
             layernorm_mode=2, group="LayerNorm variants"),
 
-    # --- Flash + optimized LayerNorm (the full package) ---
-    Variant("Flash + LN opt",     "compiled", pipeline_full,
-            attn_mode=3, layernorm_mode=2, group="Full optimization"),
+    # --- Full optimization (adaptive flash + optimized LayerNorm) ---
+    Variant("Full optimization",  "compiled", pipeline_full,
+            attn_mode=2, layernorm_mode=2, group="Full optimization"),
+
+    # --- Flash block size ablation (all use parameterized kernel with GCD) ---
+    Variant("Flash 32x32",        "compiled", pipeline_full,
+            attn_mode=5, layernorm_mode=2, group="Flash block sizes"),
+    Variant("Flash 64x128",       "compiled", pipeline_full,
+            attn_mode=6, layernorm_mode=2, group="Flash block sizes"),
+    Variant("Flash 128x256",      "compiled", pipeline_full,
+            attn_mode=7, layernorm_mode=2, group="Flash block sizes"),
+    Variant("Flash 256x512",      "compiled", pipeline_full,
+            attn_mode=8, layernorm_mode=2, group="Flash block sizes"),
 ]
 
 
@@ -681,14 +834,14 @@ def run_config(cfg: Config, lib):
     is_large = cfg.d_model >= LARGE_THRESHOLD
     variants = [v for v in VARIANTS if v.large or not is_large]
 
-    print(f"\n{'='*100}")
+    print(f"\n{'='*110}")
     print(f"  {cfg.name}: d_model={cfg.d_model}, n_heads={cfg.n_heads}, "
           f"seq={cfg.seq_len}, batch={cfg.batch}"
           + (f"  [large — {len(variants)} variants]" if is_large else ""))
     head_dim = cfg.d_model // cfg.n_heads
     scratch_mb = cfg.n_heads * cfg.seq_len**2 * 4 / 1e6
     print(f"  head_dim={head_dim}, attn scratch={scratch_mb:.1f}MB")
-    print(f"{'='*100}")
+    print(f"{'='*110}")
 
     # Build models
     is_gpt2 = cfg.model == "gpt2"
@@ -719,8 +872,8 @@ def run_config(cfg: Config, lib):
 
     results: dict[str, Result] = {}
 
-    header = (f"  {'Variant':<24} {'Total':>9} {'Attn':>9} {'LN':>9} "
-              f"{'Other':>9} {'Attn%':>6} {'LN%':>5} {'vs PT':>7}")
+    header = (f"  {'Variant':<24} {'Total':>9} {'Attn':>9} {'Linear':>9} "
+              f"{'LN':>9} {'Elem':>9} {'Move':>9} {'vs PT':>7}")
     prev_group = None
 
     for v in variants:
@@ -748,13 +901,13 @@ def run_config(cfg: Config, lib):
                             naive_model(x_torch)
                             times.append((time.perf_counter_ns() - t0) / 1000)
                     total = _median(times)
-                    attn, ln, other = 0.0, 0.0, total
+                    result = Result(total, 0.0, 0.0, 0.0, 0.0, 0.0, total)
                 else:
-                    total, attn, ln, other = bench_pytorch_naive(
+                    result = bench_pytorch_naive(
                         naive_model, x_torch, cfg.warmup, cfg.iters)
 
             elif v.mode == "pytorch_sdpa":
-                total, attn, ln, other = bench_pytorch_sdpa(
+                result = bench_pytorch_sdpa(
                     sdpa_model, x_torch, cfg.warmup, cfg.iters)
 
             elif v.mode.startswith("python_"):
@@ -768,60 +921,56 @@ def run_config(cfg: Config, lib):
                 else:
                     executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
                 graph.tensors[graph.inputs[0]].buffer = x_np
-                total, attn, ln, other = bench_python_executor(
+                result = bench_python_executor(
                     executor, ep, graph, cfg.warmup, cfg.iters)
 
             elif v.mode == "compiled":
                 graph = export_model(naive_model, (x_torch,))
                 if v.pipeline:
                     v.pipeline(graph)
-                # Tag ATTENTION nodes for flash scratch allocation
-                if v.attn_mode == 3:
-                    for node in graph.nodes.values():
-                        if node.op == OpType.ATTENTION:
-                            node.attrs["flash"] = True
-                ep = plan(graph)
+                ep = _plan_for_ablation(graph)
                 executor = CompiledExecutor()
                 executor.compile(ep)
 
                 exec_order = list(ep.order)
-                attn_indices, ln_indices = classify_op_indices(graph, exec_order)
+                categories = classify_op_indices(graph, exec_order)
                 n_nodes = executor._n_nodes
 
-                total, attn, ln, other = bench_compiled_timed(
+                result = bench_compiled_timed(
                     lib, executor, {graph.inputs[0]: x_np}, n_nodes,
-                    attn_indices, ln_indices,
+                    categories,
                     v.softmax_mode, v.attn_mode, v.layernorm_mode,
                     cfg.warmup, cfg.iters)
 
             elif v.mode == "ort":
-                total, attn, ln, other = bench_ort(
+                result = bench_ort(
                     onnx_path, x_np, v.ort_opt_level, v.ort_threads,
                     cfg.warmup, cfg.iters)
 
-            results[v.name] = Result(total, attn, ln, other)
+            results[v.name] = result
 
-            pt_total = results.get("PT naive", Result(1, 0, 0, 0)).total_us
-            vs_pt = total / pt_total if pt_total > 0 else 0
+            pt_total = results.get("PT naive", Result(1, 0, 0, 0, 0, 0, 0)).total_us
+            vs_pt = result.total_us / pt_total if pt_total > 0 else 0
 
             if v.mode == "ort":
                 # No per-op breakdown for ORT
-                print(f"  {v.name:<24} {_fmt(total):>9} {'—':>9} "
-                      f"{'—':>9} {'—':>9} "
-                      f"{'—':>6} {'—':>5} {vs_pt:6.2f}x")
+                print(f"  {v.name:<24} {_fmt(result.total_us):>9} {'—':>9} "
+                      f"{'—':>9} {'—':>9} {'—':>9} {'—':>9} {vs_pt:6.2f}x")
             else:
-                attn_pct = (attn / total * 100) if total > 0 else 0
-                ln_pct = (ln / total * 100) if total > 0 else 0
-                print(f"  {v.name:<24} {_fmt(total):>9} {_fmt(attn):>9} "
-                      f"{_fmt(ln):>9} {_fmt(other):>9} "
-                      f"{attn_pct:5.1f}% {ln_pct:4.1f}% {vs_pt:6.2f}x")
+                print(f"  {v.name:<24} {_fmt(result.total_us):>9} "
+                      f"{_fmt(result.attn_us):>9} {_fmt(result.linear_us):>9} "
+                      f"{_fmt(result.ln_us):>9} {_fmt(result.elemwise_us):>9} "
+                      f"{_fmt(result.move_us):>9} {vs_pt:6.2f}x")
 
         except Exception as e:
             print(f"  {v.name:<24} FAILED: {e}")
 
-    # Cleanup temp ONNX file
+    # Cleanup temp ONNX file and force GC to avoid onnxscript segfault
+    # (stale onnx_ir objects with C extension pointers cause use-after-free
+    # when GC triggers during a later config's export)
     if onnx_path and os.path.exists(onnx_path):
         os.unlink(onnx_path)
+    import gc; gc.collect()
 
     return results
 
@@ -858,22 +1007,25 @@ def main():
     print(f"Transformers (GPT-2): {'available' if HAS_TRANSFORMERS else 'not available'}")
     print(f"Running {len(configs)} configs x {len(VARIANTS)} variants")
 
+    import gc
     all_results = {}
     for cfg in configs:
         all_results[cfg.name] = run_config(cfg, lib)
+        gc.collect()
 
     # Summary
-    print(f"\n{'='*100}")
+    print(f"\n{'='*110}")
     print("  SUMMARY: Best compiled variant vs baselines")
-    print(f"{'='*100}")
+    print(f"{'='*110}")
     print(f"  {'Config':<12} {'PT naive':>10} {'PT SDPA':>10} {'ORT opt':>10} "
           f"{'Best ours':>10} {'vs PT':>7} {'vs SDPA':>7} {'vs ORT':>7}")
     print(f"  {'-'*82}")
+    _default = Result(0, 0, 0, 0, 0, 0, 0)
     for cfg in configs:
         r = all_results.get(cfg.name, {})
-        pt_naive = r.get("PT naive", Result(0, 0, 0, 0)).total_us
-        pt_sdpa = r.get("PT SDPA", Result(0, 0, 0, 0)).total_us
-        ort_opt = r.get("ORT optimized 1T", r.get("ORT optimized MT", Result(0, 0, 0, 0))).total_us
+        pt_naive = r.get("PT naive", _default).total_us
+        pt_sdpa = r.get("PT SDPA", _default).total_us
+        ort_opt = r.get("ORT optimized 1T", r.get("ORT optimized MT", _default)).total_us
         # Find best compiled variant (exclude baselines, python exec, and ORT)
         best_name, best_total = "", float("inf")
         for name, res in r.items():

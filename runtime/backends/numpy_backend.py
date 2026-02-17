@@ -107,7 +107,12 @@ def _fused_bias_relu(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[s
 
 def _attention(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
     Q, K, V = inputs[0], inputs[1], inputs[2]
-    # Q, K, V: [batch_heads, seq_len, head_dim]
+    # Q, K, V: [..., seq_len, head_dim]
+    group_size = attrs.get("group_size", 1)
+    if group_size > 1:
+        # GQA: repeat each KV head group_size times to match Q head count
+        K = np.repeat(K, group_size, axis=-3)
+        V = np.repeat(V, group_size, axis=-3)
     head_dim = Q.shape[-1]
     scale = 1.0 / np.sqrt(head_dim)
     scores = np.matmul(Q, np.swapaxes(K, -2, -1)) * scale
@@ -149,6 +154,54 @@ def _embedding(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, An
     output[:] = table[ids.astype(np.intp)]
 
 
+def _rsqrt(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    np.divide(1.0, np.sqrt(inputs[0]), out=output)
+
+
+def _silu(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    x = inputs[0]
+    np.divide(x, 1.0 + np.exp(-x), out=output)
+
+
+def _neg(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    np.negative(inputs[0], out=output)
+
+
+def _cos(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    np.cos(inputs[0], out=output)
+
+
+def _sin(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    np.sin(inputs[0], out=output)
+
+
+def _rmsnorm(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    x, weight = inputs[0], inputs[1]
+    eps = attrs.get("eps", 1e-5)
+    rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + eps)
+    np.copyto(output, (x / rms) * weight)
+
+
+def _cat(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    np.copyto(output, np.concatenate(inputs, axis=attrs["dim"]))
+
+
+def _gated_act(inputs: list[np.ndarray], output: np.ndarray, attrs: dict[str, Any]) -> None:
+    has_bias = attrs.get("has_bias", False)
+    act = attrs.get("act", "silu")
+    if has_bias:
+        x, bias, up = inputs[0], inputs[1], inputs[2]
+        v = x + bias
+    else:
+        x, up = inputs[0], inputs[1]
+        v = x
+    if act == "silu":
+        activated = v / (1.0 + np.exp(-v))
+    else:
+        activated = 0.5 * v * (1 + np.tanh(0.7978845608 * (v + 0.044715 * v**3)))
+    np.multiply(activated, up, out=output)
+
+
 _KERNELS: dict[OpType, KernelFn] = {
     OpType.MATMUL: _matmul,
     OpType.ADD: _add,
@@ -172,6 +225,14 @@ _KERNELS: dict[OpType, KernelFn] = {
     OpType.GELU: _gelu,
     OpType.EMBEDDING: _embedding,
     OpType.SLICE: _slice,
+    OpType.RSQRT: _rsqrt,
+    OpType.SILU: _silu,
+    OpType.NEG: _neg,
+    OpType.COS: _cos,
+    OpType.SIN: _sin,
+    OpType.RMSNORM: _rmsnorm,
+    OpType.CAT: _cat,
+    OpType.GATED_ACT: _gated_act,
 }
 
 

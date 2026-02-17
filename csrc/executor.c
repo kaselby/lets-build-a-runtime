@@ -9,58 +9,18 @@
  * patches input pointers and calls execute() per inference.
  */
 
-#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "runtime.h"
+#include "ops.h"
 
-/* Table size: must exceed the highest op code (currently 72). */
-#define DISPATCH_TABLE_SIZE 100
+/* Table size: must exceed the highest dispatchable op code (currently 1002). */
+#define DISPATCH_TABLE_SIZE 1500
 
-/* ----------------------------------------------------------------
- * Forward declarations for kernels in ops.c
- * ---------------------------------------------------------------- */
-
-void kernel_matmul(const float* a, const float* b, float* out,
-                   int M, int N, int K, int batches, int trans_b);
-void kernel_matmul_ab(const float* a, const float* b, float* out,
-                      int M, int N, int K, int batches, int trans_b,
-                      float alpha, float beta);
-void kernel_matmul_beta(const float* a, const float* b, float* out,
-                        int M, int N, int K, int batches, int trans_b,
-                        float beta);
-void kernel_add(const float* a, const float* bias, float* out,
-                int M, int N);
-void kernel_relu(const float* x, float* out, int n);
-void kernel_transpose(const float* a, float* out, int rows, int cols);
-void kernel_div(const float* a, const float* b, float* out, int n);
-void kernel_sub(const float* a, const float* b, float* out, int n);
-void kernel_mul(const float* a, const float* b, float* out, int n);
-void kernel_add_scalar(const float* a, float s, float* out, int n);
-void kernel_div_scalar(const float* a, float s, float* out, int n);
-void kernel_sub_scalar(const float* a, float s, float* out, int n);
-void kernel_mul_scalar(const float* a, float s, float* out, int n);
-void kernel_exp(const float* x, float* out, int n);
-void kernel_max(const float* x, float* out, int outer, int axis_size, int inner);
-void kernel_sum(const float* x, float* out, int outer, int axis_size, int inner);
-void kernel_softmax(const float* x, float* out, int rows, int cols);
-void kernel_layernorm(const float* x, const float* gamma, const float* beta,
-                      float* out, int rows, int cols, float eps);
-void kernel_bias_relu(const float* a, const float* bias, float* out,
-                      int M, int N);
-void kernel_attention(const float* Q, const float* K, const float* V,
-                      float* output, float* scratch, const float* mask,
-                      int batch_heads, int seq_len, int head_dim,
-                      int causal);
-void kernel_pow_scalar(const float* x, float scalar, float* out, int n);
-void kernel_tanh(const float* x, float* out, int n);
-void kernel_gelu_tanh(const float* x, float* out, int n);
-void kernel_embedding(const long* ids, const float* table, float* out,
-                      int seq_len, int embed_dim);
-void kernel_slice(const void* x, void* out,
-                  int outer, int orig_dim_size, int start,
-                  int slice_len, int inner, int elem_size);
+/* Adaptive dispatch: use flash attention for seq_len > this threshold
+ * (non-causal, no mask only). Must match ops/attn.c and Python side. */
+#define FLASH_SEQ_THRESHOLD 256
 
 /* ----------------------------------------------------------------
  * Helpers
@@ -93,17 +53,22 @@ static inline int leading_dims(const OpNode* node) {
 
 /* --- Element-wise unary --- */
 
-static void dispatch_relu(OpNode* node) {
-    kernel_relu(node->inputs[0], node->output, total_elements(node));
-}
+/* Stamp out dispatch functions for simple unary ops: (x, out, n).
+ * POW is excluded — it unpacks a scalar exponent from extra[]. */
+#define DISPATCH_UNARY(name, kernel) \
+    static void name(OpNode* node) { \
+        kernel(node->inputs[0], node->output, total_elements(node)); \
+    }
 
-static void dispatch_exp(OpNode* node) {
-    kernel_exp(node->inputs[0], node->output, total_elements(node));
-}
-
-static void dispatch_tanh(OpNode* node) {
-    kernel_tanh(node->inputs[0], node->output, total_elements(node));
-}
+DISPATCH_UNARY(dispatch_relu,  kernel_relu)
+DISPATCH_UNARY(dispatch_exp,   kernel_exp)
+DISPATCH_UNARY(dispatch_tanh,  kernel_tanh)
+DISPATCH_UNARY(dispatch_gelu,  kernel_gelu_tanh)
+DISPATCH_UNARY(dispatch_rsqrt, kernel_rsqrt)
+DISPATCH_UNARY(dispatch_silu,  kernel_silu)
+DISPATCH_UNARY(dispatch_neg,   kernel_neg)
+DISPATCH_UNARY(dispatch_cos,   kernel_cos)
+DISPATCH_UNARY(dispatch_sin,   kernel_sin)
 
 static void dispatch_pow(OpNode* node) {
     /* extra[0] = scalar exponent as float bits */
@@ -111,54 +76,94 @@ static void dispatch_pow(OpNode* node) {
                       node->output, total_elements(node));
 }
 
-static void dispatch_gelu(OpNode* node) {
-    kernel_gelu_tanh(node->inputs[0], node->output, total_elements(node));
-}
-
 /* --- Element-wise binary --- */
 
+/*
+ * Unpack broadcast parameters from extra[] and call kernel_broadcast_binop.
+ *
+ * Layout (starting at extra[base]):
+ *   [ndim, a_strides..., b_strides..., out_shape...]
+ */
+static void dispatch_broadcast(OpNode* node, int base, int binop) {
+    int ndim = node->extra[base];
+    const int* a_strides = &node->extra[base + 1];
+    const int* b_strides = &node->extra[base + 1 + ndim];
+    const int* shape     = &node->extra[base + 1 + 2 * ndim];
+    kernel_broadcast_binop(node->inputs[0], node->inputs[1], node->output,
+                           a_strides, b_strides, shape, ndim, binop);
+}
+
 static void dispatch_add(OpNode* node) {
-    /* extra[0]: 0 = bias broadcast, 1 = element-wise, 2 = scalar */
+    /* extra[0]: 0 = bias broadcast, 1 = element-wise, 2 = scalar,
+     *           3 = general broadcast */
     int n = total_elements(node);
-    if (node->extra[0] == 2) {
-        kernel_add_scalar(node->inputs[0], extra_float(node, 1),
-                          node->output, n);
-    } else if (node->extra[0] == 1) {
-        kernel_add(node->inputs[0], node->inputs[1], node->output, 1, n);
-    } else {
-        int N = node->out_shape[node->n_dims - 1];
-        kernel_add(node->inputs[0], node->inputs[1], node->output, n / N, N);
+    switch (node->extra[0]) {
+        case 2:
+            kernel_add_scalar(node->inputs[0], extra_float(node, 1),
+                              node->output, n);
+            break;
+        case 1:
+            kernel_add(node->inputs[0], node->inputs[1], node->output, 1, n);
+            break;
+        case 3:
+            dispatch_broadcast(node, 1, 0);  /* binop 0 = add */
+            break;
+        default: {
+            int N = node->out_shape[node->n_dims - 1];
+            kernel_add(node->inputs[0], node->inputs[1], node->output, n / N, N);
+            break;
+        }
     }
 }
 
 static void dispatch_sub(OpNode* node) {
-    /* extra[0]: 0 = two-tensor, 1 = scalar (extra[1] = float bits) */
+    /* extra[0]: 0 = element-wise, 1 = scalar, 2 = broadcast */
     int n = total_elements(node);
-    if (node->extra[0]) {
-        kernel_sub_scalar(node->inputs[0], extra_float(node, 1),
-                          node->output, n);
-    } else {
-        kernel_sub(node->inputs[0], node->inputs[1], node->output, n);
+    switch (node->extra[0]) {
+        case 1:
+            kernel_sub_scalar(node->inputs[0], extra_float(node, 1),
+                              node->output, n);
+            break;
+        case 2:
+            dispatch_broadcast(node, 1, 1);  /* binop 1 = sub */
+            break;
+        default:
+            kernel_sub(node->inputs[0], node->inputs[1], node->output, n);
+            break;
     }
 }
 
 static void dispatch_mul(OpNode* node) {
+    /* extra[0]: 0 = element-wise, 1 = scalar, 2 = broadcast */
     int n = total_elements(node);
-    if (node->extra[0]) {
-        kernel_mul_scalar(node->inputs[0], extra_float(node, 1),
-                          node->output, n);
-    } else {
-        kernel_mul(node->inputs[0], node->inputs[1], node->output, n);
+    switch (node->extra[0]) {
+        case 1:
+            kernel_mul_scalar(node->inputs[0], extra_float(node, 1),
+                              node->output, n);
+            break;
+        case 2:
+            dispatch_broadcast(node, 1, 2);  /* binop 2 = mul */
+            break;
+        default:
+            kernel_mul(node->inputs[0], node->inputs[1], node->output, n);
+            break;
     }
 }
 
 static void dispatch_div(OpNode* node) {
+    /* extra[0]: 0 = element-wise, 1 = scalar, 2 = broadcast */
     int n = total_elements(node);
-    if (node->extra[0]) {
-        kernel_div_scalar(node->inputs[0], extra_float(node, 1),
-                          node->output, n);
-    } else {
-        kernel_div(node->inputs[0], node->inputs[1], node->output, n);
+    switch (node->extra[0]) {
+        case 1:
+            kernel_div_scalar(node->inputs[0], extra_float(node, 1),
+                              node->output, n);
+            break;
+        case 2:
+            dispatch_broadcast(node, 1, 3);  /* binop 3 = div */
+            break;
+        default:
+            kernel_div(node->inputs[0], node->inputs[1], node->output, n);
+            break;
     }
 }
 
@@ -258,6 +263,18 @@ static void dispatch_slice(OpNode* node) {
                  node->extra[3], node->extra[4], node->elem_size);
 }
 
+static void dispatch_cat(OpNode* node) {
+    /* extra = [dim, dim_size_0, dim_size_1, ...]
+     * Compute outer/inner from output shape and dim. */
+    int dim = node->extra[0];
+    int outer = 1, inner = 1;
+    for (int i = 0; i < dim; i++) outer *= node->out_shape[i];
+    for (int i = dim + 1; i < node->n_dims; i++) inner *= node->out_shape[i];
+    kernel_cat(node->inputs, node->output,
+               &node->extra[1], node->n_inputs,
+               outer, inner, node->elem_size);
+}
+
 static void dispatch_embedding(OpNode* node) {
     /* inputs: [ids (int64), table (float)], extra[0] = embed_dim */
     int embed_dim = node->extra[0];
@@ -275,6 +292,13 @@ static void dispatch_layernorm(OpNode* node) {
     kernel_layernorm(node->inputs[0], node->inputs[1], node->inputs[2],
                      node->output, leading_dims(node), cols,
                      extra_float(node, 0));
+}
+
+static void dispatch_rmsnorm(OpNode* node) {
+    int cols = node->out_shape[node->n_dims - 1];
+    kernel_rmsnorm(node->inputs[0], node->inputs[1],
+                   node->output, leading_dims(node), cols,
+                   extra_float(node, 0));
 }
 
 /* --- Fused ops --- */
@@ -313,22 +337,49 @@ static void dispatch_fused_bias_relu(OpNode* node) {
                      leading_dims(node), N);
 }
 
+static void dispatch_gated_act(OpNode* node) {
+    /* extras: [has_bias, act_type (0=silu, 1=gelu)]
+     * no bias:   inputs = [x, up]
+     * with bias: inputs = [x, bias, up] */
+    int has_bias = node->extra[0];
+    int act_type = node->extra[1];
+    int N = node->out_shape[node->n_dims - 1];
+    const float* x    = node->inputs[0];
+    const float* up   = has_bias ? node->inputs[2] : node->inputs[1];
+    const float* bias = has_bias ? node->inputs[1] : NULL;
+    int M = leading_dims(node);
+    if (act_type == 0)
+        kernel_gated_silu(x, up, bias, node->output, M, N, has_bias);
+    else
+        kernel_gated_gelu(x, up, bias, node->output, M, N, has_bias);
+}
+
 static void dispatch_attention(OpNode* node) {
-    /* extras: [seq_len, head_dim, causal, has_mask]
+    /* extras: [seq_len, head_dim, causal, has_mask, group_size]
      * no mask:   inputs = [Q, K, V, scratch]
      * with mask: inputs = [Q, K, V, mask, scratch]  */
-    int seq_len  = node->extra[0];
-    int head_dim = node->extra[1];
-    int causal   = node->extra[2];
-    int has_mask = node->extra[3];
+    int seq_len    = node->extra[0];
+    int head_dim   = node->extra[1];
+    int causal     = node->extra[2];
+    int has_mask   = node->extra[3];
+    int group_size = node->extra[4] > 0 ? node->extra[4] : 1;
     int batch_heads = 1;
     for (int i = 0; i < node->n_dims - 2; i++)
         batch_heads *= node->out_shape[i];
     const float* mask = has_mask ? node->inputs[3] : NULL;
     float* scratch    = has_mask ? node->inputs[4] : node->inputs[3];
-    kernel_attention(node->inputs[0], node->inputs[1], node->inputs[2],
-                     node->output, scratch, mask,
-                     batch_heads, seq_len, head_dim, causal);
+
+    /* Adaptive: use flash for long sequences without custom masks.
+     * Flash supports causal natively (and skips ~half the tiles). */
+    if (seq_len > FLASH_SEQ_THRESHOLD && !has_mask) {
+        kernel_attention_flash(node->inputs[0], node->inputs[1], node->inputs[2],
+                               node->output, scratch,
+                               batch_heads, seq_len, head_dim, causal, group_size);
+    } else {
+        kernel_attention(node->inputs[0], node->inputs[1], node->inputs[2],
+                         node->output, scratch, mask,
+                         batch_heads, seq_len, head_dim, causal, group_size);
+    }
 }
 
 /* ----------------------------------------------------------------
@@ -348,6 +399,11 @@ static dispatch_fn dispatch_table[DISPATCH_TABLE_SIZE] = {
     [OP_TANH]      = dispatch_tanh,
     [OP_POW]       = dispatch_pow,
     [OP_GELU]      = dispatch_gelu,
+    [OP_RSQRT]     = dispatch_rsqrt,
+    [OP_SILU]      = dispatch_silu,
+    [OP_NEG]       = dispatch_neg,
+    [OP_COS]       = dispatch_cos,
+    [OP_SIN]       = dispatch_sin,
 
     /* Element-wise binary */
     [OP_ADD]       = dispatch_add,
@@ -368,14 +424,17 @@ static dispatch_fn dispatch_table[DISPATCH_TABLE_SIZE] = {
     [OP_TRANSPOSE] = dispatch_transpose,
     [OP_SLICE]     = dispatch_slice,
     [OP_EMBEDDING] = dispatch_embedding,
+    [OP_CAT]       = dispatch_cat,
 
     /* Normalization / compound */
     [OP_LAYERNORM] = dispatch_layernorm,
+    [OP_RMSNORM]   = dispatch_rmsnorm,
 
     /* Fused ops */
     [OP_MATMUL_ADD]      = dispatch_matmul_add,
     [OP_FUSED_BIAS_RELU] = dispatch_fused_bias_relu,
     [OP_ATTENTION]       = dispatch_attention,
+    [OP_GATED_ACT]       = dispatch_gated_act,
 };
 
 /* ----------------------------------------------------------------

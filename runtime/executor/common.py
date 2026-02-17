@@ -118,8 +118,8 @@ class Executor(ABC):
 # COpNode struct (mirrors executor.c)
 # ---------------------------------------------------------------------------
 
-MAX_INPUTS = 8
-MAX_DIMS = 16
+MAX_INPUTS = 12
+MAX_DIMS = 24
 
 
 class COpNode(ctypes.Structure):

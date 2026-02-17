@@ -180,6 +180,80 @@ register_fusion(FusionPattern(
     validator=_validate_bias_relu,
 ))
 
+# Priority 0: gated activation fusions (claim ADD before MATMUL+ADD can)
+
+def _validate_bias_gated(chain: list[Node], graph: Graph) -> bool:
+    """ADD+act+MUL: ADD must be a bias broadcast, MUL must be element-wise."""
+    add_node = chain[0]
+    a_shape = graph.tensors[add_node.inputs[0]].shape
+    b_shape = graph.tensors[add_node.inputs[1]].shape
+    return len(b_shape) == 1 and b_shape[0] == a_shape[-1]
+
+def _build_bias_gated_attrs(act: str):
+    def builder(chain: list[Node], graph: Graph) -> dict:
+        return {"act": act, "has_bias": True}
+    return builder
+
+def _build_bias_gated_inputs(chain: list[Node], graph: Graph, external_inputs: list[str]) -> list[str]:
+    """Reorder inputs to [x, bias, up] — x is ADD's first input, bias is second, up is MUL's other input."""
+    add_node, _act_node, mul_node = chain
+    x = add_node.inputs[0]
+    bias = add_node.inputs[1]
+    up = [inp for inp in mul_node.inputs if inp not in {_act_node.output}][0]
+    return [x, bias, up]
+
+register_fusion(FusionPattern(
+    name="bias_silu_mul",
+    pattern=[OpType.ADD, OpType.SILU, OpType.MUL],
+    fused_op=OpType.GATED_ACT,
+    priority=0,
+    validator=_validate_bias_gated,
+    build_attrs=_build_bias_gated_attrs("silu"),
+    build_inputs=_build_bias_gated_inputs,
+))
+
+register_fusion(FusionPattern(
+    name="bias_gelu_mul",
+    pattern=[OpType.ADD, OpType.GELU, OpType.MUL],
+    fused_op=OpType.GATED_ACT,
+    priority=0,
+    validator=_validate_bias_gated,
+    build_attrs=_build_bias_gated_attrs("gelu"),
+    build_inputs=_build_bias_gated_inputs,
+))
+
+# Priority 1: bias-free gated activations (after priority 0 claims biased variants)
+
+def _build_gated_attrs(act: str):
+    def builder(chain: list[Node], graph: Graph) -> dict:
+        return {"act": act, "has_bias": False}
+    return builder
+
+def _build_gated_inputs(chain: list[Node], graph: Graph, external_inputs: list[str]) -> list[str]:
+    """Reorder inputs to [x, up] — x is the activation's input, up is MUL's other input."""
+    act_node, mul_node = chain
+    x = act_node.inputs[0]
+    up = [inp for inp in mul_node.inputs if inp not in {act_node.output}][0]
+    return [x, up]
+
+register_fusion(FusionPattern(
+    name="silu_mul",
+    pattern=[OpType.SILU, OpType.MUL],
+    fused_op=OpType.GATED_ACT,
+    priority=1,
+    build_attrs=_build_gated_attrs("silu"),
+    build_inputs=_build_gated_inputs,
+))
+
+register_fusion(FusionPattern(
+    name="gelu_mul",
+    pattern=[OpType.GELU, OpType.MUL],
+    fused_op=OpType.GATED_ACT,
+    priority=1,
+    build_attrs=_build_gated_attrs("gelu"),
+    build_inputs=_build_gated_inputs,
+))
+
 # Priority 1: MATMUL+ADD (catches standalone bias adds not claimed by bias_relu)
 
 def _validate_matmul_add(chain: list[Node], graph: Graph) -> bool:
@@ -268,6 +342,61 @@ register_fusion(FusionPattern(
     validator=_validate_causal_attention,
     build_attrs=lambda chain, graph: {"causal": True},
     build_inputs=_build_causal_attention_inputs,
+))
+
+
+# GQA absorption: unsqueeze→expand→reshape feeding into ATTENTION's K or V
+#
+# GQA models replicate KV heads via RESHAPE(unsqueeze) → EXPAND → RESHAPE(flatten)
+# before ATTENTION. This absorbs the chain into ATTENTION's group_size parameter,
+# so the kernel strides K/V by bh/group_size instead of materializing the expansion.
+#
+# Fires twice (once for K, once for V) — the second pass picks up the new
+# ATTENTION node created by the first.
+
+def _validate_gqa(chain: list[Node], graph: Graph) -> bool:
+    """Verify the RESHAPE→EXPAND→RESHAPE→ATTENTION chain is GQA head expansion."""
+    reshape1, expand, reshape2, attn = chain
+    expand_shape = expand.attrs.get("shape")
+    original_shape = graph.tensors[reshape1.inputs[0]].shape
+    if expand_shape is None or len(expand_shape) != len(original_shape) + 1:
+        return False
+    # The inserted dim (position 2) should be > 1 — that's the group_size
+    group_size = expand_shape[2]
+    if not isinstance(group_size, int) or group_size <= 1:
+        return False
+    # The chain output must feed into ATTENTION's K (input[1]) or V (input[2])
+    chain_tensor = reshape2.output
+    return chain_tensor in (attn.inputs[1], attn.inputs[2])
+
+
+def _build_gqa_attrs(chain: list[Node], graph: Graph) -> dict:
+    """Copy ATTENTION's attrs and add/update group_size from EXPAND's shape."""
+    expand = chain[1]
+    attn = chain[-1]
+    attrs = dict(attn.attrs)
+    attrs["group_size"] = expand.attrs["shape"][2]
+    return attrs
+
+
+def _build_gqa_inputs(
+    chain: list[Node], graph: Graph, external_inputs: list[str]
+) -> list[str]:
+    """Replace the chain's connection to ATTENTION with the original tensor."""
+    attn = chain[-1]
+    chain_outputs = {n.output for n in chain[:-1]}
+    original = chain[0].inputs[0]
+    return [original if inp in chain_outputs else inp for inp in attn.inputs]
+
+
+register_fusion(FusionPattern(
+    name="gqa_attention",
+    pattern=[OpType.RESHAPE, OpType.EXPAND, OpType.RESHAPE, OpType.ATTENTION],
+    fused_op=OpType.ATTENTION,
+    priority=0,
+    validator=_validate_gqa,
+    build_attrs=_build_gqa_attrs,
+    build_inputs=_build_gqa_inputs,
 ))
 
 
@@ -497,4 +626,58 @@ register_dag_fusion(DAGFusionPattern(
     root="out",
     fused_op=OpType.GELU,
     external_inputs=["x0"],
+))
+
+
+# SiLU (x * sigmoid(x) = x / (1 + exp(-x))):
+#   x → NEG → EXP → ADD(scalar=1.0) → DIV
+#   x ──────────────────────────────→ DIV → out
+#
+# 4 nodes, x0 fans out to NEG and DIV.
+
+register_dag_fusion(DAGFusionPattern(
+    name="silu",
+    nodes={
+        "neg":   DAGNode(OpType.NEG, ["x0"]),
+        "exp":   DAGNode(OpType.EXP, ["neg"]),
+        "denom": DAGNode(OpType.ADD, ["exp"], scalar=1.0),
+        "out":   DAGNode(OpType.DIV, ["x0", "denom"]),
+    },
+    root="out",
+    fused_op=OpType.SILU,
+    external_inputs=["x0"],
+))
+
+
+# RMSNorm: x / sqrt(mean(x^2) + eps) * weight
+#
+# After exporter decomposes mean to SUM+DIV:
+#   x → POW(2) → SUM(keepdim) → DIV(scalar=N) → ADD(scalar=eps) → RSQRT
+#                                                                     ↓
+#                                                  x → MUL(x, rsqrt) → MUL(·, weight)
+#
+# 7 nodes, x0 fans out to POW and normalize MUL.
+# DIV and ADD have varying scalars (hidden_dim, eps) — matched by
+# structure only (scalar=None). Scalar-vs-tensor is distinguished by
+# input count: scalar variants have 1 input, tensor variants have 2.
+
+def _rmsnorm_build_attrs(bindings: dict[str, 'Node'], graph: 'Graph') -> dict:
+    """Extract eps from the ADD node."""
+    return {"eps": bindings["add_eps"].attrs["scalar"]}
+
+register_dag_fusion(DAGFusionPattern(
+    name="rmsnorm",
+    nodes={
+        "pow":     DAGNode(OpType.POW,   ["x0"],              scalar=2.0),
+        "sum":     DAGNode(OpType.SUM,   ["pow"]),
+        "div":     DAGNode(OpType.DIV,   ["sum"]),             # scalar=hidden_dim
+        "add_eps": DAGNode(OpType.ADD,   ["div"]),             # scalar=eps
+        "rsqrt":   DAGNode(OpType.RSQRT, ["add_eps"]),
+        "norm":    DAGNode(OpType.MUL,   ["x0", "rsqrt"],     commutative=True),
+        "out":     DAGNode(OpType.MUL,   ["norm", "x1"],      commutative=True),
+    },
+    root="out",
+    fused_op=OpType.RMSNORM,
+    external_inputs=["x0", "x1"],  # x0=input, x1=weight
+    build_attrs=_rmsnorm_build_attrs,
 ))

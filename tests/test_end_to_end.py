@@ -24,11 +24,13 @@ from conftest import SimpleMLP, NaiveTransformerBlock, SDPATransformerBlock
 MLP_CONFIGS = [(1, 64), (4, 128), (32, 512), (128, 2048), (32, 4096)]
 
 # (batch, seq_len, d_model, n_heads) configs for transformer tests
+# Configs with seq > 256 exercise the adaptive flash attention path.
 TRANSFORMER_CONFIGS = [
     (1, 8, 64, 4),
     (2, 16, 64, 4),
     (4, 32, 128, 8),
     (2, 64, 256, 8),
+    (1, 512, 64, 4),     # flash attention (non-causal)
 ]
 
 
@@ -263,6 +265,7 @@ from conftest import CausalNaiveTransformerBlock
 CAUSAL_CONFIGS = [
     (1, 8, 64, 4),
     (2, 16, 64, 4),
+    (1, 512, 64, 4),     # causal flash attention
 ]
 
 
@@ -408,7 +411,7 @@ def _make_gpt2_body():
     return body
 
 
-GPT2_SEQ_LENGTHS = [1, 16, 64]
+GPT2_SEQ_LENGTHS = [1, 16, 64, 512]
 
 
 @pytest.mark.parametrize("seq_len", GPT2_SEQ_LENGTHS)

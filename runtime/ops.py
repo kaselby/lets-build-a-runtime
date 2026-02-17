@@ -171,23 +171,68 @@ def _transpose_extras(node: Node, graph: Graph) -> list[int]:
     return [outer, A, middle, B, inner]
 
 
+def _broadcast_strides(shape: tuple, out_shape: tuple) -> list[int]:
+    """Compute element strides for broadcasting shape against out_shape.
+
+    Dims where the input has size 1 (or is absent) get stride 0 — the kernel
+    re-reads the same element, implementing broadcast.
+    """
+    ndim = len(out_shape)
+    offset = ndim - len(shape)
+    strides = []
+    for d in range(ndim):
+        if d < offset or shape[d - offset] == 1:
+            strides.append(0)
+        else:
+            stride = 1
+            for k in range(d - offset + 1, len(shape)):
+                stride *= shape[k]
+            strides.append(stride)
+    return strides
+
+
+def _pack_broadcast(a_shape: tuple, b_shape: tuple,
+                    out_shape: tuple) -> list[int]:
+    """Pack broadcast strides into extras: [ndim, a_strides..., b_strides..., out_shape...]."""
+    ndim = len(out_shape)
+    a_strides = _broadcast_strides(a_shape, out_shape)
+    b_strides = _broadcast_strides(b_shape, out_shape)
+    return [ndim] + a_strides + b_strides + list(out_shape)
+
+
 def _add_extras(node: Node, graph: Graph) -> list[int]:
-    """extra[0] = mode: 0=bias broadcast, 1=element-wise, 2=scalar.
-    For scalar mode: extra[1] = scalar value as float bits.
+    """extra[0] = mode: 0=bias broadcast, 1=element-wise, 2=scalar, 3=general broadcast.
+    Scalar:    extra[1] = float bits.
+    Broadcast: extra[1] = ndim, then a_strides, b_strides, out_shape.
     """
     if "scalar" in node.attrs:
         return [2, _float_bits(node.attrs["scalar"])]
     a_shape = graph.tensors[node.inputs[0]].shape
     b_shape = graph.tensors[node.inputs[1]].shape
-    mode = 1 if a_shape == b_shape else 0
-    return [mode]
+    if a_shape == b_shape:
+        return [1]
+    # Check for simple bias broadcast: b is 1D, last dim matches
+    if len(b_shape) == 1 and b_shape[-1] == a_shape[-1]:
+        return [0]
+    # General broadcast
+    out_shape = node.attrs.get("_out_shape") or graph.tensors[node.output].shape
+    return [3] + _pack_broadcast(a_shape, b_shape, out_shape)
 
 
 def _scalar_binop_extras(node: Node, graph: Graph) -> list[int]:
-    """For DIV, SUB, MUL: extra = [is_scalar, scalar_bits] when scalar."""
+    """For MUL, SUB, DIV: extra[0] = mode: 0=element-wise, 1=scalar, 2=broadcast.
+    Scalar:    extra[1] = float bits.
+    Broadcast: extra[1] = ndim, then a_strides, b_strides, out_shape.
+    """
     if "scalar" in node.attrs:
         return [1, _float_bits(node.attrs["scalar"])]
-    return []
+    a_shape = graph.tensors[node.inputs[0]].shape
+    b_shape = graph.tensors[node.inputs[1]].shape
+    if a_shape == b_shape:
+        return [0]
+    # General broadcast
+    out_shape = graph.tensors[node.output].shape
+    return [2] + _pack_broadcast(a_shape, b_shape, out_shape)
 
 
 def _reduction_extras(node: Node, graph: Graph) -> list[int]:
@@ -203,11 +248,18 @@ def _layernorm_extras(node: Node, graph: Graph) -> list[int]:
     return [_float_bits(eps)]
 
 
+def _rmsnorm_extras(node: Node, graph: Graph) -> list[int]:
+    """extra = [eps_bits]"""
+    eps = node.attrs.get("eps", 1e-5)
+    return [_float_bits(eps)]
+
+
 def _attention_extras(node: Node, graph: Graph) -> list[int]:
-    """extra = [seq_len, head_dim, causal, has_mask]"""
+    """extra = [seq_len, head_dim, causal, has_mask, group_size]"""
     q_shape = graph.tensors[node.inputs[0]].shape
     has_mask = 1 if len(node.inputs) > 3 else 0
-    return [q_shape[-2], q_shape[-1], 1 if node.attrs.get("causal") else 0, has_mask]
+    group_size = node.attrs.get("group_size", 1)
+    return [q_shape[-2], q_shape[-1], 1 if node.attrs.get("causal") else 0, has_mask, group_size]
 
 
 def _pow_extras(node: Node, graph: Graph) -> list[int]:
@@ -218,6 +270,36 @@ def _pow_extras(node: Node, graph: Graph) -> list[int]:
 def _embedding_extras(node: Node, graph: Graph) -> list[int]:
     """extra = [embed_dim]"""
     return [graph.tensors[node.inputs[1]].shape[-1]]
+
+
+def _cat_extras(node: Node, graph: Graph) -> list[int]:
+    """extra = [dim, dim_size_0, dim_size_1, ...]"""
+    dim = node.attrs["dim"]
+    sizes = [graph.tensors[inp].shape[dim] for inp in node.inputs]
+    return [dim] + sizes
+
+
+def _gated_act_extras(node: Node, graph: Graph) -> list[int]:
+    """extra = [has_bias, act_type (0=silu, 1=gelu)]"""
+    has_bias = 1 if node.attrs.get("has_bias") else 0
+    act_type = 0 if node.attrs.get("act", "silu") == "silu" else 1
+    return [has_bias, act_type]
+
+
+def _eval_gated_act(ins: list[np.ndarray], attrs: dict[str, Any]) -> np.ndarray:
+    has_bias = attrs.get("has_bias", False)
+    act = attrs.get("act", "silu")
+    if has_bias:
+        x, bias, up = ins[0], ins[1], ins[2]
+        v = x + bias
+    else:
+        x, up = ins[0], ins[1]
+        v = x
+    if act == "silu":
+        activated = v / (1.0 + np.exp(-v))
+    else:  # gelu
+        activated = 0.5 * v * (1 + np.tanh(0.7978845608 * (v + 0.044715 * v**3)))
+    return activated * up
 
 
 def _slice_alias(node: Node) -> bool:
@@ -235,7 +317,7 @@ def _slice_extras(node: Node, graph: Graph) -> list[int]:
     in_shape = graph.tensors[node.inputs[0]].shape
     dim = node.attrs["dim"]
     start = node.attrs["start"]
-    end = node.attrs["end"]
+    end = min(node.attrs["end"], in_shape[dim])
 
     outer = 1
     for d in range(dim):
@@ -329,23 +411,48 @@ def _shape_embedding(in_shapes, attrs):
     return (*in_shapes[0], in_shapes[1][-1])
 
 
+def _shape_cat(in_shapes, attrs):
+    """CAT: sum the concat dim across all inputs."""
+    dim = attrs["dim"]
+    result = list(in_shapes[0])
+    result[dim] = sum(s[dim] for s in in_shapes)
+    return tuple(result)
+
+
 # ---------------------------------------------------------------------------
 # Scratch calculators
 # ---------------------------------------------------------------------------
+
+# Adaptive attention dispatch: must match FLASH_SEQ_THRESHOLD in
+# csrc/ops/attn.c and csrc/executor.c.
+FLASH_SEQ_THRESHOLD = 256
+FLASH_BR = 128
+FLASH_BC = 256
+
+
+def _use_flash_attention(seq_len: int, attrs: dict) -> bool:
+    """Whether to use flash attention for the given config.
+
+    Flash supports causal natively (skips ~half the tiles).
+    Only custom masks require the standard path.
+    """
+    return seq_len > FLASH_SEQ_THRESHOLD
+
 
 def _attention_scratch(input_shapes, output_shape, attrs) -> int:
     """Scratch for fused attention: one score matrix per batch*head slice.
 
     Standard kernel needs S*S per slice (full attention matrix).
     Flash kernel needs B_r*B_c per slice (one tile).
+    Adaptive dispatch chooses based on seq_len and causal/mask flags.
     """
     q_shape = input_shapes[0]
     batch_heads = 1
     for d in q_shape[:-2]:
         batch_heads *= d
     seq_len = q_shape[-2]
-    if attrs.get("flash"):
-        scratch_per_slice = 32 * 32  # FLASH_BR * FLASH_BC
+    if _use_flash_attention(seq_len, attrs):
+        scratch_per_slice = FLASH_BR * FLASH_BC
     else:
         scratch_per_slice = seq_len * seq_len
     return batch_heads * scratch_per_slice * 4  # float32
@@ -408,6 +515,16 @@ OP_REGISTRY: dict[OpType, OpDef] = {
                           evaluator=lambda ins, a: np.tanh(ins[0])),
     OpType.GELU:    OpDef(inplace=False,  # C kernel not in-place safe (macOS vvtanhf path)
                           evaluator=lambda ins, a: 0.5 * ins[0] * (1 + np.tanh(0.7978845608 * (ins[0] + 0.044715 * ins[0]**3)))),
+    OpType.RSQRT:   OpDef(inplace=True,
+                          evaluator=lambda ins, a: 1.0 / np.sqrt(ins[0])),
+    OpType.SILU:    OpDef(inplace=True,
+                          evaluator=lambda ins, a: ins[0] / (1.0 + np.exp(-ins[0]))),
+    OpType.NEG:     OpDef(inplace=True,
+                          evaluator=lambda ins, a: -ins[0]),
+    OpType.COS:     OpDef(inplace=True,
+                          evaluator=lambda ins, a: np.cos(ins[0])),
+    OpType.SIN:     OpDef(inplace=True,
+                          evaluator=lambda ins, a: np.sin(ins[0])),
 
     # --- Reductions ---
     OpType.MAX:     OpDef(extras=_reduction_extras, shape=_shape_reduce,
@@ -430,10 +547,14 @@ OP_REGISTRY: dict[OpType, OpDef] = {
 
     # --- Compound ops ---
     OpType.LAYERNORM:   OpDef(extras=_layernorm_extras, evaluator=_eval_layernorm),
+    OpType.RMSNORM:     OpDef(extras=_rmsnorm_extras,
+                              evaluator=lambda ins, a: ins[0] / np.sqrt(np.mean(ins[0]**2, axis=-1, keepdims=True) + a.get("eps", 1e-5)) * ins[1]),
     OpType.MATMUL:      OpDef(extras=_matmul_extras, shape=_shape_matmul,
                               evaluator=lambda ins, a: ins[0] @ (np.swapaxes(ins[1], -2, -1) if a.get("transpose_b") else ins[1]) * a.get("alpha", 1.0)),
     OpType.EMBEDDING:   OpDef(extras=_embedding_extras, shape=_shape_embedding,
                               evaluator=lambda ins, a: ins[1][ins[0].astype(int)]),
+    OpType.CAT:         OpDef(extras=_cat_extras, shape=_shape_cat,
+                              evaluator=lambda ins, a: np.concatenate(ins, axis=a["dim"])),
 
     # --- Fused ops ---
     OpType.MATMUL_ADD:      OpDef(extras=_matmul_extras, shape=_shape_matmul,
@@ -441,8 +562,9 @@ OP_REGISTRY: dict[OpType, OpDef] = {
     OpType.FUSED_BIAS_RELU: OpDef(inplace=True, evaluator=lambda ins, a: np.maximum(ins[0] + ins[1], 0)),
     OpType.ATTENTION:       OpDef(extras=_attention_extras, scratch=_attention_scratch,
                                   shape=_shape_attention, evaluator=_eval_attention),
+    OpType.GATED_ACT:       OpDef(extras=_gated_act_extras, evaluator=_eval_gated_act),
 
-    # --- Fold-only ops (100+) ---
+    # --- Fold-only ops (5000+) ---
     # Infrastructure ops for mask generation, type conversion, etc.
     # Must be eliminated by constant folding before execution — neither
     # executor supports them. Evaluators here are used by constant_fold().

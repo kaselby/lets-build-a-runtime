@@ -5,7 +5,7 @@ interpreted execution paths, since they have different dispatch
 requirements.
 """
 
-from ..ir import OpType
+from ..ir import FOLD_ONLY_BASE, OpType
 from ..ops import OP_REGISTRY
 from ..planner import ExecutionPlan
 from .core import Phase, Severity, ValidationResult, register_validator
@@ -16,6 +16,7 @@ from .core import Phase, Severity, ValidationResult, register_validator
 _C_DISPATCH_OPS: frozenset[OpType] = frozenset({
     # Element-wise unary
     OpType.RELU, OpType.EXP, OpType.TANH, OpType.POW, OpType.GELU,
+    OpType.RSQRT, OpType.SILU, OpType.NEG, OpType.COS, OpType.SIN,
     # Element-wise binary
     OpType.ADD, OpType.SUB, OpType.MUL, OpType.DIV,
     # Reductions
@@ -39,6 +40,7 @@ _C_BACKEND_OPS: frozenset[OpType] = frozenset({
     OpType.MAX, OpType.SUM, OpType.SOFTMAX,
     OpType.LAYERNORM, OpType.FUSED_BIAS_RELU, OpType.ATTENTION,
     OpType.POW, OpType.TANH, OpType.GELU,
+    OpType.RSQRT, OpType.SILU, OpType.NEG, OpType.COS, OpType.SIN,
     OpType.EMBEDDING, OpType.SLICE,
 })
 
@@ -75,7 +77,7 @@ def validate_compiled_dispatch(plan: ExecutionPlan) -> list[ValidationResult]:
     results = []
 
     for node_id, op in _ops_needing_dispatch(plan):
-        if op.value >= 100:
+        if op.value >= FOLD_ONLY_BASE:
             results.append(ValidationResult(NAME, Severity.ERROR,
                 f"Fold-only op {op.name} (node {node_id}) cannot be compiled"))
             continue
@@ -103,7 +105,7 @@ def validate_interpreted_dispatch(plan: ExecutionPlan) -> list[ValidationResult]
     available = _backend_op_set(plan.backend)
 
     for node_id, op in _ops_needing_dispatch(plan):
-        if op.value >= 100:
+        if op.value >= FOLD_ONLY_BASE:
             results.append(ValidationResult(NAME, Severity.ERROR,
                 f"Fold-only op {op.name} (node {node_id}) cannot be dispatched"))
             continue

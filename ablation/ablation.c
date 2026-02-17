@@ -1,72 +1,30 @@
 /*
  * ablation.c — Variant kernels and parametric executor for ablation benchmarks.
  *
- * Self-contained: duplicates OpNode struct and dispatch logic from executor.c
- * so we don't touch existing files. Linked with ops.c for shared kernels.
+ * Duplicates dispatch logic from executor.c with additional kernel variants
+ * for controlled performance ablation. Linked with ops/ .c files for shared kernels.
  *
  * Provides:
- *   kernel_attention_scalar  — fused attention, scalar softmax, sequential
- *   kernel_attention_simd    — fused attention, SIMD softmax, sequential (no GCD)
- *   execute_ablation         — parametric executor with variant selection
- *   timed_execute_ablation   — per-op nanosecond timing with variant selection
+ *   kernel_attention_scalar      — standard attention, scalar softmax, sequential
+ *   kernel_attention_simd        — standard attention, SIMD softmax, sequential
+ *   kernel_attention_flash_param — flash attention with configurable tile sizes
+ *   kernel_layernorm_scalar      — layernorm, scalar, sequential
+ *   kernel_layernorm_simd        — layernorm, SIMD, sequential
+ *   execute_ablation             — parametric executor with variant selection
+ *   timed_execute_ablation       — per-op nanosecond timing with variant selection
  *
  * Build: see Makefile (libablation target)
  */
 
 #ifdef __APPLE__
-#include <Accelerate/Accelerate.h>
 #include <mach/mach_time.h>
 #endif
 
-#include <math.h>
-#include <float.h>
-#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "runtime.h"
-
-/* ----------------------------------------------------------------
- * Forward declarations for ops.c kernels
- * ---------------------------------------------------------------- */
-void kernel_matmul_ab(const float* a, const float* b, float* out,
-                      int M, int N, int K, int batches, int trans_b,
-                      float alpha, float beta);
-void kernel_matmul_beta(const float* a, const float* b, float* out,
-                        int M, int N, int K, int batches, int trans_b,
-                        float beta);
-void kernel_add(const float* a, const float* bias, float* out, int M, int N);
-void kernel_relu(const float* x, float* out, int n);
-void kernel_transpose(const float* a, float* out, int rows, int cols);
-void kernel_div(const float* a, const float* b, float* out, int n);
-void kernel_sub(const float* a, const float* b, float* out, int n);
-void kernel_mul(const float* a, const float* b, float* out, int n);
-void kernel_add_scalar(const float* a, float s, float* out, int n);
-void kernel_div_scalar(const float* a, float s, float* out, int n);
-void kernel_sub_scalar(const float* a, float s, float* out, int n);
-void kernel_mul_scalar(const float* a, float s, float* out, int n);
-void kernel_exp(const float* x, float* out, int n);
-void kernel_max(const float* x, float* out, int outer, int axis_size, int inner);
-void kernel_sum(const float* x, float* out, int outer, int axis_size, int inner);
-void kernel_softmax(const float* x, float* out, int rows, int cols);
-void kernel_layernorm(const float* x, const float* gamma, const float* beta,
-                      float* out, int rows, int cols, float eps);
-void kernel_bias_relu(const float* a, const float* bias, float* out, int M, int N);
-void kernel_attention(const float* Q, const float* K, const float* V,
-                      float* output, float* scratch,
-                      int batch_heads, int seq_len, int head_dim,
-                      int causal);
-void kernel_attention_flash(const float* Q, const float* K, const float* V,
-                            float* output, float* scratch,
-                            int batch_heads, int seq_len, int head_dim);
-void kernel_tanh(const float* x, float* out, int n);
-void kernel_pow_scalar(const float* x, float scalar, float* out, int n);
-void kernel_gelu_tanh(const float* x, float* out, int n);
-void kernel_embedding(const long* ids, const float* table, float* out,
-                      int seq_len, int embed_dim);
-void kernel_slice(const float* x, float* out,
-                  int outer, int orig_dim_size, int start,
-                  int slice_len, int inner);
+#include "ops.h"
 
 
 /* ================================================================
@@ -107,27 +65,41 @@ static void softmax_scalar(const float* x, float* out, int rows, int cols) {
  *   - slices are processed sequentially (no dispatch_apply)
  * ---------------------------------------------------------------- */
 void kernel_attention_scalar(const float* Q, const float* K, const float* V,
-                             float* output, float* scratch,
-                             int batch_heads, int seq_len, int head_dim) {
+                             float* output, float* scratch, const float* mask,
+                             int batch_heads, int seq_len, int head_dim,
+                             int causal, int group_size) {
     float scale = 1.0f / sqrtf((float)head_dim);
     int slice = seq_len * head_dim;
     int scratch_sz = seq_len * seq_len;
 
     for (int bh = 0; bh < batch_heads; bh++) {
+        int kv_bh = bh / group_size;
         float* S = scratch + bh * scratch_sz;
+        const float* mask_bh = mask ? mask + bh * scratch_sz : NULL;
 
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     seq_len, seq_len, head_dim, scale,
                     Q + bh * slice, head_dim,
-                    K + bh * slice, head_dim,
+                    K + kv_bh * slice, head_dim,
                     0.0f, S, seq_len);
+
+        /* Apply mask or causal */
+        if (mask_bh) {
+            int ss = seq_len * seq_len;
+            for (int i = 0; i < ss; i++)
+                S[i] += mask_bh[i];
+        } else if (causal) {
+            for (int i = 0; i < seq_len; i++)
+                for (int j = i + 1; j < seq_len; j++)
+                    S[i * seq_len + j] = -INFINITY;
+        }
 
         softmax_scalar(S, S, seq_len, seq_len);
 
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     seq_len, head_dim, seq_len, 1.0f,
                     S, seq_len,
-                    V + bh * slice, head_dim,
+                    V + kv_bh * slice, head_dim,
                     0.0f, output + bh * slice, head_dim);
     }
 }
@@ -139,33 +111,46 @@ void kernel_attention_scalar(const float* Q, const float* K, const float* V,
  * but processes slices sequentially — isolates SIMD from threading.
  * ---------------------------------------------------------------- */
 void kernel_attention_simd(const float* Q, const float* K, const float* V,
-                           float* output, float* scratch,
-                           int batch_heads, int seq_len, int head_dim) {
+                           float* output, float* scratch, const float* mask,
+                           int batch_heads, int seq_len, int head_dim,
+                           int causal, int group_size) {
     float scale = 1.0f / sqrtf((float)head_dim);
     int slice = seq_len * head_dim;
     int scratch_sz = seq_len * seq_len;
 
     for (int bh = 0; bh < batch_heads; bh++) {
+        int kv_bh = bh / group_size;
         float* S = scratch + bh * scratch_sz;
+        const float* mask_bh = mask ? mask + bh * scratch_sz : NULL;
 
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     seq_len, seq_len, head_dim, scale,
                     Q + bh * slice, head_dim,
-                    K + bh * slice, head_dim,
+                    K + kv_bh * slice, head_dim,
                     0.0f, S, seq_len);
+
+        /* Apply mask or causal */
+        if (mask_bh) {
+            int ss = seq_len * seq_len;
+            for (int i = 0; i < ss; i++)
+                S[i] += mask_bh[i];
+        } else if (causal) {
+            for (int i = 0; i < seq_len; i++)
+                for (int j = i + 1; j < seq_len; j++)
+                    S[i * seq_len + j] = -INFINITY;
+        }
 
         kernel_softmax(S, S, seq_len, seq_len);
 
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     seq_len, head_dim, seq_len, 1.0f,
                     S, seq_len,
-                    V + bh * slice, head_dim,
+                    V + kv_bh * slice, head_dim,
                     0.0f, output + bh * slice, head_dim);
     }
 }
 
 /* kernel_attention from ops.c is variant 2 (SIMD + GCD) */
-
 
 /* ----------------------------------------------------------------
  * LayerNorm variants
@@ -240,6 +225,151 @@ void kernel_layernorm_simd(const float* x, const float* gamma, const float* beta
 }
 
 /* kernel_layernorm from ops.c is variant 2 (SIMD + GCD) */
+
+
+/* ----------------------------------------------------------------
+ * Parameterized flash attention — configurable tile sizes
+ *
+ * Same algorithm as kernel_attention_flash in ops/attn.c, but
+ * takes br_max/bc_max as parameters instead of #defines. Enables
+ * block size ablation (32x32, 64x128, 128x256, 256x512).
+ *
+ * Uses C99 VLAs for row state (m[], l[]) — max 256 floats = 1KB.
+ * ---------------------------------------------------------------- */
+static void attention_flash_slice_param(
+        const float* Q_bh, const float* K_bh, const float* V_bh,
+        float* O_bh, float* scratch, int seq_len, int head_dim,
+        float scale, int causal, int br_max, int bc_max) {
+
+    for (int qi = 0; qi < seq_len; qi += br_max) {
+        int br = (qi + br_max <= seq_len) ? br_max : seq_len - qi;
+
+        const float* Q_block = Q_bh + qi * head_dim;
+        float*       O_block = O_bh + qi * head_dim;
+
+        float m[br_max];  /* VLA — running row max */
+        float l[br_max];  /* VLA — running row sum */
+        for (int r = 0; r < br; r++) {
+            m[r] = -FLT_MAX;
+            l[r] = 0.0f;
+        }
+        for (int r = 0; r < br; r++)
+            for (int d = 0; d < head_dim; d++)
+                O_block[r * head_dim + d] = 0.0f;
+
+        for (int kj = 0; kj < seq_len; kj += bc_max) {
+            int bc = (kj + bc_max <= seq_len) ? bc_max : seq_len - kj;
+
+            /* Causal: skip fully-masked tiles */
+            if (causal && kj > qi + br - 1)
+                break;
+
+            const float* K_block = K_bh + kj * head_dim;
+            const float* V_block = V_bh + kj * head_dim;
+
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        br, bc, head_dim,
+                        scale,
+                        Q_block, head_dim,
+                        K_block, head_dim,
+                        0.0f,
+                        scratch, bc);
+
+            /* Causal mask: set future positions to -inf in partial tiles */
+            if (causal && kj + bc > qi) {
+                for (int r = 0; r < br; r++) {
+                    int last_valid = qi + r - kj;
+                    if (last_valid < bc - 1) {
+                        int start = (last_valid < 0) ? 0 : last_valid + 1;
+                        for (int c = start; c < bc; c++)
+                            scratch[r * bc + c] = -INFINITY;
+                    }
+                }
+            }
+
+            for (int r = 0; r < br; r++) {
+                float* S_row = scratch + r * bc;
+                float* O_row = O_block + r * head_dim;
+
+#ifdef __APPLE__
+                float m_tile;
+                vDSP_maxv(S_row, 1, &m_tile, (vDSP_Length)bc);
+                float m_new = m[r] > m_tile ? m[r] : m_tile;
+
+                float correction = expf(m[r] - m_new);
+                l[r] *= correction;
+                vDSP_vsmul(O_row, 1, &correction, O_row, 1, (vDSP_Length)head_dim);
+
+                float neg_m = -m_new;
+                vDSP_vsadd(S_row, 1, &neg_m, S_row, 1, (vDSP_Length)bc);
+                vvexpf(S_row, S_row, &bc);
+
+                float l_new;
+                vDSP_sve(S_row, 1, &l_new, (vDSP_Length)bc);
+                l[r] += l_new;
+                m[r] = m_new;
+#else
+                float m_tile = S_row[0];
+                for (int c = 1; c < bc; c++)
+                    if (S_row[c] > m_tile) m_tile = S_row[c];
+                float m_new = m[r] > m_tile ? m[r] : m_tile;
+
+                float correction = expf(m[r] - m_new);
+                l[r] *= correction;
+                for (int d = 0; d < head_dim; d++)
+                    O_row[d] *= correction;
+
+                float l_new = 0.0f;
+                for (int c = 0; c < bc; c++) {
+                    float p = expf(S_row[c] - m_new);
+                    S_row[c] = p;
+                    l_new += p;
+                }
+                l[r] += l_new;
+                m[r] = m_new;
+#endif
+            }
+
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        br, head_dim, bc,
+                        1.0f,
+                        scratch, bc,
+                        V_block, head_dim,
+                        1.0f,
+                        O_block, head_dim);
+        }
+
+        for (int r = 0; r < br; r++) {
+            float* O_row = O_block + r * head_dim;
+#ifdef __APPLE__
+            vDSP_vsdiv(O_row, 1, &l[r], O_row, 1, (vDSP_Length)head_dim);
+#else
+            float inv_l = 1.0f / l[r];
+            for (int d = 0; d < head_dim; d++)
+                O_row[d] *= inv_l;
+#endif
+        }
+    }
+}
+
+static void kernel_attention_flash_param(
+        const float* Q, const float* K, const float* V,
+        float* output, float* scratch,
+        int batch_heads, int seq_len, int head_dim,
+        int causal, int group_size, int br_max, int bc_max) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int slice = seq_len * head_dim;
+    int scratch_per_slice = br_max * bc_max;
+
+    PARALLEL_FOR(batch_heads, slice * (int)sizeof(float), bh, {
+        int kv_bh = bh / group_size;
+        attention_flash_slice_param(
+            Q + bh * slice, K + kv_bh * slice,
+            V + kv_bh * slice, output + bh * slice,
+            scratch + bh * scratch_per_slice,
+            seq_len, head_dim, scale, causal, br_max, bc_max);
+    });
+}
 
 
 /* ================================================================
@@ -456,7 +586,7 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
         /* Usually zero-copy alias, but handle copy case */
         if (node->inputs[0] != node->output) {
             memcpy(node->output, node->inputs[0],
-                   total_elements(node) * sizeof(float));
+                   total_elements(node) * node->elem_size);
         }
         break;
     }
@@ -464,10 +594,9 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
     case OP_SLICE: {
         /* extra = [outer, orig_dim_size, start, slice_len, inner] */
         if (node->extra[0] == 0) break;
-        kernel_slice((const float*)node->inputs[0],
-                     (float*)node->output,
+        kernel_slice(node->inputs[0], node->output,
                      node->extra[0], node->extra[1], node->extra[2],
-                     node->extra[3], node->extra[4]);
+                     node->extra[3], node->extra[4], node->elem_size);
         break;
     }
 
@@ -550,48 +679,180 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
         break;
     }
 
+    case OP_RSQRT: {
+        kernel_rsqrt((const float*)node->inputs[0],
+                     (float*)node->output, total_elements(node));
+        break;
+    }
+
+    case OP_SILU: {
+        kernel_silu((const float*)node->inputs[0],
+                    (float*)node->output, total_elements(node));
+        break;
+    }
+
+    case OP_NEG: {
+        kernel_neg((const float*)node->inputs[0],
+                   (float*)node->output, total_elements(node));
+        break;
+    }
+
+    case OP_COS: {
+        kernel_cos((const float*)node->inputs[0],
+                   (float*)node->output, total_elements(node));
+        break;
+    }
+
+    case OP_SIN: {
+        kernel_sin((const float*)node->inputs[0],
+                   (float*)node->output, total_elements(node));
+        break;
+    }
+
+    case OP_RMSNORM: {
+        int cols = node->out_shape[node->n_dims - 1];
+        kernel_rmsnorm((const float*)node->inputs[0],
+                       (const float*)node->inputs[1],
+                       (float*)node->output,
+                       leading_dims(node), cols, extra_float(node, 0));
+        break;
+    }
+
+    case OP_CAT: {
+        int dim = node->extra[0];
+        int outer = 1, inner = 1;
+        for (int i = 0; i < dim; i++) outer *= node->out_shape[i];
+        for (int i = dim + 1; i < node->n_dims; i++) inner *= node->out_shape[i];
+        kernel_cat(node->inputs, node->output,
+                   &node->extra[1], node->n_inputs,
+                   outer, inner, node->elem_size);
+        break;
+    }
+
+    case OP_GATED_ACT: {
+        int has_bias = node->extra[0];
+        int act_type = node->extra[1];
+        int N = node->out_shape[node->n_dims - 1];
+        const float* x    = (const float*)node->inputs[0];
+        const float* up   = has_bias ? (const float*)node->inputs[2] : (const float*)node->inputs[1];
+        const float* bias = has_bias ? (const float*)node->inputs[1] : NULL;
+        int M = leading_dims(node);
+        if (act_type == 0)
+            kernel_gated_silu(x, up, bias, (float*)node->output, M, N, has_bias);
+        else
+            kernel_gated_gelu(x, up, bias, (float*)node->output, M, N, has_bias);
+        break;
+    }
+
     case OP_ATTENTION: {
-        int seq_len = node->extra[0];
-        int head_dim = node->extra[1];
+        /* extras: [seq_len, head_dim, causal, has_mask, group_size]
+         * no mask:   inputs = [Q, K, V, scratch]
+         * with mask: inputs = [Q, K, V, mask, scratch] */
+        int seq_len    = node->extra[0];
+        int head_dim   = node->extra[1];
+        int causal     = node->extra[2];
+        int has_mask   = node->extra[3];
+        int group_size = node->extra[4] > 0 ? node->extra[4] : 1;
         int batch_heads = 1;
         for (int i = 0; i < node->n_dims - 2; i++)
             batch_heads *= node->out_shape[i];
+        const float* mask = has_mask ? (const float*)node->inputs[3] : NULL;
+        float* scratch    = has_mask ? (float*)node->inputs[4] : (float*)node->inputs[3];
+
+        /* Scratch is always >= max(S*S, max_tile) per slice — the Python
+         * ablation overrides the planner's scratch calculator. All standard
+         * and flash variants can run safely from the same plan. */
         switch (attn_mode) {
-        case 0:
+        case 0:  /* scalar softmax, sequential */
             kernel_attention_scalar(
                 (const float*)node->inputs[0],
                 (const float*)node->inputs[1],
                 (const float*)node->inputs[2],
-                (float*)node->output,
-                (float*)node->inputs[3],
-                batch_heads, seq_len, head_dim);
+                (float*)node->output, scratch, mask,
+                batch_heads, seq_len, head_dim,
+                causal, group_size);
             break;
-        case 1:
+        case 1:  /* SIMD softmax, sequential */
             kernel_attention_simd(
                 (const float*)node->inputs[0],
                 (const float*)node->inputs[1],
                 (const float*)node->inputs[2],
-                (float*)node->output,
-                (float*)node->inputs[3],
-                batch_heads, seq_len, head_dim);
+                (float*)node->output, scratch, mask,
+                batch_heads, seq_len, head_dim,
+                causal, group_size);
             break;
-        case 3:
+        case 3:  /* force flash (ops.c kernel, 128x256, GCD) */
             kernel_attention_flash(
                 (const float*)node->inputs[0],
                 (const float*)node->inputs[1],
                 (const float*)node->inputs[2],
-                (float*)node->output,
-                (float*)node->inputs[3],
-                batch_heads, seq_len, head_dim);
+                (float*)node->output, scratch,
+                batch_heads, seq_len, head_dim,
+                causal, group_size);
             break;
-        default:
+        case 4:  /* force standard (ops.c kernel, GCD) */
             kernel_attention(
                 (const float*)node->inputs[0],
                 (const float*)node->inputs[1],
                 (const float*)node->inputs[2],
-                (float*)node->output,
-                (float*)node->inputs[3],
-                batch_heads, seq_len, head_dim, 0);
+                (float*)node->output, scratch, mask,
+                batch_heads, seq_len, head_dim,
+                causal, group_size);
+            break;
+        case 5:  /* flash 32x32 */
+            kernel_attention_flash_param(
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output, scratch,
+                batch_heads, seq_len, head_dim,
+                causal, group_size, 32, 32);
+            break;
+        case 6:  /* flash 64x128 */
+            kernel_attention_flash_param(
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output, scratch,
+                batch_heads, seq_len, head_dim,
+                causal, group_size, 64, 128);
+            break;
+        case 7:  /* flash 128x256 */
+            kernel_attention_flash_param(
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output, scratch,
+                batch_heads, seq_len, head_dim,
+                causal, group_size, 128, 256);
+            break;
+        case 8:  /* flash 256x512 */
+            kernel_attention_flash_param(
+                (const float*)node->inputs[0],
+                (const float*)node->inputs[1],
+                (const float*)node->inputs[2],
+                (float*)node->output, scratch,
+                batch_heads, seq_len, head_dim,
+                causal, group_size, 256, 512);
+            break;
+        default:  /* mode 2: adaptive (production behavior) */
+            if (!has_mask && seq_len > 256) {
+                kernel_attention_flash(
+                    (const float*)node->inputs[0],
+                    (const float*)node->inputs[1],
+                    (const float*)node->inputs[2],
+                    (float*)node->output, scratch,
+                    batch_heads, seq_len, head_dim,
+                    causal, group_size);
+            } else {
+                kernel_attention(
+                    (const float*)node->inputs[0],
+                    (const float*)node->inputs[1],
+                    (const float*)node->inputs[2],
+                    (float*)node->output, scratch, mask,
+                    batch_heads, seq_len, head_dim,
+                    causal, group_size);
+            }
             break;
         }
         break;
@@ -612,7 +873,9 @@ static void dispatch_variant(OpNode* node, int softmax_mode, int attn_mode,
  * execute_ablation — run a compiled plan with variant selection.
  *
  * softmax_mode:   0 = SIMD (default), 1 = scalar
- * attn_mode:      0 = scalar, 1 = SIMD, 2 = SIMD+GCD (default), 3 = flash
+ * attn_mode:      0 = scalar, 1 = SIMD, 2 = adaptive (default), 3 = flash,
+ *                 4 = standard, 5-8 = flash block size ablation
+ *                 (5=32x32, 6=64x128, 7=128x256, 8=256x512)
  * layernorm_mode: 0 = scalar, 1 = SIMD, 2 = SIMD+GCD (default)
  */
 void execute_ablation(OpNode* nodes, int n_nodes,

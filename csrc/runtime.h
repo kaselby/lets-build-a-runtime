@@ -9,45 +9,53 @@
 #define RUNTIME_H
 
 enum OpType {
-    /* Element-wise unary (10-19) */
-    OP_RELU      = 10,
-    OP_EXP       = 11,
-    OP_TANH      = 12,
-    OP_POW       = 13,
-    OP_GELU      = 14,
+    /* Element-wise unary (100-199) */
+    OP_RELU      = 100,
+    OP_EXP       = 101,
+    OP_TANH      = 102,
+    OP_POW       = 103,
+    OP_GELU      = 104,
+    OP_RSQRT     = 105,
+    OP_SILU      = 106,
+    OP_NEG       = 107,
+    OP_COS       = 108,
+    OP_SIN       = 109,
 
-    /* Element-wise binary (20-29) */
-    OP_ADD       = 20,
-    OP_SUB       = 21,
-    OP_MUL       = 22,
-    OP_DIV       = 23,
+    /* Element-wise binary (200-299) */
+    OP_ADD       = 200,
+    OP_SUB       = 201,
+    OP_MUL       = 202,
+    OP_DIV       = 203,
 
-    /* Reductions (30-39) */
-    OP_MAX       = 30,
-    OP_SUM       = 31,
-    OP_SOFTMAX   = 32,
+    /* Reductions (300-399) */
+    OP_MAX       = 300,
+    OP_SUM       = 301,
+    OP_SOFTMAX   = 302,
 
-    /* MatMul / BLAS (40-49) */
-    OP_MATMUL    = 40,
+    /* MatMul / BLAS (400-499) */
+    OP_MATMUL    = 400,
 
-    /* Shape / data movement (50-59) */
-    OP_RESHAPE   = 50,
-    OP_TRANSPOSE = 51,
-    OP_PERMUTE   = 52,
-    OP_SLICE     = 53,
-    OP_EMBEDDING = 54,
+    /* Shape / data movement (500-599) */
+    OP_RESHAPE   = 500,
+    OP_TRANSPOSE = 501,
+    OP_PERMUTE   = 502,
+    OP_SLICE     = 503,
+    OP_EMBEDDING = 504,
+    OP_CAT       = 505,
 
-    /* Normalization / compound (60-69) */
-    OP_LAYERNORM = 60,
+    /* Normalization / compound (600-699) */
+    OP_LAYERNORM = 600,
+    OP_RMSNORM   = 601,
 
-    /* Fused ops (70-79) */
-    OP_MATMUL_ADD      = 70,
-    OP_FUSED_BIAS_RELU = 71,
-    OP_ATTENTION       = 72,
+    /* Fused ops (1000-1499) */
+    OP_MATMUL_ADD      = 1000,
+    OP_FUSED_BIAS_RELU = 1001,
+    OP_ATTENTION       = 1002,
+    OP_GATED_ACT       = 1003,
 };
 
-#define MAX_INPUTS 8
-#define MAX_DIMS   16
+#define MAX_INPUTS 12
+#define MAX_DIMS   24
 
 typedef struct {
     int op;

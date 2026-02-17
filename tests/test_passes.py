@@ -436,6 +436,127 @@ def test_priority_reversed_matmul_add_wins():
 
 
 # ---------------------------------------------------------------------------
+# Pattern fusion: GATED_ACT (SILU/GELU × MUL, with optional bias)
+# ---------------------------------------------------------------------------
+
+def test_silu_mul_fuses():
+    """SILU → MUL should fuse into GATED_ACT with act=silu, has_bias=False."""
+    g = _make_graph(
+        (OpType.SILU, ["x"], "silu_out", (4, 8)),
+        (OpType.MUL, ["silu_out", "up"], "gate_out", (4, 8)),
+    )
+    assert fuse(g) is True
+    nodes = list(g)
+    assert len(nodes) == 1
+    assert nodes[0].op == OpType.GATED_ACT
+    assert nodes[0].attrs["act"] == "silu"
+    assert nodes[0].attrs["has_bias"] is False
+    assert nodes[0].inputs == ["x", "up"]
+
+
+def test_gelu_mul_fuses():
+    """GELU → MUL should fuse into GATED_ACT with act=gelu, has_bias=False."""
+    g = _make_graph(
+        (OpType.GELU, ["x"], "gelu_out", (4, 8)),
+        (OpType.MUL, ["gelu_out", "up"], "gate_out", (4, 8)),
+    )
+    assert fuse(g) is True
+    nodes = list(g)
+    assert len(nodes) == 1
+    assert nodes[0].op == OpType.GATED_ACT
+    assert nodes[0].attrs["act"] == "gelu"
+    assert nodes[0].attrs["has_bias"] is False
+
+
+def test_bias_silu_mul_fuses():
+    """ADD(bias) → SILU → MUL should fuse into GATED_ACT with has_bias=True."""
+    b = np.random.randn(8).astype(np.float32)
+    g = _make_graph(
+        (OpType.ADD, ["x", "b"], "add_out", (4, 8)),
+        (OpType.SILU, ["add_out"], "silu_out", (4, 8)),
+        (OpType.MUL, ["silu_out", "up"], "gate_out", (4, 8)),
+        constants={"b": ((8,), b)},
+    )
+    assert fuse(g) is True
+    nodes = list(g)
+    assert len(nodes) == 1
+    assert nodes[0].op == OpType.GATED_ACT
+    assert nodes[0].attrs["act"] == "silu"
+    assert nodes[0].attrs["has_bias"] is True
+    assert nodes[0].inputs == ["x", "b", "up"]
+
+
+def test_bias_gelu_mul_fuses():
+    """ADD(bias) → GELU → MUL should fuse into GATED_ACT with has_bias=True."""
+    b = np.random.randn(8).astype(np.float32)
+    g = _make_graph(
+        (OpType.ADD, ["x", "b"], "add_out", (4, 8)),
+        (OpType.GELU, ["add_out"], "gelu_out", (4, 8)),
+        (OpType.MUL, ["gelu_out", "up"], "gate_out", (4, 8)),
+        constants={"b": ((8,), b)},
+    )
+    assert fuse(g) is True
+    nodes = list(g)
+    assert len(nodes) == 1
+    assert nodes[0].op == OpType.GATED_ACT
+    assert nodes[0].attrs["act"] == "gelu"
+    assert nodes[0].attrs["has_bias"] is True
+
+
+def test_priority_bias_silu_wins_over_matmul_add():
+    """In MATMUL → ADD → SILU → MUL, ADD+SILU+MUL (priority 0) should fuse
+    into GATED_ACT(has_bias=True), leaving MATMUL standalone."""
+    w = np.random.randn(8, 8).astype(np.float32)
+    b = np.random.randn(8).astype(np.float32)
+    g = _make_graph(
+        (OpType.MATMUL, ["x", "w"], "mm_out", (4, 8)),
+        (OpType.ADD, ["mm_out", "b"], "add_out", (4, 8)),
+        (OpType.SILU, ["add_out"], "silu_out", (4, 8)),
+        (OpType.MUL, ["silu_out", "up"], "gate_out", (4, 8)),
+        constants={
+            "w": ((8, 8), w),
+            "b": ((8,), b),
+        },
+    )
+    fuse(g)
+    ops = [n.op for n in g]
+    assert OpType.GATED_ACT in ops
+    assert OpType.MATMUL in ops
+    # MATMUL_ADD should NOT appear — ADD was claimed by bias_silu_mul
+    assert OpType.MATMUL_ADD not in ops
+    # Verify the fused node has bias
+    gated = [n for n in g if n.op == OpType.GATED_ACT][0]
+    assert gated.attrs["has_bias"] is True
+
+
+# ---------------------------------------------------------------------------
+# DAG fusion: SiLU recognition (defensive — aten.silu is normally a single node)
+# ---------------------------------------------------------------------------
+
+def test_silu_dag_collapses():
+    """The 4-node SiLU decomposition should collapse to a single SILU node."""
+    g = Graph()
+    shape = (4, 8)
+    g.add_tensor("x", shape)
+    g.inputs.append("x")
+    g.add_tensor("neg_out", shape)
+    g.add_node(OpType.NEG, ["x"], "neg_out")
+    g.add_tensor("exp_out", shape)
+    g.add_node(OpType.EXP, ["neg_out"], "exp_out")
+    g.add_tensor("denom", shape)
+    g.add_node(OpType.ADD, ["exp_out"], "denom", {"scalar": 1.0})
+    g.add_tensor("out", shape)
+    g.add_node(OpType.DIV, ["x", "denom"], "out")
+    g.outputs.append("out")
+
+    assert len(g.nodes) == 4
+    assert fuse_dags(g) is True
+    nodes = list(g)
+    assert len(nodes) == 1
+    assert nodes[0].op == OpType.SILU
+
+
+# ---------------------------------------------------------------------------
 # MLP end-to-end with fusion
 # ---------------------------------------------------------------------------
 
@@ -744,3 +865,232 @@ def test_absorb_causal_mask_standalone():
     assert attn.attrs.get("causal") is True
     assert "mask" not in attn.inputs
     assert len(attn.inputs) == 3  # Q, K, V only
+
+
+# ---------------------------------------------------------------------------
+# Automated fusion correctness: unfused evaluator chain vs fused execution
+#
+# For each registered fusion pattern, build the ideal-case graph, compute
+# the reference by chaining numpy evaluators, then fuse + plan + execute
+# and compare. This is a safety net — hand-written tests above cover
+# structural invariants, negative cases, and priority ordering.
+# ---------------------------------------------------------------------------
+
+from runtime.ops import OP_REGISTRY
+from runtime.passes.fusion import FUSION_PATTERNS, DAG_FUSION_PATTERNS
+
+# Each entry defines how to build valid inputs for one fusion pattern.
+# (pattern_name, graph_builder, input_generator)
+# graph_builder returns a Graph; input_generator returns {name: ndarray}.
+
+def _fusion_bias_relu():
+    shape = (4, 64)
+    g = _make_graph(
+        (OpType.ADD, ["x", "b"], "add_out", shape),
+        (OpType.RELU, ["add_out"], "relu_out", shape),
+        constants={"b": ((64,), np.random.randn(64).astype(np.float32))},
+    )
+    return g, {"x": np.random.randn(*shape).astype(np.float32)}
+
+
+def _fusion_matmul_add():
+    shape = (4, 8)
+    w = np.random.randn(16, 8).astype(np.float32)
+    b = np.random.randn(8).astype(np.float32)
+    g = _make_graph(
+        (OpType.MATMUL, ["x", "w"], "mm_out", shape),
+        (OpType.ADD, ["mm_out", "b"], "add_out", shape),
+        constants={"w": ((16, 8), w), "b": ((8,), b)},
+    )
+    return g, {"x": np.random.randn(4, 16).astype(np.float32)}
+
+
+def _fusion_silu_mul():
+    shape = (4, 64)
+    g = _make_graph(
+        (OpType.SILU, ["x"], "silu_out", shape),
+        (OpType.MUL, ["silu_out", "up"], "gate_out", shape),
+    )
+    return g, {
+        "x": np.random.randn(*shape).astype(np.float32),
+        "up": np.random.randn(*shape).astype(np.float32),
+    }
+
+
+def _fusion_gelu_mul():
+    shape = (4, 64)
+    g = _make_graph(
+        (OpType.GELU, ["x"], "gelu_out", shape),
+        (OpType.MUL, ["gelu_out", "up"], "gate_out", shape),
+    )
+    return g, {
+        "x": np.random.randn(*shape).astype(np.float32),
+        "up": np.random.randn(*shape).astype(np.float32),
+    }
+
+
+def _fusion_bias_silu_mul():
+    shape = (4, 64)
+    b = np.random.randn(64).astype(np.float32)
+    g = _make_graph(
+        (OpType.ADD, ["x", "b"], "add_out", shape),
+        (OpType.SILU, ["add_out"], "silu_out", shape),
+        (OpType.MUL, ["silu_out", "up"], "gate_out", shape),
+        constants={"b": ((64,), b)},
+    )
+    return g, {
+        "x": np.random.randn(*shape).astype(np.float32),
+        "up": np.random.randn(*shape).astype(np.float32),
+    }
+
+
+def _fusion_bias_gelu_mul():
+    shape = (4, 64)
+    b = np.random.randn(64).astype(np.float32)
+    g = _make_graph(
+        (OpType.ADD, ["x", "b"], "add_out", shape),
+        (OpType.GELU, ["add_out"], "gelu_out", shape),
+        (OpType.MUL, ["gelu_out", "up"], "gate_out", shape),
+        constants={"b": ((64,), b)},
+    )
+    return g, {
+        "x": np.random.randn(*shape).astype(np.float32),
+        "up": np.random.randn(*shape).astype(np.float32),
+    }
+
+
+FUSION_CORRECTNESS_CASES = [
+    ("bias_relu",     _fusion_bias_relu),
+    ("matmul_add",    _fusion_matmul_add),
+    ("silu_mul",      _fusion_silu_mul),
+    ("gelu_mul",      _fusion_gelu_mul),
+    ("bias_silu_mul", _fusion_bias_silu_mul),
+    ("bias_gelu_mul", _fusion_bias_gelu_mul),
+]
+
+
+@pytest.mark.parametrize("name,builder", FUSION_CORRECTNESS_CASES,
+                         ids=[c[0] for c in FUSION_CORRECTNESS_CASES])
+def _execute_with_c(ep, inputs):
+    """Helper: run an execution plan with C + numpy backends."""
+    from runtime.backends.c_backend import CBackend
+    executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
+    executor.compile(ep)
+    return executor.run(inputs)
+
+
+# ---------------------------------------------------------------------------
+# GQA absorption: RESHAPE → EXPAND → RESHAPE → ATTENTION
+# ---------------------------------------------------------------------------
+
+def _build_gqa_graph(B=2, n_q=8, n_kv=4, S=16, D=32):
+    """Build a graph with GQA expand chain on K feeding into ATTENTION."""
+    group_size = n_q // n_kv
+    g = Graph()
+
+    # Inputs: Q, K, V
+    g.add_tensor("Q", (B, n_q, S, D)); g.inputs.append("Q")
+    g.add_tensor("K", (B, n_kv, S, D)); g.inputs.append("K")
+    g.add_tensor("V", (B, n_kv, S, D)); g.inputs.append("V")
+
+    # K expand chain: unsqueeze → expand → flatten
+    g.add_tensor("K_unsq", (B, n_kv, 1, S, D))
+    g.add_node(OpType.RESHAPE, ["K"], "K_unsq", {"shape": (B, n_kv, 1, S, D)})
+
+    g.add_tensor("K_exp", (B, n_kv, group_size, S, D))
+    g.add_node(OpType.EXPAND, ["K_unsq"], "K_exp", {"shape": (B, n_kv, group_size, S, D)})
+
+    g.add_tensor("K_flat", (B, n_q, S, D))
+    g.add_node(OpType.RESHAPE, ["K_exp"], "K_flat", {"shape": (B, n_q, S, D)})
+
+    # ATTENTION(Q, K_flat, V) → output
+    g.add_tensor("attn_out", (B, n_q, S, D))
+    g.add_node(OpType.ATTENTION, ["Q", "K_flat", "V"], "attn_out")
+
+    g.outputs.append("attn_out")
+    return g, group_size
+
+
+def test_gqa_fusion_structure():
+    """RESHAPE→EXPAND→RESHAPE→ATTENTION should fuse, setting group_size."""
+    g, expected_gs = _build_gqa_graph()
+
+    assert fuse(g) is True
+
+    attn_nodes = [n for n in g if n.op == OpType.ATTENTION]
+    assert len(attn_nodes) == 1
+    assert attn_nodes[0].attrs.get("group_size") == expected_gs
+
+    # K input should be rewired to the original (pre-unsqueeze) tensor
+    assert attn_nodes[0].inputs[1] == "K"
+
+    # Expand chain should be dead (no consumers) — DCE would clean it
+    expand_nodes = [n for n in g if n.op == OpType.EXPAND]
+    assert len(expand_nodes) == 0
+
+
+def test_gqa_fusion_both_kv():
+    """When both K and V have expand chains, both should be absorbed."""
+    B, n_q, n_kv, S, D = 2, 8, 4, 16, 32
+    group_size = n_q // n_kv
+    g = Graph()
+
+    g.add_tensor("Q", (B, n_q, S, D)); g.inputs.append("Q")
+    g.add_tensor("K", (B, n_kv, S, D)); g.inputs.append("K")
+    g.add_tensor("V", (B, n_kv, S, D)); g.inputs.append("V")
+
+    # K expand chain
+    g.add_tensor("K_unsq", (B, n_kv, 1, S, D))
+    g.add_node(OpType.RESHAPE, ["K"], "K_unsq", {"shape": (B, n_kv, 1, S, D)})
+    g.add_tensor("K_exp", (B, n_kv, group_size, S, D))
+    g.add_node(OpType.EXPAND, ["K_unsq"], "K_exp", {"shape": (B, n_kv, group_size, S, D)})
+    g.add_tensor("K_flat", (B, n_q, S, D))
+    g.add_node(OpType.RESHAPE, ["K_exp"], "K_flat", {"shape": (B, n_q, S, D)})
+
+    # V expand chain
+    g.add_tensor("V_unsq", (B, n_kv, 1, S, D))
+    g.add_node(OpType.RESHAPE, ["V"], "V_unsq", {"shape": (B, n_kv, 1, S, D)})
+    g.add_tensor("V_exp", (B, n_kv, group_size, S, D))
+    g.add_node(OpType.EXPAND, ["V_unsq"], "V_exp", {"shape": (B, n_kv, group_size, S, D)})
+    g.add_tensor("V_flat", (B, n_q, S, D))
+    g.add_node(OpType.RESHAPE, ["V_exp"], "V_flat", {"shape": (B, n_q, S, D)})
+
+    # ATTENTION(Q, K_flat, V_flat)
+    g.add_tensor("attn_out", (B, n_q, S, D))
+    g.add_node(OpType.ATTENTION, ["Q", "K_flat", "V_flat"], "attn_out")
+    g.outputs.append("attn_out")
+
+    assert fuse(g) is True
+
+    attn_nodes = [n for n in g if n.op == OpType.ATTENTION]
+    assert len(attn_nodes) == 1
+    assert attn_nodes[0].attrs.get("group_size") == group_size
+    assert attn_nodes[0].inputs[0] == "Q"
+    assert attn_nodes[0].inputs[1] == "K"
+    assert attn_nodes[0].inputs[2] == "V"
+
+
+@pytest.mark.parametrize("desc,builder", FUSION_CORRECTNESS_CASES,
+                         ids=[c[0] for c in FUSION_CORRECTNESS_CASES])
+def test_fusion_correctness_auto(desc, builder):
+    """Automated: fused execution matches unfused evaluator chain."""
+    # Seed RNG so both builder() calls produce identical constants
+    np.random.seed(42)
+    g, inputs = builder()
+
+    # Reference: run unfused (numpy is sufficient for primitive ops)
+    ep_unfused = plan(g)
+    ref = _execute(ep_unfused, inputs)
+    expected = ref[g.outputs[0]]
+
+    # Rebuild with same seed (constants must match)
+    np.random.seed(42)
+    g, inputs = builder()
+    fuse(g)
+    eliminate_dead_code(g)
+    ep_fused = plan(g)
+    # Use C backend — fused ops like GATED_ACT only have C kernels
+    result = _execute_with_c(ep_fused, inputs)
+    actual = result[g.outputs[0]]
+
+    np.testing.assert_allclose(actual, expected, atol=1e-4)

@@ -8,6 +8,8 @@ a clear name when it fails.
 import numpy as np
 import pytest
 
+from runtime.ir import OpType
+from runtime.ops import OP_REGISTRY
 from conftest import run_kernel
 
 
@@ -94,21 +96,40 @@ def test_elementwise_binary(backend, op_name, np_op, desc, a_shape, b_shape):
 
 
 # =====================================================================
-# Unary ops
+# Simple unary ops (automated: evaluator is the oracle)
 # =====================================================================
 
-def test_relu(backend):
-    x = np.random.randn(2, 16, 64).astype(np.float32)
-    expected = np.maximum(x, 0)
-    output = run_kernel(backend, "RELU", [x], x.shape)
-    np.testing.assert_allclose(output, expected, atol=1e-6)
+UNARY_SHAPES = [(4, 16, 64), (2, 8, 32), (128,)]
+
+SIMPLE_UNARY_OPS = [
+    # (op,           positive_inputs, atol)
+    (OpType.RELU,    False, 1e-6),
+    (OpType.EXP,     False, 1e-5),
+    (OpType.TANH,    False, 1e-5),
+    (OpType.GELU,    False, 1e-4),
+    (OpType.RSQRT,   True,  1e-5),
+    (OpType.SILU,    False, 1e-5),
+    (OpType.NEG,     False, 1e-6),
+    (OpType.COS,     False, 1e-5),
+    (OpType.SIN,     False, 1e-5),
+]
+
+_UNARY_CASES = [
+    (op, shape, positive, atol)
+    for op, positive, atol in SIMPLE_UNARY_OPS
+    for shape in UNARY_SHAPES
+]
 
 
-def test_exp(backend):
-    x = np.random.randn(2, 16, 64).astype(np.float32)
-    expected = np.exp(x)
-    output = run_kernel(backend, "EXP", [x], x.shape)
-    np.testing.assert_allclose(output, expected, atol=1e-5)
+@pytest.mark.parametrize("op,shape,positive,atol", _UNARY_CASES,
+                         ids=[f"{op.name}_{shape}" for op, shape, _, _ in _UNARY_CASES])
+def test_unary_op(backend, op, shape, positive, atol):
+    """Automated: C kernel vs OP_REGISTRY evaluator for simple unary ops."""
+    x = np.abs(np.random.randn(*shape).astype(np.float32)) + 0.01 if positive \
+        else np.random.randn(*shape).astype(np.float32)
+    expected = OP_REGISTRY[op].evaluator([x], {})
+    output = run_kernel(backend, op.name, [x], expected.shape, {})
+    np.testing.assert_allclose(output, expected, atol=atol)
 
 
 # =====================================================================
@@ -171,32 +192,6 @@ def test_pow(backend, desc, shape, exponent):
     x = np.abs(np.random.randn(*shape).astype(np.float32)) + 0.1  # positive for fractional/negative exp
     expected = np.power(x, exponent)
     output = run_kernel(backend, "POW", [x], x.shape, {"scalar": exponent})
-    np.testing.assert_allclose(output, expected, atol=1e-4)
-
-
-# =====================================================================
-# TANH
-# =====================================================================
-
-@pytest.mark.parametrize("shape", [(4, 16, 64), (2, 8, 32), (128,)])
-def test_tanh(backend, shape):
-    x = np.random.randn(*shape).astype(np.float32)
-    expected = np.tanh(x)
-    output = run_kernel(backend, "TANH", [x], x.shape)
-    np.testing.assert_allclose(output, expected, atol=1e-5)
-
-
-# =====================================================================
-# GELU (tanh approximation)
-# =====================================================================
-
-@pytest.mark.parametrize("shape", [(4, 16, 64), (2, 8, 32), (128,)])
-def test_gelu(backend, shape):
-    x = np.random.randn(*shape).astype(np.float32)
-    # Reference: tanh GELU approximation
-    inner = 0.7978845608 * (x + 0.044715 * np.power(x, 3))
-    expected = 0.5 * x * (1 + np.tanh(inner))
-    output = run_kernel(backend, "GELU", [x], x.shape)
     np.testing.assert_allclose(output, expected, atol=1e-4)
 
 
@@ -329,3 +324,130 @@ def test_slice_alias_on_intermediate():
     executor.compile(ep)
     result = executor.run({"x": x})
     np.testing.assert_allclose(result["out"], expected, atol=1e-6)
+
+
+# =====================================================================
+# RMSNORM
+# =====================================================================
+
+RMSNORM_CASES = [
+    ("2D",       (4, 64)),
+    ("3D",       (2, 16, 128)),
+    ("large",    (32, 896)),
+]
+
+
+@pytest.mark.parametrize("desc,shape",
+                         RMSNORM_CASES, ids=[c[0] for c in RMSNORM_CASES])
+def test_rmsnorm(backend, desc, shape):
+    x = np.random.randn(*shape).astype(np.float32)
+    w = np.random.randn(shape[-1]).astype(np.float32)
+    eps = 1e-5
+    rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + eps)
+    expected = (x / rms) * w
+    output = run_kernel(backend, "RMSNORM", [x, w], x.shape, {"eps": eps})
+    np.testing.assert_allclose(output, expected, atol=1e-5)
+
+
+# =====================================================================
+# CAT
+# =====================================================================
+
+CAT_CASES = [
+    ("dim0_2",       [(3, 4), (5, 4)],              0),
+    ("dim1_2",       [(2, 3), (2, 5)],               1),
+    ("dim1_3D",      [(2, 3, 4), (2, 5, 4)],         1),
+    ("dim2_3D",      [(1, 16, 32), (1, 16, 32)],     2),
+    ("dim0_3",       [(2, 4), (3, 4), (1, 4)],       0),
+]
+
+
+@pytest.mark.parametrize("desc,shapes,dim",
+                         CAT_CASES, ids=[c[0] for c in CAT_CASES])
+def test_cat(backend, desc, shapes, dim):
+    arrays = [np.random.randn(*s).astype(np.float32) for s in shapes]
+    expected = np.concatenate(arrays, axis=dim)
+    output = run_kernel(backend, "CAT", arrays, expected.shape, {"dim": dim})
+    np.testing.assert_allclose(output, expected, atol=1e-6)
+
+
+# =====================================================================
+# GATED_ACT (fused activation-gated multiply)
+# =====================================================================
+
+GATED_ACT_CASES = [
+    ("silu_nobias_2D",   (8, 64),        "silu", False),
+    ("silu_nobias_3D",   (2, 16, 128),   "silu", False),
+    ("silu_bias_2D",     (8, 64),        "silu", True),
+    ("silu_bias_3D",     (2, 16, 128),   "silu", True),
+    ("gelu_nobias_2D",   (8, 64),        "gelu", False),
+    ("gelu_nobias_3D",   (2, 16, 128),   "gelu", False),
+    ("gelu_bias_2D",     (8, 64),        "gelu", True),
+    ("gelu_bias_3D",     (2, 16, 128),   "gelu", True),
+]
+
+
+@pytest.mark.parametrize("desc,shape,act,has_bias",
+                         GATED_ACT_CASES, ids=[c[0] for c in GATED_ACT_CASES])
+def test_gated_act(c_backend, desc, shape, act, has_bias):
+    x = np.random.randn(*shape).astype(np.float32)
+    up = np.random.randn(*shape).astype(np.float32)
+    attrs = {"act": act, "has_bias": has_bias}
+
+    if has_bias:
+        bias = np.random.randn(shape[-1]).astype(np.float32)
+        inputs = [x, bias, up]
+    else:
+        inputs = [x, up]
+
+    expected = OP_REGISTRY[OpType.GATED_ACT].evaluator(inputs, attrs)
+    output = run_kernel(c_backend, "GATED_ACT", inputs, expected.shape, attrs)
+    np.testing.assert_allclose(output, expected, atol=1e-4)
+
+
+# =====================================================================
+# GQA ATTENTION
+# =====================================================================
+
+GQA_CASES = [
+    # desc, B, n_q_heads, n_kv_heads, seq_len, head_dim, causal
+    ("group2_nocausal",  1, 8,  4, 16, 32, False),
+    ("group2_causal",    1, 8,  4, 16, 32, True),
+    ("group4",           1, 16, 4, 16, 32, False),
+    ("batched_group2",   2, 8,  4, 16, 32, False),
+    ("batched_causal",   2, 16, 8, 32, 64, True),
+    # Long sequences — exercise flash attention path (seq > 256)
+    ("flash_nocausal",   1, 8,  4, 512, 64, False),
+    ("flash_causal",     1, 8,  4, 512, 64, True),
+]
+
+
+@pytest.mark.parametrize("desc,B,n_q,n_kv,S,D,causal",
+                         GQA_CASES, ids=[c[0] for c in GQA_CASES])
+def test_gqa_attention(backend, desc, B, n_q, n_kv, S, D, causal):
+    """GQA attention: Q has more heads than K/V, group_size > 1."""
+    group_size = n_q // n_kv
+
+    Q = np.random.randn(B, n_q, S, D).astype(np.float32)
+    K = np.random.randn(B, n_kv, S, D).astype(np.float32)
+    V = np.random.randn(B, n_kv, S, D).astype(np.float32)
+    scratch = np.zeros(B * n_q * S * S, dtype=np.float32)
+
+    # Reference: expand K/V then standard attention
+    K_exp = np.repeat(K, group_size, axis=1)
+    V_exp = np.repeat(V, group_size, axis=1)
+    scale = 1.0 / np.sqrt(D)
+    scores = np.matmul(Q, np.swapaxes(K_exp, -2, -1)) * scale
+    if causal:
+        mask = np.triu(np.full((S, S), -np.inf, dtype=np.float32), k=1)
+        scores = scores + mask
+    scores -= np.max(scores, axis=-1, keepdims=True)
+    e = np.exp(scores)
+    expected = np.matmul(e / np.sum(e, axis=-1, keepdims=True), V_exp)
+
+    attrs = {"group_size": group_size}
+    if causal:
+        attrs["causal"] = True
+    output = run_kernel(backend, "ATTENTION", [Q, K, V, scratch],
+                        expected.shape, attrs)
+    np.testing.assert_allclose(output, expected, atol=1e-4)

@@ -4,7 +4,7 @@ Covers POST_EXPORT, POST_OPTIMIZE, POST_RESOLVE, and
 POST_RESOLVE_OPTIMIZE phases. All validators receive a Graph.
 """
 
-from ..ir import Graph, OpType
+from ..ir import FOLD_ONLY_BASE, Graph, OpType
 from ..ops import OP_REGISTRY
 from .core import Phase, Severity, ValidationResult, register_validator
 
@@ -159,7 +159,7 @@ def validate_execution_readiness(graph: Graph) -> list[ValidationResult]:
 
     # --- No fold-only ops ---
     for node in graph.nodes.values():
-        if node.op.value >= 100:
+        if node.op.value >= FOLD_ONLY_BASE:
             results.append(ValidationResult(NAME, Severity.ERROR,
                 f"Fold-only op {node.op.name} (node {node.id}) "
                 f"was not eliminated by constant folding"))

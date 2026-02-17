@@ -11,7 +11,7 @@ import time
 
 import numpy as np
 
-from ..ir import Graph, Node, OpType
+from ..ir import FOLD_ONLY_BASE, Graph, Node, OpType
 from ..ops import OP_REGISTRY
 from ..planner import MemoryPlan
 from .common import COpNode, Executor, RunProfile, MAX_INPUTS, MAX_DIMS, _c_executor_lib
@@ -52,7 +52,7 @@ class CompiledExecutor(Executor):
         for node in plan.order:
             if self._is_alias(node) and node.inputs[0] not in external:
                 continue
-            if node.op.value >= 100:
+            if node.op.value >= FOLD_ONLY_BASE:
                 raise RuntimeError(
                     f"Fold-only op {node.op.name} reached compiled executor — "
                     f"should have been eliminated by constant folding"

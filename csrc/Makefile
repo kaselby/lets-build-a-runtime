@@ -13,16 +13,16 @@ else
 	LIB_EXT = so
 endif
 
-SRCS = ops.c
+OPS_SRCS = $(wildcard ops/*.c)
 
 all: libruntime.$(LIB_EXT) libexecutor.$(LIB_EXT)
 
 # Per-op kernels (loaded by c_backend.py)
-libruntime.$(LIB_EXT): $(SRCS)
+libruntime.$(LIB_EXT): $(OPS_SRCS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 # Compiled executor: dispatch loop + kernels (loaded by executor.py)
-libexecutor.$(LIB_EXT): executor.c $(SRCS)
+libexecutor.$(LIB_EXT): executor.c $(OPS_SRCS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 clean:

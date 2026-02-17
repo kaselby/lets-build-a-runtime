@@ -91,6 +91,11 @@ def _load_library() -> ctypes.CDLL | None:
                                      ctypes.c_int, ctypes.c_int, ctypes.c_float]
     lib.kernel_layernorm.restype = None
 
+    # RMSNorm: (x, weight, out, rows, cols, eps)
+    lib.kernel_rmsnorm.argtypes = [FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_float]
+    lib.kernel_rmsnorm.restype = None
+
     # Broadcast binary op: (a, b, out, a_strides, b_strides, out_shape, ndim, op)
     lib.kernel_broadcast_binop.argtypes = [
         FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
@@ -104,12 +109,19 @@ def _load_library() -> ctypes.CDLL | None:
                                      ctypes.c_int, ctypes.c_int]
     lib.kernel_bias_relu.restype = None
 
-    # Attention: (Q, K, V, output, scratch, mask, batch_heads, seq_len, head_dim, causal)
+    # Attention: (Q, K, V, output, scratch, mask, batch_heads, seq_len, head_dim, causal, group_size)
     lib.kernel_attention.argtypes = [FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
                                      FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
                                      ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                     ctypes.c_int]
+                                     ctypes.c_int, ctypes.c_int]
     lib.kernel_attention.restype = None
+
+    # Flash attention: (Q, K, V, output, scratch, batch_heads, seq_len, head_dim, causal, group_size)
+    lib.kernel_attention_flash.argtypes = [FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
+                                           FLOAT_PTR, FLOAT_PTR,
+                                           ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_int, ctypes.c_int]
+    lib.kernel_attention_flash.restype = None
 
     # Scalar binary ops: (a, s, out, n)
     for name in ("kernel_add_scalar", "kernel_div_scalar", "kernel_sub_scalar", "kernel_mul_scalar"):
@@ -129,6 +141,20 @@ def _load_library() -> ctypes.CDLL | None:
     lib.kernel_gelu_tanh.argtypes = [FLOAT_PTR, FLOAT_PTR, ctypes.c_int]
     lib.kernel_gelu_tanh.restype = None
 
+    # New unary ops: rsqrt, silu, neg, cos, sin — all (x, out, n)
+    for name in ("kernel_rsqrt", "kernel_silu", "kernel_neg",
+                 "kernel_cos", "kernel_sin"):
+        fn = getattr(lib, name)
+        fn.argtypes = [FLOAT_PTR, FLOAT_PTR, ctypes.c_int]
+        fn.restype = None
+
+    # Gated activations: (x, up, bias, out, M, N, has_bias)
+    for name in ("kernel_gated_silu", "kernel_gated_gelu"):
+        fn = getattr(lib, name)
+        fn.argtypes = [FLOAT_PTR, FLOAT_PTR, FLOAT_PTR, FLOAT_PTR,
+                       ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        fn.restype = None
+
     # Embedding: (ids, table, out, n_ids, embed_dim)
     LONG_PTR = ctypes.POINTER(ctypes.c_long)
     lib.kernel_embedding.argtypes = [LONG_PTR, FLOAT_PTR, FLOAT_PTR,
@@ -140,6 +166,12 @@ def _load_library() -> ctypes.CDLL | None:
                                  ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                  ctypes.c_int, ctypes.c_int, ctypes.c_int]
     lib.kernel_slice.restype = None
+
+    # Cat: (inputs, out, dim_sizes, n_inputs, outer, inner, elem_size)
+    lib.kernel_cat.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                               INT_PTR, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.kernel_cat.restype = None
 
     return lib
 
@@ -516,27 +548,59 @@ def _wrap_bias_relu(lib: ctypes.CDLL) -> KernelFn:
     return kernel
 
 
+def _wrap_gated_act(lib: ctypes.CDLL) -> KernelFn:
+    """Wrap kernel_gated_silu / kernel_gated_gelu: activation-gated multiply with optional bias."""
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        has_bias = attrs.get("has_bias", False)
+        act = attrs.get("act", "silu")
+        if has_bias:
+            x, bias, up = inputs[0], inputs[1], inputs[2]
+        else:
+            x, up = inputs[0], inputs[1]
+            bias = np.empty(0, dtype=np.float32)  # dummy for ctypes
+        N = x.shape[-1]
+        M = x.size // N
+        fn = lib.kernel_gated_silu if act == "silu" else lib.kernel_gated_gelu
+        fn(_as_ptr(x), _as_ptr(up), _as_ptr(bias), _as_ptr(output),
+           M, N, int(has_bias))
+    return kernel
+
+
 def _wrap_attention(lib: ctypes.CDLL) -> KernelFn:
-    """Wrap kernel_attention: fused multi-head attention.
+    """Wrap kernel_attention with adaptive flash dispatch.
 
     Inputs: [Q, K, V, scratch] or [Q, K, V, mask, scratch].
     Scratch is appended by the executor from the planner's scratch allocation.
     Q, K, V: [..., seq_len, head_dim] (leading dims are batch)
+
+    Uses flash attention for long sequences without custom masks.
+    Must match the threshold in ops.py and csrc/executor.c.
     """
+    from runtime.ops import _use_flash_attention
+
     def kernel(inputs: list[np.ndarray], output: np.ndarray,
                attrs: dict[str, Any]) -> None:
         Q, K, V = inputs[0], inputs[1], inputs[2]
-        # Scratch is always last; mask (if present) is between V and scratch
         has_mask = len(inputs) > 4
         mask = inputs[3] if has_mask else None
         scratch = inputs[-1]
         seq_len, head_dim = Q.shape[-2], Q.shape[-1]
         batch_heads = Q.size // (seq_len * head_dim)
         causal = 1 if attrs.get("causal") else 0
-        mask_ptr = _as_ptr(mask) if mask is not None else ctypes.cast(None, FLOAT_PTR)
-        lib.kernel_attention(_as_ptr(Q), _as_ptr(K), _as_ptr(V),
-                             _as_ptr(output), _as_ptr(scratch), mask_ptr,
-                             batch_heads, seq_len, head_dim, causal)
+        group_size = attrs.get("group_size", 1)
+
+        if _use_flash_attention(seq_len, attrs) and not has_mask:
+            lib.kernel_attention_flash(
+                _as_ptr(Q), _as_ptr(K), _as_ptr(V),
+                _as_ptr(output), _as_ptr(scratch),
+                batch_heads, seq_len, head_dim, causal, group_size)
+        else:
+            mask_ptr = _as_ptr(mask) if mask is not None else ctypes.cast(None, FLOAT_PTR)
+            lib.kernel_attention(
+                _as_ptr(Q), _as_ptr(K), _as_ptr(V),
+                _as_ptr(output), _as_ptr(scratch), mask_ptr,
+                batch_heads, seq_len, head_dim, causal, group_size)
     return kernel
 
 
@@ -566,6 +630,28 @@ def _wrap_gelu(lib: ctypes.CDLL) -> KernelFn:
     return kernel
 
 
+def _wrap_rmsnorm(lib: ctypes.CDLL) -> KernelFn:
+    """Wrap kernel_rmsnorm: x / sqrt(mean(x^2) + eps) * weight."""
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        x, weight = inputs[0], inputs[1]
+        cols = x.shape[-1]
+        rows = x.size // cols
+        eps = attrs.get("eps", 1e-5)
+        lib.kernel_rmsnorm(_as_ptr(x), _as_ptr(weight),
+                           _as_ptr(output), rows, cols, ctypes.c_float(eps))
+    return kernel
+
+
+def _wrap_unary(lib: ctypes.CDLL, fname: str) -> KernelFn:
+    """Wrap a simple element-wise unary kernel: (x, out, n)."""
+    cfn = getattr(lib, fname)
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        cfn(_as_ptr(inputs[0]), _as_ptr(output), inputs[0].size)
+    return kernel
+
+
 def _wrap_embedding(lib: ctypes.CDLL) -> KernelFn:
     """Wrap kernel_embedding: table lookup.
 
@@ -584,6 +670,28 @@ def _wrap_embedding(lib: ctypes.CDLL) -> KernelFn:
     return kernel
 
 
+def _wrap_cat(lib: ctypes.CDLL) -> KernelFn:
+    """Wrap kernel_cat: concatenate tensors along a dimension."""
+    def kernel(inputs: list[np.ndarray], output: np.ndarray,
+               attrs: dict[str, Any]) -> None:
+        dim = attrs["dim"]
+        n = len(inputs)
+        out_shape = output.shape
+        outer = 1
+        for d in out_shape[:dim]:
+            outer *= d
+        inner = 1
+        for d in out_shape[dim + 1:]:
+            inner *= d
+        dim_sizes = [inp.shape[dim] for inp in inputs]
+        c_inputs = (ctypes.c_void_p * n)(*[inp.ctypes.data for inp in inputs])
+        c_dim_sizes = (ctypes.c_int * n)(*dim_sizes)
+        lib.kernel_cat(c_inputs, output.ctypes.data,
+                       c_dim_sizes, n,
+                       outer, inner, inputs[0].dtype.itemsize)
+    return kernel
+
+
 def _wrap_slice(lib: ctypes.CDLL) -> KernelFn:
     """Wrap kernel_slice: strided copy for non-contiguous slices.
 
@@ -595,7 +703,7 @@ def _wrap_slice(lib: ctypes.CDLL) -> KernelFn:
         x = inputs[0]
         dim = attrs["dim"]
         start = attrs["start"]
-        end = attrs["end"]
+        end = min(attrs["end"], x.shape[dim])
         outer = 1
         for d in x.shape[:dim]:
             outer *= d
@@ -632,6 +740,7 @@ class CBackend:
                 OpType.SUM: _wrap_reduce(self._lib, "kernel_sum"),
                 OpType.SOFTMAX: _wrap_softmax(self._lib),
                 OpType.LAYERNORM: _wrap_layernorm(self._lib),
+                OpType.RMSNORM: _wrap_rmsnorm(self._lib),
                 OpType.FUSED_BIAS_RELU: _wrap_bias_relu(self._lib),
                 OpType.ATTENTION: _wrap_attention(self._lib),
                 OpType.POW: _wrap_pow_scalar(self._lib),
@@ -639,6 +748,13 @@ class CBackend:
                 OpType.GELU: _wrap_gelu(self._lib),
                 OpType.EMBEDDING: _wrap_embedding(self._lib),
                 OpType.SLICE: _wrap_slice(self._lib),
+                OpType.CAT: _wrap_cat(self._lib),
+                OpType.RSQRT: _wrap_unary(self._lib, "kernel_rsqrt"),
+                OpType.SILU:  _wrap_unary(self._lib, "kernel_silu"),
+                OpType.NEG:   _wrap_unary(self._lib, "kernel_neg"),
+                OpType.COS:   _wrap_unary(self._lib, "kernel_cos"),
+                OpType.SIN:   _wrap_unary(self._lib, "kernel_sin"),
+                OpType.GATED_ACT: _wrap_gated_act(self._lib),
             }
 
     @property

@@ -14,7 +14,9 @@ endif
 
 all: libablation.$(LIB_EXT)
 
-libablation.$(LIB_EXT): ablation.c $(CSRC)/ops.c
+OPS_SRC = $(wildcard $(CSRC)/ops/*.c)
+
+libablation.$(LIB_EXT): ablation.c $(OPS_SRC)
 	$(CC) $(CFLAGS) $(LDFLAGS) -I$(CSRC) -o $@ $^
 
 clean:
