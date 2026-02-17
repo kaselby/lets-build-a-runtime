@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from ..ir import Graph
-from ..planner import ExecutionPlan
+from ..planner import MemoryPlan
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ class Executor(ABC):
             tensor.buffer = flat_view.view(dtype).reshape(tensor.shape)
 
     @abstractmethod
-    def compile(self, plan: ExecutionPlan) -> None:
+    def compile(self, plan: MemoryPlan) -> None:
         """Prepare for execution. Called once per plan."""
         ...
 

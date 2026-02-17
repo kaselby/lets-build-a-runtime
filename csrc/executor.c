@@ -251,9 +251,8 @@ static void dispatch_transpose(OpNode* node) {
 
 static void dispatch_slice(OpNode* node) {
     /* extra = [outer, orig_dim_size, start, slice_len, inner]
-     * Contiguous slices (dim=0) are aliases filtered by Python —
-     * guard here too in case one leaks through. */
-    if (node->extra[0] == 0) return;
+     * Only non-contiguous slices (dim>0) reach here — contiguous
+     * slices are zero-copy aliases, filtered out by Python. */
     kernel_slice(node->inputs[0], node->output,
                  node->extra[0], node->extra[1], node->extra[2],
                  node->extra[3], node->extra[4], node->elem_size);

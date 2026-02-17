@@ -437,7 +437,7 @@ OP_REGISTRY: dict[OpType, OpDef] = {
 
     # --- Fused ops ---
     OpType.MATMUL_ADD:      OpDef(extras=_matmul_extras, shape=_shape_matmul,
-                                  evaluator=lambda ins, a: ins[0] @ (ins[1].T if a.get("transpose_b") else ins[1]) * a.get("alpha", 1.0) + ins[2]),
+                                  evaluator=lambda ins, a: ins[0] @ (np.swapaxes(ins[1], -2, -1) if a.get("transpose_b") else ins[1]) * a.get("alpha", 1.0) + ins[2]),
     OpType.FUSED_BIAS_RELU: OpDef(inplace=True, evaluator=lambda ins, a: np.maximum(ins[0] + ins[1], 0)),
     OpType.ATTENTION:       OpDef(extras=_attention_extras, scratch=_attention_scratch,
                                   shape=_shape_attention, evaluator=_eval_attention),

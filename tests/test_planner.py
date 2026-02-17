@@ -17,7 +17,7 @@ import pytest
 from runtime.ir import Graph, OpType
 from runtime.ops import OP_REGISTRY
 from runtime.planner import (
-    ExecutionPlan,
+    MemoryPlan,
     FitStrategy,
     Lifetime,
     OrderStrategy,
@@ -47,7 +47,7 @@ def _add_constant(g: Graph, name: str, shape: tuple[int, ...]) -> None:
     g.constants.append(name)
 
 
-def _check_no_overlap(ep: ExecutionPlan) -> None:
+def _check_no_overlap(ep: MemoryPlan) -> None:
     """Verify that no two simultaneously-live tensors share arena memory.
 
     For every pair of arena-owning tensors with overlapping lifetimes,
@@ -456,7 +456,6 @@ class TestMemoryAwareOrder:
     def test_reduces_peak_vs_naive(self):
         """Memory-aware ordering should yield smaller peak arena than naive."""
         g = _build_two_independent_chains()
-        g.validate()
 
         naive_order = list(g)
         naive_lifetimes, _ = _compute_lifetimes(g, naive_order)
@@ -632,14 +631,16 @@ class TestPlan:
         # Declare an output that has no producer
         g.add_tensor("ghost", (4, 8))
         g.outputs.append("ghost")
-        with pytest.raises(ValueError, match="Cannot plan invalid graph"):
-            plan(g)
+        # Validation is now handled by the validation framework, not plan()
+        from runtime.validation import run_validators, Phase, Severity, ValidationError
+        with pytest.raises(ValidationError):
+            run_validators(Phase.POST_EXPORT, g, fail_on=Severity.ERROR)
 
     def test_plan_returns_execution_plan(self):
         g = _build_linear_chain()
         ep = plan(g)
 
-        assert isinstance(ep, ExecutionPlan)
+        assert isinstance(ep, MemoryPlan)
         assert ep.arena_size > 0
         assert len(ep.order) == len(g.nodes)
         assert ep.graph is g

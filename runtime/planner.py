@@ -2,7 +2,7 @@
 
 Analyzes a Graph to determine when each intermediate tensor is live,
 then packs non-overlapping lifetimes into a shared arena to minimize
-memory usage. Produces an ExecutionPlan that the executor consumes.
+memory usage. Produces a MemoryPlan that the executor consumes.
 
 Scratch buffers: some kernels (e.g., fused attention) need temporary
 workspace that isn't an input or output. The planner handles this via
@@ -97,8 +97,14 @@ class PlanStats:
 
 
 @dataclass
-class ExecutionPlan:
-    """Everything needed to execute a graph: execution order + memory layout."""
+class MemoryPlan:
+    """Output of the memory planner: execution order + arena layout.
+
+    Contains the topological execution order, arena byte offsets for
+    each intermediate tensor, and scratch buffer allocations. This is
+    the planner's output — it knows nothing about how ops will be
+    dispatched. See ExecutionPlan for the full execution context.
+    """
     graph: Graph
     order: list[Node]
     arena_size: int                     # total bytes
@@ -111,6 +117,24 @@ class ExecutionPlan:
     def allocate_arena(self) -> np.ndarray:
         """Allocate the arena buffer."""
         return np.zeros(self.arena_size, dtype=np.uint8)
+
+
+@dataclass
+class ExecutionPlan:
+    """Full execution context: memory plan + dispatch configuration.
+
+    Bundles everything needed to validate and execute a compiled graph.
+    The Session constructs this after planning by combining the planner's
+    MemoryPlan with the user's execution preferences (executor type,
+    backend chain).
+
+    Validators at the PRE_EXECUTE phase receive this object, giving them
+    access to both the memory layout and the dispatch target.
+    """
+    graph: Graph
+    memory: MemoryPlan
+    executor_type: str          # "compiled" or "interpreted"
+    backend: str                # "c", "numpy", "c+numpy"
 
 
 @dataclass
@@ -473,7 +497,7 @@ def _best_fit(alive_regions: list[tuple[int, int]], size: int) -> int:
 # Plan
 # ---------------------------------------------------------------------------
 
-def plan(graph: Graph, config: PlannerConfig | None = None) -> ExecutionPlan:
+def plan(graph: Graph, config: PlannerConfig | None = None) -> MemoryPlan:
     """Analyze a graph and produce an execution plan with memory layout.
 
     Computes tensor lifetimes from the topological order, then assigns
@@ -483,10 +507,6 @@ def plan(graph: Graph, config: PlannerConfig | None = None) -> ExecutionPlan:
     """
     if config is None:
         config = PlannerConfig()
-
-    errors = graph.validate()
-    if errors:
-        raise ValueError(f"Cannot plan invalid graph: {errors}")
 
     order = _get_order(graph, config.order)
 
@@ -539,7 +559,7 @@ def plan(graph: Graph, config: PlannerConfig | None = None) -> ExecutionPlan:
         weight_bytes=weight_bytes,
     )
 
-    return ExecutionPlan(
+    return MemoryPlan(
         graph=graph,
         order=order,
         arena_size=arena_size,

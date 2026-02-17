@@ -173,16 +173,64 @@ Kahn's + max-heap with version-based stale entry skipping, priority = `freed_byt
 | Code complexity | ~60 lines | ~115 lines | ~140 lines |
 | Edge cases | Staleness | None known | Multi-edge trigger gap |
 
-**v2 was chosen** — best balance of correctness, simplicity, and heuristic quality. The lazy re-score is "good enough" for realistic graphs, the inplace bonus is a genuinely useful addition, and it's much easier to explain in an interview than the event-driven machinery.
+**v2 was chosen** for its theoretical properties — best balance of correctness, simplicity, and heuristic quality. The lazy re-score handles staleness cleanly, the net-delta scoring is more principled, and it's easy to explain in an interview. However, empirical benchmarks showed that **ordering strategy has negligible impact on peak memory** for our workloads (see below).
+
+### Empirical results: ordering doesn't matter
+
+We benchmarked all three ordering strategies (plus naive toposort and various sharing ablations) across transformer blocks of increasing size and 2-layer GPT-2 at multiple sequence lengths. Arena sizes are activation memory only (weights excluded).
+
+**Transformer block (single layer, 20 nodes after optimization):**
+
+| Config | no-opt | naive+share | v1 | v2 | v3 | best-fit | PyTorch | ORT |
+|--------|--------|-------------|----|----|----|---------:|--------:|----:|
+| Toy (d=64, s=32) | 80 KB | 48 KB | 48 KB | 48 KB | 48 KB | 48 KB | 144 KB | 55 KB |
+| Small (d=256, s=128) | 1.3 MB | 768 KB | 768 KB | 768 KB | 768 KB | 768 KB | 2.3 MB | 1.0 MB |
+| Medium (d=512, s=256) | 5.0 MB | 4.0 MB | 4.0 MB | 4.0 MB | 4.0 MB | 4.0 MB | 11.0 MB | 4.0 MB |
+| GPT-2 dims (d=768, s=512) | 18.0 MB | 18.0 MB | 18.0 MB | 18.0 MB | 18.0 MB | 18.0 MB | 45.0 MB | 24.0 MB |
+
+All ordering strategies produce **identical** arena sizes at every config. The only lever that moves the needle is in-place reuse (Toy: 80→48 KB, a 40% reduction). At GPT-2 dimensions, even in-place makes no difference — attention scratch (S² per batch×head) dominates the arena.
+
+**GPT-2 (2-layer HuggingFace model, 64 nodes after optimization):**
+
+| Config | no-opt | naive+share | v1 | v2 | v3 | no-inplace | PyTorch |
+|--------|--------|-------------|----|----|----|-----------:|--------:|
+| s=16 | 3189 KB | 3189 KB | 3237 KB | 3237 KB | 3189 KB | 3189 KB | 3189 KB |
+| s=64 | 12.5 MB | 12.5 MB | 12.6 MB | 12.6 MB | 12.5 MB | 12.5 MB | 12.5 MB |
+| s=256 | 49.8 MB | 49.8 MB | 50.6 MB | 50.6 MB | 49.8 MB | 49.8 MB | 49.8 MB |
+
+The GPT-2 results are surprising: memory-aware ordering (v1, v2) is **1.5% worse** than naive toposort. In-place reuse is also counterproductive — disabling it matches the optimal result. v3 fixes the staleness issue well enough to match naive, but doesn't beat it.
+
+### Why ordering doesn't matter here
+
+Two factors conspire to make ordering irrelevant for these graphs:
+
+1. **Attention scratch dominates.** The fused attention kernel's S² scratch buffer is by far the largest single allocation. At s=512, one scratch buffer is `12 × 512 × 512 × 4 = 12 MB` — larger than all other intermediates combined. No ordering heuristic can reduce this; it's a fixed cost determined by the algorithm.
+
+2. **Graph structure limits reordering freedom.** After optimization (fusion, DCE), the transformer block graph is a nearly linear chain with only a few branch points (residual connections). The topological ordering has very few valid permutations, so different heuristics converge to the same or similar schedules.
+
+### In-place reuse: helps most configs, slight penalty on GPT-2
+
+In-place reuse delivers clear savings on smaller graphs: 40% arena reduction at Toy/Small, 20% at Medium. At GPT-2 transformer-block dimensions it has no effect (attention scratch dominates). On the actual 2-layer GPT-2 model, it's slightly counterproductive — a 1.5% arena increase. The mechanism: chaining an output to an input's arena slot extends the root tensor's lifetime, blocking that arena region longer and potentially forcing later allocations to higher offsets. For GPT-2's specific graph structure (64 nodes, multiple residual connections), this lifetime extension costs slightly more than the allocation it saves.
+
+This is a known tradeoff in real runtimes. In-place reuse is a local optimization (this tensor can share that slot) that can have negative global effects (longer lifetimes reduce packing opportunities). For our workloads, in-place is net positive overall and the GPT-2 penalty is small enough to keep it enabled by default.
+
+### Decision: v1 as default, v2/v3 retained for reference
+
+v1 is the default ordering strategy. It's simple (~60 lines), the staleness issue is theoretical rather than practical for our workloads, and empirically it matches or nearly matches all alternatives. v2 and v3 are retained in `order.py` as research implementations — they demonstrate more sophisticated approaches and provide good interview discussion material about the tradeoffs.
+
+The real memory savings come from the planner's core capabilities (lifetime analysis, first-fit packing, alias resolution, in-place sharing) rather than from ordering heuristics. Our arena is 2.5-3x smaller than PyTorch's peak-alive memory and competitive with ORT's arena allocator across all tested configs.
 
 ### Interview talking points
 
 - Tradeoffs of first-fit vs best-fit offset assignment
 - NP-hardness of optimal topological ordering for minimum memory
 - Memory-aware ordering and in-place reuse are the two main heuristics real runtimes use
-- The planner runs once at compile time, so O(n²) is fine for realistic graph sizes
+- **Empirical finding: ordering heuristics make no measurable difference for transformer graphs** — attention scratch dominates, graph structure limits reordering freedom
+- **In-place reuse can be counterproductive** — lifetime extension vs allocation savings tradeoff
+- The planner runs once at compile time, so O(n²) algorithms are fine for realistic graph sizes
 - Can walk through the staleness analysis: why freed_bytes can only be under-estimated, why lazy re-eval works
 - Net delta vs freed-only: peak memory is about live set size, need to account for output allocation not just input freeing
+- The value of implementing, measuring, and making an empirically-grounded decision rather than assuming a theoretical improvement translates to practice
 
 ## Weight Transpose Handling
 
@@ -794,3 +842,67 @@ This is correct for both cases:
 **Verification:** The `_resolve_alias` call on line 306 (for consumed counting used by in-place decisions) is still correct — it needs graph-structural relationships for the "is this the last consumer?" check. Only the death-tracking on line 310 was wrong, because it needs to extend the lifetime of whichever tensor actually owns the arena memory, which is a planner decision, not a graph-structure fact.
 
 Full GPT-2 (124M, 12 layers) now runs end-to-end through the compiled C executor directly from HuggingFace with no wrapper. Max logit diff vs PyTorch: 0.000092.
+
+## Validation Framework
+
+### Motivation
+
+The runtime had one validation method: `Graph.validate()`, a monolithic structural check added early in the project and never revisited. It caught reference errors and cycles but nothing else — no semantic checks (are MATMUL input shapes compatible?), no pipeline-stage-specific checks (did constant folding eliminate all fold-only ops?), no memory plan validation (do arena offsets actually avoid overlapping?).
+
+Both executors had runtime guards for fold-only ops (`if node.op.value >= 100: raise RuntimeError`), which meant a compile-time error was caught at execution time. An interviewer would reasonably ask: "Why not catch this earlier?"
+
+### Design space
+
+We considered three approaches:
+
+**Option A: Context bag.** A `ValidationContext` accumulates state as the pipeline runs — each stage adds its output, validators pull what they need. Uniform `(ValidationContext) -> list[str]` signature. Problem: god object with no compile-time guarantee that the data a validator needs has actually been populated. A POST_PLAN check could accidentally reach for something that doesn't exist until PRE_EXECUTE.
+
+**Option B: Phase-typed protocols.** Different validator signatures per phase (`GraphCheck`, `PlanCheck`, `CompileCheck`). Type-safe — a plan validator can't accidentally depend on executor state. But you lose the unified registry; dispatching validators requires knowing which protocol you're using.
+
+**Option C: Components validate their own output.** No validation abstraction at all. The planner validates its plan before returning, the executor validates the plan before compiling. Simplest, closest to how ORT works, but validation logic scatters across components rather than being collected and inspectable.
+
+### What we chose
+
+A hybrid of A and B, avoiding the worst of each. Validators are registered with a `Phase` tag and a check function. The phase tag determines both *when* the validator runs and *what type* it receives:
+
+- Graph phases (POST_EXPORT through POST_RESOLVE_OPTIMIZE): `check(graph: Graph) -> list[ValidationResult]`
+- POST_PLAN: `check(plan: MemoryPlan) -> list[ValidationResult]`
+- PRE_EXECUTE: `check(plan: ExecutionPlan) -> list[ValidationResult]`
+
+The phase is the contract — it tells you when the validator runs and what's available. No context bag, no god object. The type of `T` is implied by the phase rather than enforced by generics (Python generics don't buy much at runtime anyway).
+
+### MemoryPlan vs ExecutionPlan
+
+This design revealed that the old `ExecutionPlan` was really a memory plan — it's the planner's output containing execution order, arena layout, and offsets. It knows nothing about dispatch targets.
+
+The PRE_EXECUTE phase needs to validate things like "does every op have a C dispatch function?" — which requires knowing the executor type. So we renamed the planner's output to `MemoryPlan` and created a new `ExecutionPlan` that bundles:
+
+```python
+@dataclass
+class ExecutionPlan:
+    graph: Graph
+    memory: MemoryPlan
+    executor_type: str      # "compiled" or "interpreted"
+    backend: str            # "c", "numpy", "c+numpy"
+```
+
+The Session constructs this after planning, before compilation. Validators at PRE_EXECUTE can inspect both the memory layout and the dispatch configuration.
+
+### Severity model
+
+Severity lives on the result, not the validator. A single validator might produce both errors and warnings — "fold-only op survived" is an error, "dead node detected" is a warning. Three levels: ERROR (execution will fail), WARNING (suspicious), INFO (diagnostic).
+
+The Session maps a user-facing `validation` parameter to a failure threshold:
+- `"strict"`: fail on WARNING or ERROR
+- `"normal"`: fail on ERROR only (default)
+- `"none"`: skip validation entirely
+
+### Package structure
+
+Core types live in `validation/core.py` to avoid circular imports — the validator submodules (`graph.py`, `plan.py`, `execution.py`) import from `core`, and `__init__.py` re-exports and triggers registration by importing the submodules. The registry is a module-level list populated by `@register_validator` decorators at import time.
+
+### Compiled executor boundary
+
+We considered adding a PRE_DISPATCH phase for validating COpNode structs (raw pointers, op codes, array bounds) before the C handoff. This is qualitatively different from domain-level validation — it's FFI defensive checking where the failure mode is `abort()` instead of a Python exception.
+
+Decision: keep FFI-level checks inside `CompiledExecutor._validate_structs()` rather than in the validation framework. Domain-level pre-dispatch checks (like "all ops have C dispatch support") belong in PRE_EXECUTE. Pointer sanity checks are assertions, not validators.

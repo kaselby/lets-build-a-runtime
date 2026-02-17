@@ -14,7 +14,7 @@ import numpy as np
 
 from ..ir import OpType
 from ..ops import OP_REGISTRY
-from ..planner import ExecutionPlan
+from ..planner import MemoryPlan
 from .common import Executor, OpTiming, RunProfile
 
 
@@ -38,9 +38,9 @@ class InterpretedExecutor(Executor):
     def __init__(self, backends: list[Backend], profile: bool = False) -> None:
         super().__init__(profile=profile)
         self.backends = backends
-        self._plan: ExecutionPlan | None = None
+        self._plan: MemoryPlan | None = None
 
-    def compile(self, plan: ExecutionPlan) -> None:
+    def compile(self, plan: MemoryPlan) -> None:
         """Stash the plan. No compilation needed for interpreted dispatch."""
         self._plan = plan
 

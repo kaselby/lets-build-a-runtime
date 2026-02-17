@@ -248,6 +248,36 @@ ORT's Python API doesn't expose arena stats — getting peak memory requires eit
 - **`graph.dump()`** — Full node-by-node listing in topological order with shapes and attrs.
 - **`graph.save(path)` / `Graph.load(path)`** — Serialization to `{path}.json` (human-readable topology) + `{path}.weights` (binary blob). The JSON contains the full graph structure and a weight manifest. Weights file is optional on load — without it, the graph is inspectable but not executable. Useful for diffing pre-opt vs post-opt graphs.
 
+## Validation Framework
+
+Pipeline validation is a first-class concern, modeled as registered checks that run at pipeline boundaries. Validators are tagged with a `Phase` indicating when they run, and return structured `ValidationResult` diagnostics with severity levels (ERROR, WARNING, INFO).
+
+**Six phases** correspond to the pipeline's natural boundaries:
+
+| Phase | Artifact | What it checks |
+|---|---|---|
+| POST_EXPORT | Graph | Structural integrity (references, connectivity, cycles) |
+| POST_OPTIMIZE | Graph | Graph still valid after pass mutations |
+| POST_RESOLVE | Graph | All symbolic dimensions resolved to concrete values |
+| POST_RESOLVE_OPTIMIZE | Graph | No fold-only ops remaining, all ops in registry |
+| POST_PLAN | MemoryPlan | Arena integrity (no overlapping co-live tensors) |
+| PRE_EXECUTE | ExecutionPlan | Dispatch coverage (all ops supported by target executor) |
+
+**Two plan types** reflect the pipeline's layered output. `MemoryPlan` is the planner's output (execution order, arena layout, offsets, scratch). `ExecutionPlan` bundles the memory plan with dispatch configuration (executor type, backend chain) — this is what PRE_EXECUTE validators inspect.
+
+**Registry-based extensibility.** Validators register via `@register_validator(name, phase)` decorator. The Session runs `run_validators(phase, target)` at each boundary. Validators work standalone too — useful in tests and scripts.
+
+**Configurable severity.** The Session's `validation` parameter controls failure threshold: `"strict"` (fail on WARNING), `"normal"` (fail on ERROR, default), `"none"` (skip validation). Individual validators return results with per-diagnostic severity, so a single check can produce both errors and warnings.
+
+```
+runtime/validation/
+  core.py        — types, registry, runner
+  __init__.py    — re-exports, triggers submodule registration
+  graph.py       — graph-phase validators
+  plan.py        — memory plan validators
+  execution.py   — execution plan validators
+```
+
 ## Known Limitations
 
 - **No PERMUTE in compiled C dispatch.** General N-dim permutations are unhandled in `executor.c`. Currently safe because transformer permutations are classified as TRANSPOSE.

@@ -26,7 +26,8 @@ from .passes.passes import (
     Pass, PassResult,
     PRE_RESOLUTION_PIPELINE, run_pipeline, run_until_stable,
 )
-from .planner import PlanStats, plan
+from .planner import ExecutionPlan, PlanStats, plan
+from .validation import Phase, Severity, run_validators
 from .executor.common import Executor, RunProfile
 
 
@@ -84,6 +85,7 @@ class Session:
         verbose: bool = False,
         profile: bool = False,
         bindings: dict[str, int] | None = None,
+        validation: str = "normal",
     ) -> None:
         """Optimize, plan, and compile the graph for execution.
 
@@ -113,11 +115,17 @@ class Session:
                 e.g., {'L': 50} resolves all "L" symbols to 50.
                 If the graph has dynamic_dims, this triggers shape
                 resolution before planning.
+            validation: How strictly to enforce validation checks.
+                "strict"  — Fail on WARNING or ERROR.
+                "normal"  — Fail on ERROR only (default).
+                "none"    — Skip validation entirely.
         """
         # Save execution settings for rebind()
         self._execution_mode = execution_mode
         self._backend = backend
         self._profile = profile
+
+        fail_on = _validation_severity(validation)
 
         # --- Optimize (only once, not on rebind) ---
         if not self._optimized:
@@ -142,23 +150,38 @@ class Session:
             self._pass_log = log
             self._optimized = True
 
+            self._validate(Phase.POST_OPTIMIZE, self._graph, fail_on, verbose)
+
         # --- Resolve dynamic shapes ---
         if bindings:
             self._resolved = resolve_graph(self._graph, bindings)
         else:
             self._resolved = self._graph
 
+        self._validate(Phase.POST_RESOLVE_OPTIMIZE, self._resolved, fail_on, verbose)
+
         # --- Plan ---
-        execution_plan = plan(self._resolved)
-        self._plan_stats = execution_plan.stats
+        memory_plan = plan(self._resolved)
+        self._plan_stats = memory_plan.stats
 
         if verbose and self._plan_stats:
             print(self._plan_stats)
             print()
 
-        # --- Build executor ---
+        self._validate(Phase.POST_PLAN, memory_plan, fail_on, verbose)
+
+        # --- Build execution plan and validate before compilation ---
+        exec_plan = ExecutionPlan(
+            graph=self._resolved,
+            memory=memory_plan,
+            executor_type=execution_mode,
+            backend=backend,
+        )
+        self._validate(Phase.PRE_EXECUTE, exec_plan, fail_on, verbose)
+
+        # --- Compile ---
         executor = self._make_executor(execution_mode, backend, profile)
-        executor.compile(execution_plan)
+        executor.compile(memory_plan)
         self._executor = executor
 
     def rebind(self, bindings: dict[str, int]) -> None:
@@ -174,13 +197,13 @@ class Session:
         """
         self._resolved = resolve_graph(self._graph, bindings)
 
-        execution_plan = plan(self._resolved)
-        self._plan_stats = execution_plan.stats
+        memory_plan = plan(self._resolved)
+        self._plan_stats = memory_plan.stats
 
         executor = self._make_executor(
             self._execution_mode, self._backend, self._profile
         )
-        executor.compile(execution_plan)
+        executor.compile(memory_plan)
         self._executor = executor
 
     def run(self, inputs: dict[str, np.ndarray],
@@ -206,6 +229,17 @@ class Session:
         return result
 
     @staticmethod
+    def _validate(phase: Phase, target, fail_on: Severity | None,
+                  verbose: bool) -> None:
+        """Run validators for a phase, optionally printing results."""
+        if fail_on is None:
+            return
+        results = run_validators(phase, target, fail_on=fail_on)
+        if verbose and results:
+            for r in results:
+                print(r)
+
+    @staticmethod
     def _make_executor(execution_mode: str, backend: str,
                        profile: bool = False) -> Executor:
         """Construct an executor from high-level options."""
@@ -222,6 +256,20 @@ class Session:
             f"Unknown execution_mode '{execution_mode}' "
             f"(expected 'compiled' or 'interpreted')"
         )
+
+
+def _validation_severity(validation: str) -> Severity | None:
+    """Map validation preference string to fail_on severity."""
+    if validation == "strict":
+        return Severity.WARNING
+    if validation == "normal":
+        return Severity.ERROR
+    if validation == "none":
+        return None
+    raise ValueError(
+        f"Unknown validation '{validation}' "
+        f"(expected 'strict', 'normal', or 'none')"
+    )
 
 
 def _build_backend_chain(backend: str) -> list:

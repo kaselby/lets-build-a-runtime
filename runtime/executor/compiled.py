@@ -13,7 +13,7 @@ import numpy as np
 
 from ..ir import Graph, Node, OpType
 from ..ops import OP_REGISTRY
-from ..planner import ExecutionPlan
+from ..planner import MemoryPlan
 from .common import COpNode, Executor, RunProfile, MAX_INPUTS, MAX_DIMS, _c_executor_lib
 
 
@@ -31,7 +31,7 @@ class CompiledExecutor(Executor):
         # Keep references to arena/scratch views to prevent GC
         self._refs: list[np.ndarray] = []
 
-    def compile(self, plan: ExecutionPlan) -> None:
+    def compile(self, plan: MemoryPlan) -> None:
         """Build COpNode struct array with all pointers pre-resolved.
 
         After this, only graph input pointers need patching per call.
@@ -106,7 +106,7 @@ class CompiledExecutor(Executor):
         return op_def is not None and op_def.is_alias(node)
 
     def _build_node(self, i: int, node: Node, graph: Graph,
-                    plan: ExecutionPlan, arena: np.ndarray) -> None:
+                    plan: MemoryPlan, arena: np.ndarray) -> None:
         """Populate one COpNode struct."""
         c_node = self._nodes[i]
         c_node.op = node.op.value
