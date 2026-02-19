@@ -40,13 +40,16 @@ from runtime.exporter import export_model
 from runtime.executor import (
     COpNode, CompiledExecutor, InterpretedExecutor, MAX_DIMS, MAX_INPUTS,
 )
-from runtime.ir import OpType
+from runtime.ir import Graph, OpType
 from runtime.passes import (
     FUSION_PATTERNS,
     absorb_into_matmul,
+    absorb_mask_into_attention,
     constant_fold,
     eliminate_dead_code,
     fuse,
+    fuse_dags,
+    merge_parallel_matmuls,
 )
 from runtime.ops import OP_REGISTRY
 from runtime.planner import plan
@@ -85,7 +88,7 @@ def _plan_for_ablation(graph):
 
 try:
     import onnxruntime as ort
-    HAS_ORT = False  # XXX: disabled — onnxscript GC segfault when running all configs
+    HAS_ORT = True
 except ImportError:
     HAS_ORT = False
 
@@ -94,6 +97,12 @@ try:
     HAS_TRANSFORMERS = True
 except ImportError:
     HAS_TRANSFORMERS = False
+
+try:
+    from transformers import AutoConfig, AutoModelForCausalLM
+    HAS_QWEN3 = True
+except ImportError:
+    HAS_QWEN3 = False
 
 
 # =====================================================================
@@ -174,6 +183,31 @@ def _make_gpt2(n_layer=2, n_head=12, n_embd=768):
     return model
 
 
+class CausalLMWrapper(nn.Module):
+    """Wrapper that returns logits tensor directly (no CausalLMOutput)."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids):
+        return self.model(input_ids, use_cache=False).logits
+
+
+def _make_qwen3(variant="0.6B", n_layer=2):
+    """Create a Qwen3 model with random weights. Returns (wrapper, raw_model) or None."""
+    if not HAS_QWEN3:
+        return None
+    config = AutoConfig.from_pretrained(f"Qwen/Qwen3-{variant}", trust_remote_code=True)
+    config.num_hidden_layers = n_layer
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True,
+                                              torch_dtype=torch.float32)
+    model.eval()
+    model.config.use_cache = False
+    wrapper = CausalLMWrapper(model)
+    wrapper.eval()
+    return wrapper, model
+
+
 # =====================================================================
 # Configs
 # =====================================================================
@@ -187,7 +221,7 @@ class Config:
     batch: int = 1
     warmup: int = 20
     iters: int = 100
-    model: str = "naive"  # "naive" for custom transformer, "gpt2" for HF GPT-2 body
+    model: str = "naive"  # "naive", "gpt2", "qwen3", or "qwen3-4B"
 
 ALL_CONFIGS = [
     Config("Toy",     64,   4,   32,   warmup=5, iters=10),
@@ -203,6 +237,21 @@ ALL_CONFIGS = [
     Config("gpt2-s16",  768, 12,  16,  warmup=5, iters=10, model="gpt2"),
     Config("gpt2-s64",  768, 12,  64,  warmup=5, iters=10, model="gpt2"),
     Config("gpt2-s256", 768, 12, 256,  warmup=5, iters=10, model="gpt2"),
+    Config("gpt2-s1024", 768, 12, 1024, warmup=3, iters=5,  model="gpt2"),
+    # Qwen3-0.6B body (HuggingFace, 2-layer, GQA 2:1 + RoPE + SiLU gated MLP)
+    Config("q3-0.6B-s16",   1024, 16,   16,  warmup=5, iters=10, model="qwen3"),
+    Config("q3-0.6B-s256",  1024, 16,  256,  warmup=5, iters=10, model="qwen3"),
+    Config("q3-0.6B-s1024", 1024, 16,  1024, warmup=3, iters=10, model="qwen3"),
+    Config("q3-0.6B-s4K",   1024, 16,  4096, warmup=2, iters=5,  model="qwen3"),
+    Config("q3-0.6B-s8K",   1024, 16,  8192, warmup=2, iters=3,  model="qwen3"),
+    Config("q3-0.6B-s16K",  1024, 16, 16384, warmup=2, iters=3,  model="qwen3"),
+    # Qwen3-4B body (HuggingFace, 2-layer, GQA 4:1 + RoPE + SiLU gated MLP)
+    Config("q3-4B-s16",     2560, 32,   16,  warmup=5, iters=10, model="qwen3-4B"),
+    Config("q3-4B-s256",    2560, 32,  256,  warmup=3, iters=10, model="qwen3-4B"),
+    Config("q3-4B-s1024",   2560, 32,  1024, warmup=3, iters=5,  model="qwen3-4B"),
+    Config("q3-4B-s4K",     2560, 32,  4096, warmup=2, iters=3,  model="qwen3-4B"),
+    Config("q3-4B-s8K",     2560, 32,  8192, warmup=2, iters=3,  model="qwen3-4B"),
+    Config("q3-4B-s16K",    2560, 32, 16384, warmup=2, iters=3,  model="qwen3-4B"),
 ]
 
 # Configs with d_model >= 2048 use the reduced variant set
@@ -243,10 +292,21 @@ def pipeline_bias_relu(graph):
     fuse(graph, patterns=[P_MATMUL_ADD, P_BIAS_RELU])
     eliminate_dead_code(graph)
 
+def pipeline_full_no_merge(graph):
+    absorb_into_matmul(graph)
+    constant_fold(graph)
+    absorb_mask_into_attention(graph)
+    fuse_dags(graph)
+    fuse(graph)
+    eliminate_dead_code(graph)
+
 def pipeline_full(graph):
     absorb_into_matmul(graph)
     constant_fold(graph)
-    fuse(graph, patterns=[P_MATMUL_ADD, P_BIAS_RELU, P_ATTENTION])
+    absorb_mask_into_attention(graph)
+    fuse_dags(graph)
+    merge_parallel_matmuls(graph)
+    fuse(graph)
     eliminate_dead_code(graph)
 
 
@@ -285,7 +345,11 @@ def _load_ablation_lib():
 # =====================================================================
 
 def classify_op_indices(graph, exec_order):
-    """Return dict of category name -> set of indices into RESHAPE-stripped execution order.
+    """Return dict of category name -> set of indices into the COpNode array.
+
+    Must match the compiled executor's skip logic exactly: skip alias ops
+    whose first input is internal (not a graph input or constant). This
+    ensures indices here correspond 1:1 with COpNode array positions.
 
     Categories:
       "attn"    — fused ATTENTION nodes, or SOFTMAX + neighboring MATMULs in unfused graphs
@@ -293,19 +357,21 @@ def classify_op_indices(graph, exec_order):
       "linear"  — MATMUL, MATMUL_ADD that are NOT in the attn set
       "elemwise" — ADD, SUB, MUL, DIV, RELU, EXP, TANH, POW, GELU, SILU, NEG, COS, SIN,
                    RSQRT, FUSED_BIAS_RELU, GATED_ACT
-      "move"    — TRANSPOSE, PERMUTE
+      "move"    — TRANSPOSE, PERMUTE, SLICE, EMBEDDING
     """
+    from runtime.ops import OP_REGISTRY
+
     ELEMWISE_OPS = {
         OpType.ADD, OpType.SUB, OpType.MUL, OpType.DIV,
         OpType.RELU, OpType.EXP, OpType.TANH, OpType.POW,
         OpType.GELU, OpType.SILU, OpType.NEG, OpType.COS, OpType.SIN,
         OpType.RSQRT, OpType.FUSED_BIAS_RELU, OpType.GATED_ACT,
     }
-    MOVE_OPS = {OpType.TRANSPOSE, OpType.PERMUTE}
+    MOVE_OPS = {OpType.TRANSPOSE, OpType.PERMUTE, OpType.SLICE}
     LN_OPS = {OpType.LAYERNORM, OpType.RMSNORM}
     LINEAR_OPS = {OpType.MATMUL, OpType.MATMUL_ADD}
 
-    # First pass: identify attention node IDs (same logic as before)
+    # First pass: identify attention node IDs
     attn_ids = set()
     for node in exec_order:
         if node.op == OpType.ATTENTION:
@@ -319,12 +385,19 @@ def classify_op_indices(graph, exec_order):
                 if c.op == OpType.MATMUL:
                     attn_ids.add(c.id)
 
-    # Second pass: classify each node in RESHAPE-stripped order
-    stripped = [n for n in exec_order if n.op != OpType.RESHAPE]
+    # Second pass: classify nodes using the same skip logic as CompiledExecutor
+    external = set(graph.inputs) | set(graph.constants)
+    dispatched = []
+    for n in exec_order:
+        op_def = OP_REGISTRY.get(n.op)
+        if op_def is not None and op_def.is_alias(n) and n.inputs[0] not in external:
+            continue
+        dispatched.append(n)
+
     categories = {"attn": set(), "ln": set(), "linear": set(),
                   "elemwise": set(), "move": set()}
 
-    for i, n in enumerate(stripped):
+    for i, n in enumerate(dispatched):
         if n.id in attn_ids:
             categories["attn"].add(i)
         elif n.op in LN_OPS:
@@ -335,7 +408,7 @@ def classify_op_indices(graph, exec_order):
             categories["elemwise"].add(i)
         elif n.op in MOVE_OPS:
             categories["move"].add(i)
-        # else: uncategorized → implicit "other"
+        # else: uncategorized → implicit "other" (EMBEDDING, non-alias RESHAPE, etc.)
 
     return categories
 
@@ -413,7 +486,7 @@ def bench_pytorch_naive(model, x, warmup, iters):
         for _ in range(warmup):
             m(x)
 
-    total_ns_all, attn_ns_all, ln_ns_all, linear_ns_all = [], [], [], []
+    per_iter = {k: [] for k in ["total", "attn", "ln", "linear", "elem", "move"]}
     with torch.no_grad():
         for _ in range(iters):
             t_start = time.perf_counter_ns()
@@ -428,23 +501,29 @@ def bench_pytorch_naive(model, x, warmup, iters):
             v_raw = m.wv(h)
             linear_time = time.perf_counter_ns() - tl
 
+            tmv = time.perf_counter_ns()
             q = q_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
             k = k_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
             v = v_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
+            move_time = time.perf_counter_ns() - tmv
 
             ta = time.perf_counter_ns()
             scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(m.d_k)
             weights = F.softmax(scores, dim=-1)
             attn = torch.matmul(weights, v)
-            attn_ns_all.append(time.perf_counter_ns() - ta)
+            attn_time = time.perf_counter_ns() - ta
 
+            tmv2 = time.perf_counter_ns()
             attn = attn.permute(0, 2, 1, 3).reshape(B, S, D)
+            move_time += time.perf_counter_ns() - tmv2
 
             tl2 = time.perf_counter_ns()
             wo_out = m.wo(attn)
             linear_time += time.perf_counter_ns() - tl2
 
+            te = time.perf_counter_ns()
             x_out = x + wo_out
+            elem_time = time.perf_counter_ns() - te
 
             tln2 = time.perf_counter_ns()
             ln2_out = m.ln2(x_out)
@@ -454,23 +533,31 @@ def bench_pytorch_naive(model, x, warmup, iters):
             ffn1_out = m.ffn1(ln2_out)
             linear_time += time.perf_counter_ns() - tl3
 
+            te2 = time.perf_counter_ns()
+            relu_out = torch.relu(ffn1_out)
+            elem_time += time.perf_counter_ns() - te2
+
             tl4 = time.perf_counter_ns()
-            ffn2_out = m.ffn2(torch.relu(ffn1_out))
+            ffn2_out = m.ffn2(relu_out)
             linear_time += time.perf_counter_ns() - tl4
 
+            te3 = time.perf_counter_ns()
             x_out = x_out + ffn2_out
-            total_ns_all.append(time.perf_counter_ns() - t_start)
-            ln_ns_all.append(ln_time)
-            linear_ns_all.append(linear_time)
+            elem_time += time.perf_counter_ns() - te3
 
-    total_us = [t / 1000 for t in total_ns_all]
-    attn_us = [t / 1000 for t in attn_ns_all]
-    ln_us = [t / 1000 for t in ln_ns_all]
-    linear_us = [t / 1000 for t in linear_ns_all]
-    other_us = [t - a - l - li for t, a, l, li in zip(total_us, attn_us, ln_us, linear_us)]
+            total_ns = time.perf_counter_ns() - t_start
+            per_iter["total"].append(total_ns / 1000)
+            per_iter["attn"].append(attn_time / 1000)
+            per_iter["ln"].append(ln_time / 1000)
+            per_iter["linear"].append(linear_time / 1000)
+            per_iter["elem"].append(elem_time / 1000)
+            per_iter["move"].append(move_time / 1000)
+
+    med = {k: _median(v) for k, v in per_iter.items()}
+    other = med["total"] - med["attn"] - med["ln"] - med["linear"] - med["elem"] - med["move"]
     return Result(
-        _median(total_us), _median(attn_us), _median(ln_us),
-        _median(linear_us), 0.0, 0.0, _median(other_us),
+        med["total"], med["attn"], med["ln"],
+        med["linear"], med["elem"], med["move"], max(other, 0.0),
     )
 
 
@@ -483,7 +570,7 @@ def bench_pytorch_sdpa(model, x, warmup, iters):
         for _ in range(warmup):
             m(x)
 
-    total_ns_all, attn_ns_all, ln_ns_all, linear_ns_all = [], [], [], []
+    per_iter = {k: [] for k in ["total", "attn", "ln", "linear", "elem", "move"]}
     with torch.no_grad():
         for _ in range(iters):
             t_start = time.perf_counter_ns()
@@ -498,21 +585,27 @@ def bench_pytorch_sdpa(model, x, warmup, iters):
             v_raw = m.wv(h)
             linear_time = time.perf_counter_ns() - tl
 
+            tmv = time.perf_counter_ns()
             q = q_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
             k = k_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
             v = v_raw.reshape(B, S, m.n_heads, m.d_k).permute(0, 2, 1, 3)
+            move_time = time.perf_counter_ns() - tmv
 
             ta = time.perf_counter_ns()
             attn = F.scaled_dot_product_attention(q, k, v)
-            attn_ns_all.append(time.perf_counter_ns() - ta)
+            attn_time = time.perf_counter_ns() - ta
 
+            tmv2 = time.perf_counter_ns()
             attn = attn.permute(0, 2, 1, 3).reshape(B, S, D)
+            move_time += time.perf_counter_ns() - tmv2
 
             tl2 = time.perf_counter_ns()
             wo_out = m.wo(attn)
             linear_time += time.perf_counter_ns() - tl2
 
+            te = time.perf_counter_ns()
             x_out = x + wo_out
+            elem_time = time.perf_counter_ns() - te
 
             tln2 = time.perf_counter_ns()
             ln2_out = m.ln2(x_out)
@@ -522,23 +615,355 @@ def bench_pytorch_sdpa(model, x, warmup, iters):
             ffn1_out = m.ffn1(ln2_out)
             linear_time += time.perf_counter_ns() - tl3
 
+            te2 = time.perf_counter_ns()
+            relu_out = torch.relu(ffn1_out)
+            elem_time += time.perf_counter_ns() - te2
+
             tl4 = time.perf_counter_ns()
-            ffn2_out = m.ffn2(torch.relu(ffn1_out))
+            ffn2_out = m.ffn2(relu_out)
             linear_time += time.perf_counter_ns() - tl4
 
+            te3 = time.perf_counter_ns()
             x_out = x_out + ffn2_out
-            total_ns_all.append(time.perf_counter_ns() - t_start)
-            ln_ns_all.append(ln_time)
-            linear_ns_all.append(linear_time)
+            elem_time += time.perf_counter_ns() - te3
 
-    total_us = [t / 1000 for t in total_ns_all]
-    attn_us = [t / 1000 for t in attn_ns_all]
-    ln_us = [t / 1000 for t in ln_ns_all]
-    linear_us = [t / 1000 for t in linear_ns_all]
-    other_us = [t - a - l - li for t, a, l, li in zip(total_us, attn_us, ln_us, linear_us)]
+            total_ns = time.perf_counter_ns() - t_start
+            per_iter["total"].append(total_ns / 1000)
+            per_iter["attn"].append(attn_time / 1000)
+            per_iter["ln"].append(ln_time / 1000)
+            per_iter["linear"].append(linear_time / 1000)
+            per_iter["elem"].append(elem_time / 1000)
+            per_iter["move"].append(move_time / 1000)
+
+    med = {k: _median(v) for k, v in per_iter.items()}
+    other = med["total"] - med["attn"] - med["ln"] - med["linear"] - med["elem"] - med["move"]
     return Result(
-        _median(total_us), _median(attn_us), _median(ln_us),
-        _median(linear_us), 0.0, 0.0, _median(other_us),
+        med["total"], med["attn"], med["ln"],
+        med["linear"], med["elem"], med["move"], max(other, 0.0),
+    )
+
+
+def bench_pytorch_gpt2(model, x, warmup, iters):
+    """Benchmark full GPT2LMHeadModel with per-component timing.
+
+    Manually decomposes the forward pass to instrument each component:
+      - LN: ln_1, ln_2 per block + ln_f
+      - Linear: c_attn, c_proj (attn), c_fc, c_proj (mlp), lm_head
+      - Attn: scaled_dot_product_attention call
+      - Elem: GELU activations + residual adds
+      - Move: head split/merge reshapes + transposes
+      - Other: token/position embeddings
+    """
+    m = model
+    tfm = m.transformer
+    B, S = x.shape
+    position_ids = torch.arange(S, device=x.device).unsqueeze(0)
+
+    with torch.no_grad():
+        for _ in range(warmup):
+            m(x)
+
+    per_iter = {k: [] for k in ["total", "attn", "ln", "linear", "elem", "move", "other"]}
+    with torch.no_grad():
+        for _ in range(iters):
+            ln_time = 0
+            linear_time = 0
+            attn_time = 0
+            elem_time = 0
+            move_time = 0
+            other_time = 0
+
+            t_start = time.perf_counter_ns()
+
+            # Embeddings (other)
+            t0 = time.perf_counter_ns()
+            inputs_embeds = tfm.wte(x)
+            position_embeds = tfm.wpe(position_ids)
+            other_time += time.perf_counter_ns() - t0
+
+            # Embedding add (elem)
+            t0 = time.perf_counter_ns()
+            h = inputs_embeds + position_embeds
+            elem_time += time.perf_counter_ns() - t0
+
+            for block in tfm.h:
+                n_heads = block.attn.num_heads
+                head_dim = block.attn.head_dim
+
+                # LayerNorm 1
+                t0 = time.perf_counter_ns()
+                ln_out = block.ln_1(h)
+                ln_time += time.perf_counter_ns() - t0
+
+                # QKV projection (linear)
+                t0 = time.perf_counter_ns()
+                qkv = block.attn.c_attn(ln_out)
+                linear_time += time.perf_counter_ns() - t0
+
+                # Split Q/K/V + reshape to heads (move)
+                t0 = time.perf_counter_ns()
+                q, k, v = qkv.split(block.attn.split_size, dim=2)
+                q = q.view(B, S, n_heads, head_dim).transpose(1, 2)
+                k = k.view(B, S, n_heads, head_dim).transpose(1, 2)
+                v = v.view(B, S, n_heads, head_dim).transpose(1, 2)
+                move_time += time.perf_counter_ns() - t0
+
+                # Attention (SDPA)
+                t0 = time.perf_counter_ns()
+                attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                attn_time += time.perf_counter_ns() - t0
+
+                # Merge heads (move)
+                t0 = time.perf_counter_ns()
+                attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, n_heads * head_dim)
+                move_time += time.perf_counter_ns() - t0
+
+                # Output projection (linear)
+                t0 = time.perf_counter_ns()
+                attn_out = block.attn.c_proj(attn_out)
+                linear_time += time.perf_counter_ns() - t0
+
+                # Residual (elem)
+                t0 = time.perf_counter_ns()
+                h = h + attn_out
+                elem_time += time.perf_counter_ns() - t0
+
+                residual = h
+
+                # LayerNorm 2
+                t0 = time.perf_counter_ns()
+                ln_out = block.ln_2(h)
+                ln_time += time.perf_counter_ns() - t0
+
+                # FFN: fc (linear)
+                t0 = time.perf_counter_ns()
+                mlp_h = block.mlp.c_fc(ln_out)
+                linear_time += time.perf_counter_ns() - t0
+
+                # GELU (elem)
+                t0 = time.perf_counter_ns()
+                mlp_h = block.mlp.act(mlp_h)
+                elem_time += time.perf_counter_ns() - t0
+
+                # FFN: proj (linear)
+                t0 = time.perf_counter_ns()
+                mlp_h = block.mlp.c_proj(mlp_h)
+                linear_time += time.perf_counter_ns() - t0
+
+                # Residual (elem)
+                t0 = time.perf_counter_ns()
+                h = residual + mlp_h
+                elem_time += time.perf_counter_ns() - t0
+
+            # Final layernorm
+            t0 = time.perf_counter_ns()
+            h = tfm.ln_f(h)
+            ln_time += time.perf_counter_ns() - t0
+
+            # LM head (linear)
+            t0 = time.perf_counter_ns()
+            logits = m.lm_head(h)
+            linear_time += time.perf_counter_ns() - t0
+
+            total_ns = time.perf_counter_ns() - t_start
+            per_iter["total"].append(total_ns / 1000)
+            per_iter["attn"].append(attn_time / 1000)
+            per_iter["ln"].append(ln_time / 1000)
+            per_iter["linear"].append(linear_time / 1000)
+            per_iter["elem"].append(elem_time / 1000)
+            per_iter["move"].append(move_time / 1000)
+            per_iter["other"].append(other_time / 1000)
+
+    med = {k: _median(v) for k, v in per_iter.items()}
+    accounted = med["attn"] + med["ln"] + med["linear"] + med["elem"] + med["move"] + med["other"]
+    overhead = max(med["total"] - accounted, 0.0)
+    return Result(
+        med["total"], med["attn"], med["ln"],
+        med["linear"], med["elem"], med["move"], med["other"] + overhead,
+    )
+
+
+def bench_pytorch_qwen3(wrapper, x, warmup, iters):
+    """Benchmark Qwen3 CausalLM with per-component timing.
+
+    Manually decomposes the forward pass to instrument each component:
+      - LN: input_layernorm, post_attention_layernorm per block + final norm (RMSNorm)
+      - Linear: q/k/v/o_proj (attn), gate/up/down_proj (mlp), lm_head
+      - Attn: scaled_dot_product_attention call
+      - Elem: SiLU activations, gate*up multiply, residual adds
+      - Move: head reshape/transpose, merge heads
+      - Other: token embedding, RoPE (rotary position encoding), QK head norms
+    """
+    m = wrapper.model  # unwrap CausalLMWrapper → Qwen3ForCausalLM
+    tfm = m.model      # Qwen3Model
+    B, S = x.shape
+
+    # Pre-compute rotary embeddings (shared across iterations)
+    with torch.no_grad():
+        # rotary_emb needs a dummy hidden to infer device/dtype
+        dummy_h = tfm.embed_tokens(x)
+        position_ids = torch.arange(S, device=x.device).unsqueeze(0)
+        cos, sin = tfm.rotary_emb(dummy_h, position_ids)
+
+    # Helper: apply rotary position embedding
+    def _rotate_half(t):
+        t1 = t[..., :t.shape[-1] // 2]
+        t2 = t[..., t.shape[-1] // 2:]
+        return torch.cat((-t2, t1), dim=-1)
+
+    def _apply_rope(q, k, cos, sin):
+        q_out = (q * cos) + (_rotate_half(q) * sin)
+        k_out = (k * cos) + (_rotate_half(k) * sin)
+        return q_out, k_out
+
+    # Helper: repeat KV heads for GQA
+    def _repeat_kv(hidden_states, n_rep):
+        if n_rep == 1:
+            return hidden_states
+        batch, n_kv_heads, slen, head_dim = hidden_states.shape
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch, n_kv_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, n_kv_heads * n_rep, slen, head_dim)
+
+    with torch.no_grad():
+        for _ in range(warmup):
+            wrapper(x)
+
+    per_iter = {k: [] for k in ["total", "attn", "ln", "linear", "elem", "move", "other"]}
+    with torch.no_grad():
+        for _ in range(iters):
+            ln_time = 0
+            linear_time = 0
+            attn_time = 0
+            elem_time = 0
+            move_time = 0
+            other_time = 0
+
+            t_start = time.perf_counter_ns()
+
+            # Token embedding (other)
+            t0 = time.perf_counter_ns()
+            h = tfm.embed_tokens(x)
+            other_time += time.perf_counter_ns() - t0
+
+            for layer in tfm.layers:
+                sa = layer.self_attn
+                head_dim = sa.head_dim
+                n_kv_groups = sa.num_key_value_groups
+                n_heads = sa.config.num_attention_heads
+                n_kv_heads = sa.config.num_key_value_heads
+                n_rep = n_kv_groups  # == n_heads // n_kv_heads
+
+                # Input layernorm (LN)
+                t0 = time.perf_counter_ns()
+                ln_out = layer.input_layernorm(h)
+                ln_time += time.perf_counter_ns() - t0
+
+                # Q/K/V projections (linear)
+                t0 = time.perf_counter_ns()
+                q = sa.q_proj(ln_out)
+                k = sa.k_proj(ln_out)
+                v = sa.v_proj(ln_out)
+                linear_time += time.perf_counter_ns() - t0
+
+                # Reshape to heads (move)
+                t0 = time.perf_counter_ns()
+                q = q.view(B, S, n_heads, head_dim).transpose(1, 2)
+                k = k.view(B, S, n_kv_heads, head_dim).transpose(1, 2)
+                v = v.view(B, S, n_kv_heads, head_dim).transpose(1, 2)
+                move_time += time.perf_counter_ns() - t0
+
+                # QK head norms (other — Qwen3-specific)
+                t0 = time.perf_counter_ns()
+                q = sa.q_norm(q)
+                k = sa.k_norm(k)
+                other_time += time.perf_counter_ns() - t0
+
+                # RoPE (other)
+                t0 = time.perf_counter_ns()
+                q, k = _apply_rope(q, k, cos, sin)
+                other_time += time.perf_counter_ns() - t0
+
+                # GQA: repeat KV heads (move)
+                t0 = time.perf_counter_ns()
+                k = _repeat_kv(k, n_rep)
+                v = _repeat_kv(v, n_rep)
+                move_time += time.perf_counter_ns() - t0
+
+                # Attention (SDPA)
+                t0 = time.perf_counter_ns()
+                attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                attn_time += time.perf_counter_ns() - t0
+
+                # Merge heads (move)
+                t0 = time.perf_counter_ns()
+                attn_out = attn_out.transpose(1, 2).contiguous().reshape(B, S, -1)
+                move_time += time.perf_counter_ns() - t0
+
+                # Output projection (linear)
+                t0 = time.perf_counter_ns()
+                attn_out = sa.o_proj(attn_out)
+                linear_time += time.perf_counter_ns() - t0
+
+                # Residual (elem)
+                t0 = time.perf_counter_ns()
+                h = h + attn_out
+                elem_time += time.perf_counter_ns() - t0
+
+                residual = h
+
+                # Post-attention layernorm (LN)
+                t0 = time.perf_counter_ns()
+                ln_out = layer.post_attention_layernorm(h)
+                ln_time += time.perf_counter_ns() - t0
+
+                # MLP: gate + up projections (linear)
+                t0 = time.perf_counter_ns()
+                gate = layer.mlp.gate_proj(ln_out)
+                up = layer.mlp.up_proj(ln_out)
+                linear_time += time.perf_counter_ns() - t0
+
+                # SiLU activation + gate*up multiply (elem)
+                t0 = time.perf_counter_ns()
+                gate = layer.mlp.act_fn(gate)
+                mlp_h = gate * up
+                elem_time += time.perf_counter_ns() - t0
+
+                # MLP: down projection (linear)
+                t0 = time.perf_counter_ns()
+                mlp_h = layer.mlp.down_proj(mlp_h)
+                linear_time += time.perf_counter_ns() - t0
+
+                # Residual (elem)
+                t0 = time.perf_counter_ns()
+                h = residual + mlp_h
+                elem_time += time.perf_counter_ns() - t0
+
+            # Final norm (LN)
+            t0 = time.perf_counter_ns()
+            h = tfm.norm(h)
+            ln_time += time.perf_counter_ns() - t0
+
+            # LM head (linear)
+            t0 = time.perf_counter_ns()
+            logits = m.lm_head(h)
+            linear_time += time.perf_counter_ns() - t0
+
+            total_ns = time.perf_counter_ns() - t_start
+            per_iter["total"].append(total_ns / 1000)
+            per_iter["attn"].append(attn_time / 1000)
+            per_iter["ln"].append(ln_time / 1000)
+            per_iter["linear"].append(linear_time / 1000)
+            per_iter["elem"].append(elem_time / 1000)
+            per_iter["move"].append(move_time / 1000)
+            per_iter["other"].append(other_time / 1000)
+
+    med = {k: _median(v) for k, v in per_iter.items()}
+    accounted = med["attn"] + med["ln"] + med["linear"] + med["elem"] + med["move"] + med["other"]
+    overhead = max(med["total"] - accounted, 0.0)
+    return Result(
+        med["total"], med["attn"], med["ln"],
+        med["linear"], med["elem"], med["move"], med["other"] + overhead,
     )
 
 
@@ -638,6 +1063,14 @@ def _median(values):
     return s[len(s) // 2]
 
 
+def _speedup(our, baseline):
+    """Format speedup: '1.33x' if we're faster, '0.75x' if slower."""
+    if baseline <= 0:
+        return "     —"
+    ratio = baseline / our
+    return f"{ratio:5.2f}x"
+
+
 # =====================================================================
 # ONNX Runtime helpers
 # =====================================================================
@@ -729,13 +1162,15 @@ class Variant:
     layernorm_mode: int = 2  # 0=scalar, 1=SIMD, 2=SIMD+GCD
     group: str = ""          # for display grouping
     large: bool = True       # include in large-config runs
+    slow: bool = False       # run with reduced warmup/iters
+    qwen3: bool = True       # include in Qwen3-config runs
     ort_opt_level: object = None   # ort.GraphOptimizationLevel (set at runtime)
     ort_threads: int = 1           # intra_op_num_threads for ORT
 
 
 VARIANTS = [
     # --- Baselines ---
-    Variant("PT naive",           "pytorch_naive",  group="Baselines"),
+    Variant("PT naive",           "pytorch_naive",  group="Baselines", slow=True),
     Variant("PT SDPA",            "pytorch_sdpa",   group="Baselines"),]
 
 # ORT variants are appended at runtime once we know ort is available
@@ -760,27 +1195,28 @@ VARIANTS += [
 
     # --- Python executor ---
     Variant("Numpy per-op",       "python_numpy", pipeline_full, group="Python exec",
-            large=False),
+            large=False, qwen3=False),
     Variant("C per-op",           "python_c",     pipeline_full, group="Python exec",
             large=False),
 
     # --- Compiled C, incremental fusion (attention stays unfused) ---
-    Variant("No passes",          "compiled", pipeline_none,      group="Incremental fusion"),
+    Variant("No passes",          "compiled", pipeline_none,      group="Incremental fusion",
+            slow=True, qwen3=False),
     Variant("+ fold/DCE",         "compiled", pipeline_fold_dce,  group="Incremental fusion",
-            large=False),
+            qwen3=False),
     Variant("+ BLAS absorb",      "compiled", pipeline_absorb,    group="Incremental fusion",
-            large=False),
+            qwen3=False),
     Variant("+ MATMUL_ADD",       "compiled", pipeline_matmul_add,group="Incremental fusion",
-            large=False),
+            qwen3=False),
     Variant("+ BIAS_RELU",        "compiled", pipeline_bias_relu, group="Incremental fusion",
-            large=False),
+            qwen3=False),
 
     # --- Attention kernel variants (all non-attn fusions active) ---
     Variant("Attn: prim scalar",  "compiled", pipeline_bias_relu,
             softmax_mode=1, group="Attention variants",
-            large=False),
+            large=False, qwen3=False),
     Variant("Attn: fused scalar", "compiled", pipeline_full,
-            attn_mode=0, layernorm_mode=0, group="Attention variants"),
+            attn_mode=0, layernorm_mode=0, group="Attention variants", slow=True),
     Variant("Attn: fused SIMD",   "compiled", pipeline_full,
             attn_mode=1, layernorm_mode=0, group="Attention variants",
             large=False),
@@ -796,6 +1232,12 @@ VARIANTS += [
             large=False),
     Variant("LN: SIMD+GCD",      "compiled", pipeline_full,
             layernorm_mode=2, group="LayerNorm variants"),
+
+    # --- Merge parallel matmuls ablation ---
+    Variant("No merge",           "compiled", pipeline_full_no_merge,
+            attn_mode=2, layernorm_mode=2, group="Merge parallel matmuls"),
+    Variant("+ merge matmuls",    "compiled", pipeline_full,
+            attn_mode=2, layernorm_mode=2, group="Merge parallel matmuls"),
 
     # --- Full optimization (adaptive flash + optimized LayerNorm) ---
     Variant("Full optimization",  "compiled", pipeline_full,
@@ -832,25 +1274,41 @@ def run_config(cfg: Config, lib):
     to keep runtime manageable.
     """
     is_large = cfg.d_model >= LARGE_THRESHOLD
+    is_qwen3_cfg = cfg.model.startswith("qwen3")
     variants = [v for v in VARIANTS if v.large or not is_large]
+    if is_qwen3_cfg:
+        variants = [v for v in variants if v.qwen3]
 
-    print(f"\n{'='*110}")
+    print(f"\n{'='*120}")
     print(f"  {cfg.name}: d_model={cfg.d_model}, n_heads={cfg.n_heads}, "
           f"seq={cfg.seq_len}, batch={cfg.batch}"
           + (f"  [large — {len(variants)} variants]" if is_large else ""))
     head_dim = cfg.d_model // cfg.n_heads
     scratch_mb = cfg.n_heads * cfg.seq_len**2 * 4 / 1e6
     print(f"  head_dim={head_dim}, attn scratch={scratch_mb:.1f}MB")
-    print(f"{'='*110}")
+    print(f"{'='*120}")
 
     # Build models
     is_gpt2 = cfg.model == "gpt2"
-    if is_gpt2:
+    is_qwen3 = cfg.model.startswith("qwen3")
+    is_hf = is_gpt2 or is_qwen3  # HuggingFace model (no naive/sdpa baselines)
+    if is_qwen3:
+        qwen3_variant = cfg.model.split("-", 1)[1] if "-" in cfg.model else "0.6B"
+        result = _make_qwen3(variant=qwen3_variant)
+        if result is None:
+            print(f"  SKIPPED: transformers + Qwen3 config required")
+            return {}
+        qwen3_wrapper, qwen3_raw = result
+        naive_model = qwen3_wrapper  # wrapper used for export
+        sdpa_model = None
+        vocab_size = qwen3_raw.config.vocab_size
+        x_torch = torch.randint(0, vocab_size, (cfg.batch, cfg.seq_len))
+        x_np = x_torch.numpy().astype(np.int64).copy()
+    elif is_gpt2:
         gpt2_model = _make_gpt2(n_head=cfg.n_heads, n_embd=cfg.d_model)
         if gpt2_model is None:
             print(f"  SKIPPED: transformers package required for GPT-2 configs")
             return {}
-        # GPT-2 uses its own architecture; naive/sdpa baselines don't apply
         naive_model = gpt2_model
         sdpa_model = None
         x_torch = torch.randint(0, 50257, (cfg.batch, cfg.seq_len))
@@ -865,15 +1323,28 @@ def run_config(cfg: Config, lib):
         x_np = x_torch.numpy().copy()
 
     # Export ONNX model once for all ORT variants
+    # Skip ORT for long sequences — CPU EP doesn't scale (>15x slower at 8K)
+    skip_ort = cfg.seq_len >= 4096
     onnx_path = None
     has_ort_variants = any(v.mode == "ort" for v in variants)
-    if has_ort_variants and HAS_ORT:
+    if has_ort_variants and HAS_ORT and not skip_ort:
         onnx_path = export_to_onnx(naive_model, x_torch)
+
+    # Export our graph once for all runtime variants (save/load to get fresh copies)
+    needs_our_graph = any(v.mode in ("compiled", "python_numpy", "python_c")
+                         for v in variants)
+    graph_path = None
+    if needs_our_graph:
+        base_graph = export_model(naive_model, (x_torch,))
+        fd, graph_path = tempfile.mkstemp(prefix="ablation_graph_")
+        os.close(fd)
+        base_graph.save(graph_path)
+        del base_graph
 
     results: dict[str, Result] = {}
 
     header = (f"  {'Variant':<24} {'Total':>9} {'Attn':>9} {'Linear':>9} "
-              f"{'LN':>9} {'Elem':>9} {'Move':>9} {'vs PT':>7}")
+              f"{'LN':>9} {'Elem':>9} {'Move':>9} {'Other':>9} {'vs PT':>7}")
     prev_group = None
 
     for v in variants:
@@ -885,34 +1356,34 @@ def run_config(cfg: Config, lib):
             prev_group = v.group
 
         try:
-            # Skip PyTorch SDPA baseline for GPT-2 configs (no matching model)
-            if is_gpt2 and v.mode == "pytorch_sdpa":
+            # Skip PyTorch SDPA baseline for HF model configs (no matching model)
+            if is_hf and v.mode == "pytorch_sdpa":
+                continue
+            if skip_ort and v.mode == "ort":
                 continue
 
+            # Reduce warmup/iters for slow variants
+            warmup = max(cfg.warmup // 2, 2) if v.slow else cfg.warmup
+            iters = max(cfg.iters // 3, 3) if v.slow else cfg.iters
+
             if v.mode == "pytorch_naive":
-                if is_gpt2:
-                    # For GPT-2, just time the model directly (no manual breakdown)
-                    with torch.no_grad():
-                        for _ in range(cfg.warmup):
-                            naive_model(x_torch)
-                        times = []
-                        for _ in range(cfg.iters):
-                            t0 = time.perf_counter_ns()
-                            naive_model(x_torch)
-                            times.append((time.perf_counter_ns() - t0) / 1000)
-                    total = _median(times)
-                    result = Result(total, 0.0, 0.0, 0.0, 0.0, 0.0, total)
+                if is_qwen3:
+                    result = bench_pytorch_qwen3(
+                        qwen3_wrapper, x_torch, warmup, iters)
+                elif is_gpt2:
+                    result = bench_pytorch_gpt2(
+                        naive_model, x_torch, warmup, iters)
                 else:
                     result = bench_pytorch_naive(
-                        naive_model, x_torch, cfg.warmup, cfg.iters)
+                        naive_model, x_torch, warmup, iters)
 
             elif v.mode == "pytorch_sdpa":
                 result = bench_pytorch_sdpa(
-                    sdpa_model, x_torch, cfg.warmup, cfg.iters)
+                    sdpa_model, x_torch, warmup, iters)
 
             elif v.mode.startswith("python_"):
                 backend_name = v.mode.split("_")[1]
-                graph = export_model(naive_model, (x_torch,))
+                graph = Graph.load(graph_path)
                 if v.pipeline:
                     v.pipeline(graph)
                 ep = plan(graph)
@@ -922,10 +1393,10 @@ def run_config(cfg: Config, lib):
                     executor = InterpretedExecutor(backends=[CBackend(), NumpyBackend()])
                 graph.tensors[graph.inputs[0]].buffer = x_np
                 result = bench_python_executor(
-                    executor, ep, graph, cfg.warmup, cfg.iters)
+                    executor, ep, graph, warmup, iters)
 
             elif v.mode == "compiled":
-                graph = export_model(naive_model, (x_torch,))
+                graph = Graph.load(graph_path)
                 if v.pipeline:
                     v.pipeline(graph)
                 ep = _plan_for_ablation(graph)
@@ -940,27 +1411,31 @@ def run_config(cfg: Config, lib):
                     lib, executor, {graph.inputs[0]: x_np}, n_nodes,
                     categories,
                     v.softmax_mode, v.attn_mode, v.layernorm_mode,
-                    cfg.warmup, cfg.iters)
+                    warmup, iters)
 
             elif v.mode == "ort":
                 result = bench_ort(
                     onnx_path, x_np, v.ort_opt_level, v.ort_threads,
-                    cfg.warmup, cfg.iters)
+                    warmup, iters)
 
             results[v.name] = result
 
             pt_total = results.get("PT naive", Result(1, 0, 0, 0, 0, 0, 0)).total_us
-            vs_pt = result.total_us / pt_total if pt_total > 0 else 0
+            vs_pt = _speedup(result.total_us, pt_total)
+
+            display_name = v.name
+            if is_hf and v.name == "PT naive":
+                display_name = "PyTorch"
 
             if v.mode == "ort":
                 # No per-op breakdown for ORT
-                print(f"  {v.name:<24} {_fmt(result.total_us):>9} {'—':>9} "
-                      f"{'—':>9} {'—':>9} {'—':>9} {'—':>9} {vs_pt:6.2f}x")
+                print(f"  {display_name:<24} {_fmt(result.total_us):>9} {'—':>9} "
+                      f"{'—':>9} {'—':>9} {'—':>9} {'—':>9} {'—':>9} {vs_pt}")
             else:
-                print(f"  {v.name:<24} {_fmt(result.total_us):>9} "
+                print(f"  {display_name:<24} {_fmt(result.total_us):>9} "
                       f"{_fmt(result.attn_us):>9} {_fmt(result.linear_us):>9} "
                       f"{_fmt(result.ln_us):>9} {_fmt(result.elemwise_us):>9} "
-                      f"{_fmt(result.move_us):>9} {vs_pt:6.2f}x")
+                      f"{_fmt(result.move_us):>9} {_fmt(result.other_us):>9} {vs_pt}")
 
         except Exception as e:
             print(f"  {v.name:<24} FAILED: {e}")
@@ -970,6 +1445,11 @@ def run_config(cfg: Config, lib):
     # when GC triggers during a later config's export)
     if onnx_path and os.path.exists(onnx_path):
         os.unlink(onnx_path)
+    if graph_path:
+        for ext in (".json", ".weights"):
+            p = Path(graph_path).with_suffix(ext)
+            if p.exists():
+                p.unlink()
     import gc; gc.collect()
 
     return results
@@ -994,17 +1474,24 @@ def main():
         print("No configs selected. Available:", ", ".join(c.name for c in ALL_CONFIGS))
         return
 
-    # Filter out GPT-2 configs if transformers is unavailable
+    # Filter out HF model configs if dependencies are unavailable
     gpt2_configs = [c for c in configs if c.model == "gpt2"]
     if gpt2_configs and not HAS_TRANSFORMERS:
         print(f"Warning: skipping {len(gpt2_configs)} GPT-2 configs "
               f"(transformers package not installed)")
         configs = [c for c in configs if c.model != "gpt2"]
 
+    qwen3_configs = [c for c in configs if c.model.startswith("qwen3")]
+    if qwen3_configs and not HAS_QWEN3:
+        print(f"Warning: skipping {len(qwen3_configs)} Qwen3 configs "
+              f"(transformers package not installed)")
+        configs = [c for c in configs if not c.model.startswith("qwen3")]
+
     lib = _load_ablation_lib()
     print(f"Loaded ablation library")
     print(f"ONNX Runtime: {'v' + ort.__version__ if HAS_ORT else 'not available'}")
     print(f"Transformers (GPT-2): {'available' if HAS_TRANSFORMERS else 'not available'}")
+    print(f"Transformers (Qwen3): {'available' if HAS_QWEN3 else 'not available'}")
     print(f"Running {len(configs)} configs x {len(VARIANTS)} variants")
 
     import gc
@@ -1014,9 +1501,9 @@ def main():
         gc.collect()
 
     # Summary
-    print(f"\n{'='*110}")
+    print(f"\n{'='*120}")
     print("  SUMMARY: Best compiled variant vs baselines")
-    print(f"{'='*110}")
+    print(f"{'='*120}")
     print(f"  {'Config':<12} {'PT naive':>10} {'PT SDPA':>10} {'ORT opt':>10} "
           f"{'Best ours':>10} {'vs PT':>7} {'vs SDPA':>7} {'vs ORT':>7}")
     print(f"  {'-'*82}")
@@ -1036,14 +1523,13 @@ def main():
                 best_total = res.total_us
                 best_name = name
         if best_total < float("inf"):
-            vs_naive = best_total / pt_naive if pt_naive > 0 else 0
-            vs_sdpa = best_total / pt_sdpa if pt_sdpa > 0 else 0
-            vs_ort = best_total / ort_opt if ort_opt > 0 else 0
+            vs_naive = _speedup(best_total, pt_naive)
+            vs_sdpa = _speedup(best_total, pt_sdpa)
+            vs_ort = _speedup(best_total, ort_opt)
             ort_str = _fmt(ort_opt) if ort_opt > 0 else "—"
-            vs_ort_str = f"{vs_ort:6.2f}x" if ort_opt > 0 else "     —"
             print(f"  {cfg.name:<12} {_fmt(pt_naive):>10} {_fmt(pt_sdpa):>10} "
                   f"{ort_str:>10} {_fmt(best_total):>10} "
-                  f"{vs_naive:6.2f}x {vs_sdpa:6.2f}x {vs_ort_str}"
+                  f"{vs_naive} {vs_sdpa} {vs_ort}"
                   f"  ({best_name})")
 
 

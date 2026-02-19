@@ -64,7 +64,13 @@ ORT_LOGGING_LEVEL_WARNING = 3
 ORT_DEVICE_ALLOCATOR = 0   # OrtDeviceAllocator
 ORT_MEM_TYPE_DEFAULT = 0    # OrtMemTypeDefault
 ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT = 1
+ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 = 7
 ORT_ENABLE_ALL = 99  # GraphOptimizationLevel
+
+_NUMPY_TO_ORT_DTYPE = {
+    np.float32: ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+    np.int64: ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+}
 
 
 def _find_ort_lib():
@@ -132,7 +138,8 @@ class OrtCApi:
             raise RuntimeError(f"ORT error ({context}): {msg}")
 
 
-def get_ort_arena_stats(onnx_path: str, input_shape: tuple[int, ...]) -> dict[str, str]:
+def get_ort_arena_stats(onnx_path: str, input_shape: tuple[int, ...],
+                        input_dtype=np.float32) -> dict[str, str]:
     """Run an ONNX model through ORT's C API and return arena allocator stats.
 
     Returns dict of stat name → value string (e.g. {"MaxInUse": "49152", ...}).
@@ -215,7 +222,14 @@ def get_ort_arena_stats(onnx_path: str, input_shape: tuple[int, ...]) -> dict[st
     )
     api._check(status, "CreateCpuMemoryInfo")
 
-    input_data = np.random.randn(*input_shape).astype(np.float32)
+    ort_element_type = _NUMPY_TO_ORT_DTYPE.get(np.dtype(input_dtype).type)
+    if ort_element_type is None:
+        raise ValueError(f"Unsupported input dtype: {input_dtype}")
+
+    if np.issubdtype(input_dtype, np.integer):
+        input_data = np.random.randint(0, 1000, size=input_shape).astype(input_dtype)
+    else:
+        input_data = np.random.randn(*input_shape).astype(input_dtype)
     shape_arr = (ctypes.c_int64 * len(input_shape))(*input_shape)
 
     input_value = VP()
@@ -234,7 +248,7 @@ def get_ort_arena_stats(onnx_path: str, input_shape: tuple[int, ...]) -> dict[st
         input_data.nbytes,
         shape_arr,
         len(input_shape),
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        ort_element_type,
         ctypes.byref(input_value),
     )
     api._check(status, "CreateTensorWithDataAsOrtValue")

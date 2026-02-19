@@ -3,6 +3,8 @@ from .passes import (
     DEFAULT_PIPELINE, PRE_RESOLUTION_PIPELINE, POST_RESOLUTION_PIPELINE,
     run_pipeline, run_until_stable,
     absorb_into_matmul, constant_fold, absorb_mask_into_attention,
-    eliminate_dead_code,
+    merge_parallel_matmuls, eliminate_dead_code,
 )
-from .fusion import fuse, FusionPattern, FUSION_PATTERNS, register_fusion
+from .fusion import (
+    fuse, fuse_dags, FusionPattern, FUSION_PATTERNS, register_fusion,
+)

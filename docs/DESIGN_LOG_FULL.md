@@ -906,3 +906,126 @@ Core types live in `validation/core.py` to avoid circular imports — the valida
 We considered adding a PRE_DISPATCH phase for validating COpNode structs (raw pointers, op codes, array bounds) before the C handoff. This is qualitatively different from domain-level validation — it's FFI defensive checking where the failure mode is `abort()` instead of a Python exception.
 
 Decision: keep FFI-level checks inside `CompiledExecutor._validate_structs()` rather than in the validation framework. Domain-level pre-dispatch checks (like "all ops have C dispatch support") belong in PRE_EXECUTE. Pointer sanity checks are assertions, not validators.
+
+## Parallel Matmul Merging (2026-02-17)
+
+### Context: Qwen3 profiling reveals BLAS call overhead
+
+After getting Qwen3-0.6B (2-layer) working end-to-end through the full pipeline (export → optimize → plan → compiled C execution), we profiled the compiled path using the ablation library's per-COpNode nanosecond timing. The breakdown was stark:
+
+```
+Category               Time       %
+attn                 56.4us    0.9%
+ln                  106.5us    1.7%
+linear               5.95ms   93.6%
+elemwise            221.8us    3.5%
+move                 28.0us    0.4%
+other                13.1us    0.2%
+TOTAL            6.36ms
+```
+
+Linear ops (MATMUL) dominate at 93.6%. The broadcast binop concern from the TODO turned out to be negligible — 8 RoPE MUL ops hitting `kernel_broadcast_binop` totaled 35us (0.5% of total). With BLAS calls already optimal (CblasTrans via absorption pass, no unnecessary copies), the question was whether any structural optimization remained.
+
+### Observation: shared-input matmul fan-outs
+
+Qwen3 has two clear fan-out patterns per transformer layer:
+
+**QKV projections** — 3 MATMULs reading the same RMSNorm output:
+```
+                  ┌→ MATMUL(W_q: 2048×1024) → Q  (16×2048)
+rmsnorm_out ──────┼→ MATMUL(W_k: 1024×1024) → K  (16×1024)
+                  └→ MATMUL(W_v: 1024×1024) → V  (16×1024)
+```
+
+**Gate/Up projections** — 2 MATMULs reading the same RMSNorm output:
+```
+rmsnorm_out ──────┬→ MATMUL(W_gate: 3072×1024) → gate (16×3072)
+                  └→ MATMUL(W_up:   3072×1024) → up   (16×3072)
+```
+
+Each group reads the same 64KB input activation multiple times. The question was whether merging these into single larger matmuls would help, given the added cost of splitting the output afterward.
+
+### Analysis: memory traffic tradeoffs
+
+For QKV merge at seq_len=16, hidden=1024:
+
+**Saved by merging:**
+- 2 fewer reads of input activation: 2 × 16 × 1024 × 4 = 128KB
+- 2 fewer BLAS calls (thread pool sync, tiling setup: ~1-5us each)
+- Better BLAS tiling efficiency for the larger output dimension
+
+**Cost of splitting:**
+The merged output `(16, 4096)` must be sliced on the last dimension into Q `(16, 2048)`, K `(16, 1024)`, V `(16, 1024)`. Last-dim slices are non-contiguous (strided), so they require `kernel_slice` (memcpy per row), not zero-copy aliasing. Total slice traffic:
+- Read merged output: 16 × 4096 × 4 = 256KB
+- Write 3 slices: 16 × 4096 × 4 = 256KB
+- Total: ~512KB of memory traffic
+
+On raw bytes, the slices cost ~4x what we save on input re-reads. However, the merged output is still hot in L2 cache when the slices run immediately after (256KB easily fits in L2), so the slice reads are nearly free. The real cost is the write traffic (~256KB).
+
+The hypothesis was that the net win would come from BLAS call overhead reduction and better tiling, not memory bandwidth. We decided to implement it and benchmark rather than over-analyze.
+
+### Design decision: standalone pass, not DAG fusion
+
+The existing fusion infrastructure has two pattern types:
+- **Chain patterns** (`FusionPattern`): linear A→B→C sequences with sole-consumer constraint
+- **DAG patterns** (`DAGFusionPattern`): small branching subgraphs that reconverge at a single root
+
+Matmul merging is structurally different from both:
+- It's a **fan-out** pattern (one input diverges to multiple parallel ops), not a chain or reconverging DAG
+- It has **variable width** (2, 3, or N matmuls) — DAG patterns match fixed topologies
+- It produces **multiple outputs** (one SLICE per original matmul) — DAG fusion produces one
+- It matches **forwards** from a shared input to consumers — DAG matching walks backwards from a root
+
+We considered extending the DAG framework but concluded it would add complexity to both the framework and the pattern definition without improving readability. Instead, `merge_parallel_matmuls` is a standalone pass function following the same conventions as `absorb_into_matmul` and `constant_fold`.
+
+### Implementation
+
+The pass is ~80 lines in `passes.py`. Algorithm:
+
+1. **Detect**: For each tensor, check if it has 2+ MATMUL consumers with constant weight matrices. Group them.
+2. **Validate**: All matmuls in a group must have same K dimension, same `trans_b` flag, same `alpha`, and 2D weight matrices.
+3. **Merge**: Concatenate weight matrices along the output dim (dim 0 for `trans_b=True`), register as a new constant.
+4. **Rewrite**: Add one merged MATMUL node. Replace each original MATMUL with a SLICE from the merged output (keeping the original output tensor name so downstream consumers are automatically rewired). Clean up unused original weight constants.
+
+The SLICE nodes use `dim=last_dim` (non-contiguous), so they dispatch to `kernel_slice` in the compiled executor rather than being zero-copy aliases. The extras packer (`_slice_extras`) computes the strided copy layout automatically.
+
+**Pipeline placement:** After `fuse_dags` (so RMSNorm, GELU, SiLU are already recognized) and `constant_fold` (so weights are materialized), but before `fuse` (so `MATMUL_ADD` fusion can still fire on the merged matmul if it has a downstream bias add) and `eliminate_dead_code`.
+
+### Results: 32% total speedup on Qwen3
+
+Before (15 matmuls):
+```
+Category               Time       %
+linear               5.95ms   93.6%
+TOTAL            6.36ms
+```
+
+After (9 matmuls + 10 slices):
+```
+Category               Time       %
+linear               3.91ms   89.9%
+TOTAL            4.35ms
+```
+
+**6.36ms → 4.35ms (32% faster).** The merged matmuls are substantially more efficient:
+
+| Operation | Before | After |
+|-----------|--------|-------|
+| QKV (3 matmuls) | ~267 + 267 + 377 = 911us | ~460us (1 merged) + ~15us (3 slices) |
+| Gate/Up (2 matmuls) | ~574 + 591 = 1165us | ~525us (1 merged) + ~10us (2 slices) |
+
+The slices are ~5us each — invisible compared to the matmul savings. The win comes from:
+1. **BLAS call overhead**: Accelerate's sgemm has non-trivial per-call cost for thread pool dispatch and tiling setup. 6 fewer calls across 2 layers.
+2. **Better tiling**: One `(16, 4096)` output tiles more efficiently than three separate calls with smaller N.
+3. **Input reuse**: The activation is read once instead of 2-3 times (modest benefit at these sizes, more impactful at longer sequences).
+
+### Generality
+
+The pass is fully general — no hardcoded QKV or gate/up patterns. It detects any group of MATMULs sharing the same first input with constant, compatible weights. This means it automatically handles:
+- QKV projection merging (Q + K + V, even with GQA's different Q/KV sizes)
+- Gate/Up merging in SwiGLU/GeGLU MLPs
+- Any future model with parallel linear projections from a shared input
+
+### Impact on other models
+
+The pass also fires on GPT-2 when QKV is done as separate projections (though HuggingFace GPT-2 already uses a fused `c_attn` projection, so it's a no-op there). It does NOT fire when matmuls have different `trans_b` flags, different K dimensions, or non-constant weights — all correct behavior.

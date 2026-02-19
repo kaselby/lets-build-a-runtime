@@ -391,6 +391,118 @@ def eliminate_dead_code(graph: Graph) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Parallel matmul merging
+# ---------------------------------------------------------------------------
+
+def merge_parallel_matmuls(graph: Graph) -> bool:
+    """Merge multiple MATMULs sharing the same input into one larger MATMUL.
+
+    Detects groups of MATMUL nodes that read the same activation tensor and
+    have constant weight matrices with compatible shapes (same K, same
+    trans_b). Replaces N matmuls with one merged matmul + N SLICE nodes.
+
+    Typical targets: QKV projections (3→1), gate/up projections (2→1).
+    """
+    changed = False
+    constant_set = set(graph.constants)
+
+    # Find tensors consumed by 2+ MATMULs
+    from collections import defaultdict
+    matmul_groups: dict[str, list[Node]] = defaultdict(list)
+    for node in graph:
+        if node.op == OpType.MATMUL and node.inputs[1] in constant_set:
+            matmul_groups[node.inputs[0]].append(node)
+
+    for shared_input, group in matmul_groups.items():
+        if len(group) < 2:
+            continue
+
+        # Validate: same K, same trans_b, all weights are 2D constants
+        first = group[0]
+        trans_b = first.attrs.get("transpose_b", False)
+        alpha = first.attrs.get("alpha", 1.0)
+        w0_shape = graph.tensors[first.inputs[1]].shape
+        if len(w0_shape) != 2:
+            continue
+
+        K = w0_shape[1] if trans_b else w0_shape[0]
+        compatible = True
+        for node in group[1:]:
+            if node.attrs.get("transpose_b", False) != trans_b:
+                compatible = False
+                break
+            if node.attrs.get("alpha", 1.0) != alpha:
+                compatible = False
+                break
+            ws = graph.tensors[node.inputs[1]].shape
+            if len(ws) != 2:
+                compatible = False
+                break
+            node_K = ws[1] if trans_b else ws[0]
+            if node_K != K:
+                compatible = False
+                break
+        if not compatible:
+            continue
+
+        # Compute merged weight shape and output slices
+        # With trans_b: weight is (N, K), output dim is N (axis 0)
+        # Without trans_b: weight is (K, N), output dim is N (axis 1)
+        cat_axis = 0 if trans_b else 1
+        weights = [graph.tensors[n.inputs[1]].buffer for n in group]
+        merged_weight = np.concatenate(weights, axis=cat_axis)
+
+        # Register merged weight as a constant
+        merged_w_name = f"_merged_weight_{group[0].output}"
+        w_info = graph.add_tensor(merged_w_name, merged_weight.shape, "float32")
+        w_info.buffer = merged_weight
+        graph.constants.append(merged_w_name)
+        constant_set.add(merged_w_name)
+
+        # Compute merged output shape
+        in_shape = graph.tensors[shared_input].shape
+        N_total = merged_weight.shape[0] if trans_b else merged_weight.shape[1]
+        merged_out_shape = (*in_shape[:-1], N_total)
+
+        # Register merged output tensor
+        merged_out_name = f"_merged_matmul_{group[0].output}"
+        graph.add_tensor(merged_out_name, merged_out_shape, "float32")
+
+        # Add merged MATMUL node
+        merged_attrs = {"transpose_b": trans_b}
+        if alpha != 1.0:
+            merged_attrs["alpha"] = alpha
+        graph.add_node(OpType.MATMUL, [shared_input, merged_w_name],
+                        merged_out_name, merged_attrs)
+
+        # Replace each original MATMUL with a SLICE from the merged output
+        last_dim = len(merged_out_shape) - 1
+        offset = 0
+        for node in group:
+            w_shape = graph.tensors[node.inputs[1]].shape
+            N_i = w_shape[0] if trans_b else w_shape[1]
+
+            # Rewire: remove original MATMUL, add SLICE keeping same output name
+            old_output = node.output
+            old_weight = node.inputs[1]
+            graph.remove_node(node.id)
+
+            graph.add_node(OpType.SLICE, [merged_out_name], old_output,
+                           {"dim": last_dim, "start": offset, "end": offset + N_i})
+            offset += N_i
+
+            # Clean up now-unused original weight constant
+            if not graph.consumers(old_weight):
+                if old_weight in graph.constants:
+                    graph.constants.remove(old_weight)
+                graph.remove_tensor(old_weight)
+
+        changed = True
+
+    return changed
+
+
+# ---------------------------------------------------------------------------
 # Pass pipelines
 # ---------------------------------------------------------------------------
 
@@ -404,6 +516,7 @@ PRE_RESOLUTION_PIPELINE: list[Pass] = [
     constant_fold,
     absorb_mask_into_attention,
     fuse_dags,
+    merge_parallel_matmuls,
     fuse,
     eliminate_dead_code,
 ]

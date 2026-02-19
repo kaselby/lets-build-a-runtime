@@ -27,8 +27,8 @@
  * ---------------------------------------------------------------- */
 
 /* Product of all output shape dimensions. */
-static inline int total_elements(const OpNode* node) {
-    int n = 1;
+static inline long total_elements(const OpNode* node) {
+    long n = 1;
     for (int i = 0; i < node->n_dims; i++) n *= node->out_shape[i];
     return n;
 }
@@ -41,8 +41,8 @@ static inline float extra_float(const OpNode* node, int idx) {
 }
 
 /* Product of out_shape[0..n_dims-2] (everything except the last dim). */
-static inline int leading_dims(const OpNode* node) {
-    int rows = 1;
+static inline long leading_dims(const OpNode* node) {
+    long rows = 1;
     for (int i = 0; i < node->n_dims - 1; i++) rows *= node->out_shape[i];
     return rows;
 }
@@ -96,7 +96,7 @@ static void dispatch_broadcast(OpNode* node, int base, int binop) {
 static void dispatch_add(OpNode* node) {
     /* extra[0]: 0 = bias broadcast, 1 = element-wise, 2 = scalar,
      *           3 = general broadcast */
-    int n = total_elements(node);
+    long n = total_elements(node);
     switch (node->extra[0]) {
         case 2:
             kernel_add_scalar(node->inputs[0], extra_float(node, 1),
@@ -118,7 +118,7 @@ static void dispatch_add(OpNode* node) {
 
 static void dispatch_sub(OpNode* node) {
     /* extra[0]: 0 = element-wise, 1 = scalar, 2 = broadcast */
-    int n = total_elements(node);
+    long n = total_elements(node);
     switch (node->extra[0]) {
         case 1:
             kernel_sub_scalar(node->inputs[0], extra_float(node, 1),
@@ -135,7 +135,7 @@ static void dispatch_sub(OpNode* node) {
 
 static void dispatch_mul(OpNode* node) {
     /* extra[0]: 0 = element-wise, 1 = scalar, 2 = broadcast */
-    int n = total_elements(node);
+    long n = total_elements(node);
     switch (node->extra[0]) {
         case 1:
             kernel_mul_scalar(node->inputs[0], extra_float(node, 1),
@@ -152,7 +152,7 @@ static void dispatch_mul(OpNode* node) {
 
 static void dispatch_div(OpNode* node) {
     /* extra[0]: 0 = element-wise, 1 = scalar, 2 = broadcast */
-    int n = total_elements(node);
+    long n = total_elements(node);
     switch (node->extra[0]) {
         case 1:
             kernel_div_scalar(node->inputs[0], extra_float(node, 1),
@@ -203,15 +203,21 @@ static void dispatch_matmul(OpNode* node) {
     int b_is_2d = node->extra[2];
     float alpha = node->extra[3] ? extra_float(node, 3) : 1.0f;
 
+    int M, batches;
     if (b_is_2d) {
-        int M_total = leading_dims(node);
-        kernel_matmul_ab(node->inputs[0], node->inputs[1], node->output,
-                         M_total, N, K, 1, trans_b, alpha, 0.0f);
+        M = leading_dims(node);
+        batches = 1;
     } else {
-        int M = node->out_shape[node->n_dims - 2];
-        int batches = 1;
+        M = node->out_shape[node->n_dims - 2];
+        batches = 1;
         for (int i = 0; i < node->n_dims - 2; i++)
             batches *= node->out_shape[i];
+    }
+
+    if (M == 1) {
+        kernel_matmul_gemv(node->inputs[0], node->inputs[1], node->output,
+                           N, K, batches, trans_b, alpha, 0.0f);
+    } else {
         kernel_matmul_ab(node->inputs[0], node->inputs[1], node->output,
                          M, N, K, batches, trans_b, alpha, 0.0f);
     }
@@ -305,7 +311,7 @@ static void dispatch_rmsnorm(OpNode* node) {
 
 static void dispatch_matmul_add(OpNode* node) {
     /* inputs: [A, B, bias], extras: [K, trans_b, b_is_2d]
-     * Pre-fill output with broadcast bias, then sgemm with beta=1.0. */
+     * Pre-fill output with broadcast bias, then sgemm/sgemv with beta=1.0. */
     int N = node->out_shape[node->n_dims - 1];
     int K = node->extra[0];
     int trans_b = node->extra[1];
@@ -313,21 +319,29 @@ static void dispatch_matmul_add(OpNode* node) {
     const float* bias = (const float*)node->inputs[2];
     float* out = (float*)node->output;
 
-    int rows = leading_dims(node);
+    int M, batches;
+    if (b_is_2d) {
+        M = leading_dims(node);
+        batches = 1;
+    } else {
+        M = node->out_shape[node->n_dims - 2];
+        batches = 1;
+        for (int i = 0; i < node->n_dims - 2; i++)
+            batches *= node->out_shape[i];
+    }
+
+    /* Pre-fill output rows with bias vector */
+    int rows = M * batches;
     for (int r = 0; r < rows; r++)
         for (int c = 0; c < N; c++)
             out[r * N + c] = bias[c];
 
-    if (b_is_2d) {
-        kernel_matmul_beta(node->inputs[0], node->inputs[1], node->output,
-                           rows, N, K, 1, trans_b, 1.0f);
+    if (M == 1) {
+        kernel_matmul_gemv(node->inputs[0], node->inputs[1], node->output,
+                           N, K, batches, trans_b, 1.0f, 1.0f);
     } else {
-        int M = node->out_shape[node->n_dims - 2];
-        int batches = 1;
-        for (int i = 0; i < node->n_dims - 2; i++)
-            batches *= node->out_shape[i];
-        kernel_matmul_beta(node->inputs[0], node->inputs[1], node->output,
-                           M, N, K, batches, trans_b, 1.0f);
+        kernel_matmul_ab(node->inputs[0], node->inputs[1], node->output,
+                         M, N, K, batches, trans_b, 1.0f, 1.0f);
     }
 }
 

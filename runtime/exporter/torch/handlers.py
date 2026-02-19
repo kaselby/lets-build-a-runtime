@@ -526,7 +526,13 @@ def _handle_slice_tensor(fx_node, graph: Graph, node_map: dict[str, str], symbol
     start = fx_node.args[2] if len(fx_node.args) > 2 else 0
     if len(fx_node.args) > 3:
         raw_end = fx_node.args[3]
-        end = _sym_or_val(raw_end, symbol_map) if not isinstance(raw_end, int) else raw_end
+        if isinstance(raw_end, int):
+            end = raw_end
+        else:
+            # SymInt — concretize sentinels (sys.maxsize) directly,
+            # only map to symbol names for real dynamic dims
+            hint = int(raw_end.node.hint)
+            end = hint if hint >= sys.maxsize else _sym_or_val(raw_end, symbol_map)
     else:
         end_val = fx_node.args[0].meta["val"].shape[dim]
         end = _sym_or_val(end_val, symbol_map)

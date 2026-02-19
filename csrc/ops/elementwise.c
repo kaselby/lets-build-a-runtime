@@ -20,8 +20,8 @@ void kernel_add(const float* a, const float* bias, float* out,
  *   x: [n] (flat)
  *   out: [n] (flat)
  * ---------------------------------------------------------------- */
-void kernel_relu(const float* x, float* out, int n) {
-    for (int i = 0; i < n; i++) {
+void kernel_relu(const float* x, float* out, long n) {
+    for (long i = 0; i < n; i++) {
         out[i] = x[i] > 0.0f ? x[i] : 0.0f;
     }
 }
@@ -29,42 +29,42 @@ void kernel_relu(const float* x, float* out, int n) {
 /* ----------------------------------------------------------------
  * Element-wise binary ops: tensor × tensor
  * ---------------------------------------------------------------- */
-void kernel_div(const float* a, const float* b, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = a[i] / b[i];
+void kernel_div(const float* a, const float* b, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = a[i] / b[i];
 }
 
-void kernel_sub(const float* a, const float* b, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = a[i] - b[i];
+void kernel_sub(const float* a, const float* b, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = a[i] - b[i];
 }
 
-void kernel_mul(const float* a, const float* b, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = a[i] * b[i];
+void kernel_mul(const float* a, const float* b, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = a[i] * b[i];
 }
 
 /* ----------------------------------------------------------------
  * Element-wise binary ops: tensor × scalar
  * ---------------------------------------------------------------- */
-void kernel_add_scalar(const float* a, float s, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = a[i] + s;
+void kernel_add_scalar(const float* a, float s, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = a[i] + s;
 }
 
-void kernel_div_scalar(const float* a, float s, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = a[i] / s;
+void kernel_div_scalar(const float* a, float s, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = a[i] / s;
 }
 
-void kernel_sub_scalar(const float* a, float s, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = a[i] - s;
+void kernel_sub_scalar(const float* a, float s, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = a[i] - s;
 }
 
-void kernel_mul_scalar(const float* a, float s, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = a[i] * s;
+void kernel_mul_scalar(const float* a, float s, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = a[i] * s;
 }
 
 /* ----------------------------------------------------------------
  * EXP: out = exp(x)  (element-wise)
  * ---------------------------------------------------------------- */
-void kernel_exp(const float* x, float* out, int n) {
-    for (int i = 0; i < n; i++) {
+void kernel_exp(const float* x, float* out, long n) {
+    for (long i = 0; i < n; i++) {
         out[i] = expf(x[i]);
     }
 }
@@ -140,8 +140,8 @@ void kernel_gated_gelu(const float* x, const float* up, const float* bias,
  *   x: [n] (flat)
  *   out: [n] (flat)
  * ---------------------------------------------------------------- */
-void kernel_pow_scalar(const float* x, float scalar, float* out, int n) {
-    for (int i = 0; i < n; i++) {
+void kernel_pow_scalar(const float* x, float scalar, float* out, long n) {
+    for (long i = 0; i < n; i++) {
         out[i] = powf(x[i], scalar);
     }
 }
@@ -151,8 +151,8 @@ void kernel_pow_scalar(const float* x, float scalar, float* out, int n) {
  *   x: [n] (flat)
  *   out: [n] (flat)
  * ---------------------------------------------------------------- */
-void kernel_tanh(const float* x, float* out, int n) {
-    for (int i = 0; i < n; i++) {
+void kernel_tanh(const float* x, float* out, long n) {
+    for (long i = 0; i < n; i++) {
         out[i] = tanhf(x[i]);
     }
 }
@@ -164,21 +164,26 @@ void kernel_tanh(const float* x, float* out, int n) {
  *   On macOS, uses Accelerate's vvtanhf for SIMD vectorization of
  *   the tanh part, same approach as kernel_softmax with vvexpf.
  * ---------------------------------------------------------------- */
-void kernel_gelu_tanh(const float* x, float* out, int n) {
+void kernel_gelu_tanh(const float* x, float* out, long n) {
 #ifdef __APPLE__
     /* Compute the tanh argument: sqrt(2/pi) * (x + 0.044715 * x^3) */
-    for (int i = 0; i < n; i++) {
+    for (long i = 0; i < n; i++) {
         float xi = x[i];
         out[i] = 0.7978845608f * (xi + 0.044715f * xi * xi * xi);
     }
-    /* Vectorized tanh via Accelerate (NEON SIMD) */
-    vvtanhf(out, out, &n);
+    /* Vectorized tanh via Accelerate (NEON SIMD).
+     * vvtanhf takes int* count — chunk to avoid overflow for n > INT_MAX. */
+    for (long off = 0; off < n; ) {
+        int chunk = (n - off > INT_MAX) ? INT_MAX : (int)(n - off);
+        vvtanhf(out + off, out + off, &chunk);
+        off += chunk;
+    }
     /* Final: 0.5 * x * (1 + tanh_result) */
-    for (int i = 0; i < n; i++) {
+    for (long i = 0; i < n; i++) {
         out[i] = 0.5f * x[i] * (1.0f + out[i]);
     }
 #else
-    for (int i = 0; i < n; i++) {
+    for (long i = 0; i < n; i++) {
         float xi = x[i];
         out[i] = 0.5f * xi * (1.0f + tanhf(0.7978845608f * (xi + 0.044715f * xi * xi * xi)));
     }
@@ -188,34 +193,34 @@ void kernel_gelu_tanh(const float* x, float* out, int n) {
 /* ----------------------------------------------------------------
  * RSQRT: out = 1/sqrt(x)  (element-wise)
  * ---------------------------------------------------------------- */
-void kernel_rsqrt(const float* x, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = 1.0f / sqrtf(x[i]);
+void kernel_rsqrt(const float* x, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = 1.0f / sqrtf(x[i]);
 }
 
 /* ----------------------------------------------------------------
  * SILU: out = x * sigmoid(x)  (element-wise)
  * ---------------------------------------------------------------- */
-void kernel_silu(const float* x, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = x[i] / (1.0f + expf(-x[i]));
+void kernel_silu(const float* x, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = x[i] / (1.0f + expf(-x[i]));
 }
 
 /* ----------------------------------------------------------------
  * NEG: out = -x  (element-wise)
  * ---------------------------------------------------------------- */
-void kernel_neg(const float* x, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = -x[i];
+void kernel_neg(const float* x, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = -x[i];
 }
 
 /* ----------------------------------------------------------------
  * COS: out = cos(x)  (element-wise)
  * ---------------------------------------------------------------- */
-void kernel_cos(const float* x, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = cosf(x[i]);
+void kernel_cos(const float* x, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = cosf(x[i]);
 }
 
 /* ----------------------------------------------------------------
  * SIN: out = sin(x)  (element-wise)
  * ---------------------------------------------------------------- */
-void kernel_sin(const float* x, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = sinf(x[i]);
+void kernel_sin(const float* x, float* out, long n) {
+    for (long i = 0; i < n; i++) out[i] = sinf(x[i]);
 }

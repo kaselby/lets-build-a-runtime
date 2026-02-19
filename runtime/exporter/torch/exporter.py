@@ -74,10 +74,19 @@ def _export_core(
                     torch_dynamic_shapes[input_name] = {}
                 torch_dynamic_shapes[input_name][dim_idx] = dim_obj
 
+    # When dynamic shapes are used, defer unprovable guards to runtime
+    # asserts instead of failing at export time. This handles cases like
+    # GQA where torch.export can't symbolically prove min(128*L, 256*L)==128*L.
+    export_kwargs = {}
+    if dynamic_dims:
+        export_kwargs["strict"] = False
+        export_kwargs["prefer_deferred_runtime_asserts_over_guards"] = True
+
     exported = torch.export.export(
         model, example_inputs,
         kwargs=example_kwargs or {},
         dynamic_shapes=torch_dynamic_shapes,
+        **export_kwargs,
     )
 
     # Step 2: Build symbol map (SymInt string repr -> user symbol name)
@@ -172,10 +181,13 @@ def _process_compute_nodes(exported, graph: Graph, node_map: dict[str, str],
         if fx_node.op != "call_function":
             continue
 
-        # Skip scalar-producing ops (sym_size, arithmetic on SymInts, etc.)
-        # These appear with dynamic shapes; their values are consumed via metadata.
+        # Skip non-tensor-producing ops:
+        # - val is None: assertion ops from deferred runtime guards
+        # - val is non-Tensor: sym_size, SymInt arithmetic, etc.
         val = fx_node.meta.get("val")
-        if val is not None and not isinstance(val, torch.Tensor):
+        if val is None:
+            continue
+        if not isinstance(val, torch.Tensor):
             if not (isinstance(val, tuple) and val and isinstance(val[0], torch.Tensor)):
                 continue
 

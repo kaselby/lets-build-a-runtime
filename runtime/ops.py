@@ -387,7 +387,8 @@ def _shape_permute(in_shapes, attrs):
 def _shape_slice(in_shapes, attrs):
     shape = list(in_shapes[0])
     dim = attrs["dim"]
-    shape[dim] = attrs["end"] - attrs.get("start", 0)
+    end = min(attrs["end"], shape[dim])  # clamp sentinel (sys.maxsize → dim size)
+    shape[dim] = end - attrs.get("start", 0)
     return tuple(shape)
 
 

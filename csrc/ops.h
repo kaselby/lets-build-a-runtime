@@ -18,6 +18,7 @@
 #include <float.h>
 #include <string.h>
 #include <stddef.h>
+#include <limits.h>
 
 /* ----------------------------------------------------------------
  * PARALLEL_FOR — GCD-threaded loop with chunking
@@ -34,26 +35,26 @@
  * ---------------------------------------------------------------- */
 #ifdef __APPLE__
 #define PARALLEL_FOR(n, bytes_per_iter, i, body) do {                   \
-    int _pf_n = (n);                                                    \
-    int _pf_min = (16 * 1024) / (bytes_per_iter);                       \
+    long _pf_n = (n);                                                   \
+    long _pf_min = (16 * 1024) / (bytes_per_iter);                      \
     if (_pf_min < 1) _pf_min = 1;                                      \
     if (_pf_n > _pf_min) {                                              \
-        int _pf_nchunks = (_pf_n + _pf_min - 1) / _pf_min;             \
+        long _pf_nchunks = (_pf_n + _pf_min - 1) / _pf_min;            \
         dispatch_apply((size_t)_pf_nchunks,                             \
             dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),     \
             ^(size_t _pf_chunk) {                                       \
-                int _pf_s = (int)_pf_chunk * _pf_min;                   \
-                int _pf_e = _pf_s + _pf_min;                            \
+                long _pf_s = (long)_pf_chunk * _pf_min;                 \
+                long _pf_e = _pf_s + _pf_min;                           \
                 if (_pf_e > _pf_n) _pf_e = _pf_n;                       \
-                for (int i = _pf_s; i < _pf_e; i++) { body }            \
+                for (long i = _pf_s; i < _pf_e; i++) { body }           \
             });                                                         \
     } else {                                                            \
-        for (int i = 0; i < _pf_n; i++) { body }                        \
+        for (long i = 0; i < _pf_n; i++) { body }                       \
     }                                                                   \
 } while(0)
 #else
 #define PARALLEL_FOR(n, bytes_per_iter, i, body)                        \
-    for (int i = 0; i < (n); i++) { body }
+    for (long i = 0; i < (n); i++) { body }
 #endif
 
 /* ----------------------------------------------------------------
@@ -69,26 +70,29 @@ void kernel_matmul_beta(const float* a, const float* b, float* out,
                         float beta);
 void kernel_matmul(const float* a, const float* b, float* out,
                    int M, int N, int K, int batches, int trans_b);
+void kernel_matmul_gemv(const float* a, const float* b, float* out,
+                        int N, int K, int batches, int trans_b,
+                        float alpha, float beta);
 
 /* elementwise.c */
 void kernel_add(const float* a, const float* bias, float* out, int M, int N);
-void kernel_add_scalar(const float* a, float s, float* out, int n);
-void kernel_sub(const float* a, const float* b, float* out, int n);
-void kernel_sub_scalar(const float* a, float s, float* out, int n);
-void kernel_mul(const float* a, const float* b, float* out, int n);
-void kernel_mul_scalar(const float* a, float s, float* out, int n);
-void kernel_div(const float* a, const float* b, float* out, int n);
-void kernel_div_scalar(const float* a, float s, float* out, int n);
-void kernel_relu(const float* x, float* out, int n);
-void kernel_exp(const float* x, float* out, int n);
-void kernel_pow_scalar(const float* x, float scalar, float* out, int n);
-void kernel_tanh(const float* x, float* out, int n);
-void kernel_gelu_tanh(const float* x, float* out, int n);
-void kernel_rsqrt(const float* x, float* out, int n);
-void kernel_silu(const float* x, float* out, int n);
-void kernel_neg(const float* x, float* out, int n);
-void kernel_cos(const float* x, float* out, int n);
-void kernel_sin(const float* x, float* out, int n);
+void kernel_add_scalar(const float* a, float s, float* out, long n);
+void kernel_sub(const float* a, const float* b, float* out, long n);
+void kernel_sub_scalar(const float* a, float s, float* out, long n);
+void kernel_mul(const float* a, const float* b, float* out, long n);
+void kernel_mul_scalar(const float* a, float s, float* out, long n);
+void kernel_div(const float* a, const float* b, float* out, long n);
+void kernel_div_scalar(const float* a, float s, float* out, long n);
+void kernel_relu(const float* x, float* out, long n);
+void kernel_exp(const float* x, float* out, long n);
+void kernel_pow_scalar(const float* x, float scalar, float* out, long n);
+void kernel_tanh(const float* x, float* out, long n);
+void kernel_gelu_tanh(const float* x, float* out, long n);
+void kernel_rsqrt(const float* x, float* out, long n);
+void kernel_silu(const float* x, float* out, long n);
+void kernel_neg(const float* x, float* out, long n);
+void kernel_cos(const float* x, float* out, long n);
+void kernel_sin(const float* x, float* out, long n);
 void kernel_bias_relu(const float* a, const float* bias, float* out, int M, int N);
 void kernel_gated_silu(const float* x, const float* up, const float* bias,
                        float* out, int M, int N, int has_bias);

@@ -25,10 +25,12 @@ _C_DISPATCH_OPS: frozenset[OpType] = frozenset({
     OpType.MATMUL,
     # Shape / data movement
     OpType.RESHAPE, OpType.TRANSPOSE, OpType.SLICE, OpType.EMBEDDING,
+    OpType.CAT,
     # Normalization
-    OpType.LAYERNORM,
+    OpType.LAYERNORM, OpType.RMSNORM,
     # Fused ops
     OpType.MATMUL_ADD, OpType.FUSED_BIAS_RELU, OpType.ATTENTION,
+    OpType.GATED_ACT,
 })
 
 # C backend kernel coverage (per-op dispatch via ctypes).
@@ -38,10 +40,11 @@ _C_BACKEND_OPS: frozenset[OpType] = frozenset({
     OpType.ADD, OpType.RELU, OpType.TRANSPOSE,
     OpType.DIV, OpType.SUB, OpType.MUL, OpType.EXP,
     OpType.MAX, OpType.SUM, OpType.SOFTMAX,
-    OpType.LAYERNORM, OpType.FUSED_BIAS_RELU, OpType.ATTENTION,
+    OpType.LAYERNORM, OpType.RMSNORM,
+    OpType.FUSED_BIAS_RELU, OpType.ATTENTION, OpType.GATED_ACT,
     OpType.POW, OpType.TANH, OpType.GELU,
     OpType.RSQRT, OpType.SILU, OpType.NEG, OpType.COS, OpType.SIN,
-    OpType.EMBEDDING, OpType.SLICE,
+    OpType.EMBEDDING, OpType.SLICE, OpType.CAT,
 })
 
 

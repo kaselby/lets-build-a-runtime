@@ -41,6 +41,12 @@ except ImportError:
     HAS_TRANSFORMERS = False
 
 try:
+    from transformers import AutoConfig, AutoModelForCausalLM
+    HAS_QWEN3 = True
+except ImportError:
+    HAS_QWEN3 = False
+
+try:
     from ablation.ort_arena_stats import get_ort_arena_stats
     HAS_ORT_CAPI = True
 except Exception:
@@ -93,6 +99,31 @@ def _make_gpt2(n_layer=2, n_head=12, n_embd=768):
     return model
 
 
+class CausalLMWrapper(nn.Module):
+    """Wraps a HuggingFace CausalLM so forward() returns logits only."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids):
+        return self.model(input_ids, use_cache=False).logits
+
+
+def _make_qwen3(variant="0.6B", n_layer=2):
+    """Create a Qwen3 model with random weights. Returns (wrapper, raw_model) or None."""
+    if not HAS_QWEN3:
+        return None
+    config = AutoConfig.from_pretrained(f"Qwen/Qwen3-{variant}", trust_remote_code=True)
+    config.num_hidden_layers = n_layer
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True,
+                                              torch_dtype=torch.float32)
+    model.eval()
+    model.config.use_cache = False
+    wrapper = CausalLMWrapper(model)
+    wrapper.eval()
+    return wrapper, model
+
+
 # =====================================================================
 # Configs
 # =====================================================================
@@ -115,9 +146,22 @@ ALL_CONFIGS = [
     Config("1B",      2048, 16,  512),
     Config("3B",      3072, 24,  1024),
     Config("7B",      4096, 32,  1024),
-    Config("gpt2-s16",  768, 12,  16,  model="gpt2"),
-    Config("gpt2-s64",  768, 12,  64,  model="gpt2"),
-    Config("gpt2-s256", 768, 12, 256,  model="gpt2"),
+    # GPT-2 body (HuggingFace, 2-layer)
+    Config("gpt2-s16",   768, 12,   16,  model="gpt2"),
+    Config("gpt2-s64",   768, 12,   64,  model="gpt2"),
+    Config("gpt2-s256",  768, 12,  256,  model="gpt2"),
+    Config("gpt2-s1024", 768, 12, 1024,  model="gpt2"),
+    # Qwen3-0.6B body (HuggingFace, 2-layer)
+    Config("q3-0.6B-s16",   1024, 16,   16,  model="qwen3"),
+    Config("q3-0.6B-s256",  1024, 16,  256,  model="qwen3"),
+    Config("q3-0.6B-s1024", 1024, 16, 1024,  model="qwen3"),
+    # Qwen3-4B body (HuggingFace, 2-layer)
+    Config("q3-4B-s16",   2560, 32,   16,  model="qwen3-4B"),
+    Config("q3-4B-s256",  2560, 32,  256,  model="qwen3-4B"),
+    Config("q3-4B-s1024", 2560, 32, 1024,  model="qwen3-4B"),
+    # Long context
+    Config("7B-4K",   4096, 32, 4096),
+    Config("1B-8K",   2048, 16, 8192),
 ]
 
 
@@ -210,8 +254,14 @@ def ort_peak_activations(model, x_torch):
     if not HAS_ORT or not HAS_ORT_CAPI:
         return None
     try:
+        # Map torch dtype to numpy dtype for ORT C API
+        _torch_to_np = {torch.float32: np.float32, torch.int64: np.int64,
+                        torch.int32: np.int32}
+        input_dtype = _torch_to_np.get(x_torch.dtype, np.float32)
+
         onnx_path = _export_onnx(model, x_torch)
-        stats = get_ort_arena_stats(onnx_path, tuple(x_torch.shape))
+        stats = get_ort_arena_stats(onnx_path, tuple(x_torch.shape),
+                                    input_dtype=input_dtype)
         os.unlink(onnx_path)
         if "MaxInUse" not in stats:
             return None
@@ -247,7 +297,17 @@ def run_config(cfg):
     """Measure arena size across all strategies + baselines for a single config."""
 
     is_gpt2 = cfg.model == "gpt2"
-    if is_gpt2:
+    is_qwen3 = cfg.model.startswith("qwen3")
+    if is_qwen3:
+        qwen3_variant = cfg.model.split("-", 1)[1] if "-" in cfg.model else "0.6B"
+        result = _make_qwen3(variant=qwen3_variant)
+        if result is None:
+            print(f"  SKIPPED: transformers + Qwen3 config required")
+            return {}
+        model, qwen3_raw = result
+        vocab_size = qwen3_raw.config.vocab_size
+        x_torch = torch.randint(0, vocab_size, (cfg.batch, cfg.seq_len))
+    elif is_gpt2:
         model = _make_gpt2(n_head=cfg.n_heads, n_embd=cfg.d_model)
         if model is None:
             print(f"  SKIPPED: transformers package required for GPT-2 configs")
@@ -377,11 +437,17 @@ def main():
         print(f"Warning: skipping {len(gpt2_configs)} GPT-2 configs (transformers not installed)")
         configs = [c for c in configs if c.model != "gpt2"]
 
+    qwen3_configs = [c for c in configs if c.model.startswith("qwen3")]
+    if qwen3_configs and not HAS_QWEN3:
+        print(f"Warning: skipping {len(qwen3_configs)} Qwen3 configs (transformers not installed)")
+        configs = [c for c in configs if not c.model.startswith("qwen3")]
+
     print("Memory Ablation: Planner Strategies + Baselines")
     print("=" * 90)
     print(f"  ONNX Runtime:  {'v' + ort.__version__ if HAS_ORT else 'not available'}")
     print(f"  ORT C API:     {'available' if HAS_ORT_CAPI else 'not available'}")
     print(f"  Transformers:  {'available' if HAS_TRANSFORMERS else 'not available'}")
+    print(f"  Qwen3:         {'available' if HAS_QWEN3 else 'not available'}")
     print(f"  Configs:       {len(configs)}  x  {len(STRATEGIES)} strategies")
     print()
     print("  All metrics are activation memory only (weights excluded).")
@@ -396,22 +462,22 @@ def main():
     print(f"\n{'='*90}")
     print("SUMMARY")
     print(f"{'='*90}")
-    print(f"  {'Config':<12} {'no-opt':>10} {'v1':>10} {'best':>10}"
+    print(f"  {'Config':<16} {'no-opt':>10} {'v1':>10} {'best':>10}"
           f" {'PyTorch':>10} {'ORT':>10}")
-    print(f"  {'-'*65}")
+    print(f"  {'-'*69}")
     for cfg in configs:
         r = all_results.get(cfg.name, {})
         if not r:
             continue
         no_opt = r.get("no-opt", 0)
         v1 = r.get("v1 (default)", 0)
-        best_size = min(v for v in r.values() if v > 0) if r.values() else 0
+        best_size = min((v for v in r.values() if isinstance(v, (int, float)) and v > 0), default=0)
 
         pt = r.get("__pt_peak") or 0
         ort_a = r.get("__ort_activ") or 0
 
         fmt = lambda x: f"{x/1024:.0f}K" if x > 0 else "—"
-        print(f"  {cfg.name:<12} {fmt(no_opt):>10} {fmt(v1):>10} {fmt(best_size):>10}"
+        print(f"  {cfg.name:<16} {fmt(no_opt):>10} {fmt(v1):>10} {fmt(best_size):>10}"
               f" {fmt(pt):>10} {fmt(ort_a):>10}")
 
 
